@@ -155,3 +155,26 @@ share=1 之类）——链号确定性映射，逐位门不破。
 - 定律：**链稀=批稀=分组亏；链稠=双管线=分组赚**。share 是用户旋钮；真正
   的算力场景（YGO 级模型）610M 类卡按 share 压到象征性或 0。每组独立调度
   台（DML 同步提交的队头阻塞，贡献 ~0.02s/32局，次要）留路标。
+
+## 16. population 路由（演化负载，2026-09-22，spike_othello 需求）
+ES 种群=同架构异权重多模型同时推理。判决：**逐行权重路由**（需求方候选 1）
+——模型图自带 `pop [P, flat_w]`（种群权重平面，**图输入非常量**）+ `mid [slots]`
+（每行个体号），图内 Gather+bmm 一行用自己那套权重。三处豁免+一 API：
+Claim 清零跳过 pop 面；缓存哈希跳过 pop（**代次 gen 管失效——refit 代次机制
+原样复用**）；cuda SubmitBatch 脏旗全量 H2D（代间零拷贝，dml/cpu 直读宿主=
+零拷贝）；`Farm::SetPopulation(host)` 写全部银行+代次++。适配器零新机制
+（mid=普通小输入，进哈希/前缀拷/清零全现成）。锚点对手=pop 面多占行，
+"双模型在飞"自动成立；PG 换心=SetPopulation 毫秒级（替代 TRT refit，此类
+模型不需要 refit 了）。dim0=P≠slots 合法（population 输入豁免批形校验，
+arena 按总量）。
+
+**实测（黑白棋 41k 参数 MLP，P=128，1024 局/代）**：真模型路由腿（fb128×
+12 银行，1024 链全并发）**0.52-0.54s/代 vs torch 参考实现 1.07s = 2.0×**
+（需求方门槛"≤1s=追平"达成；"<0.3s=显著超越"未达——瓶颈=routed 图自身
+的 gather+bmm 每行 164KB 权重流量，持续 60K 决策/s 与 torch 同形状同量级，
+进一步提速属图侧[fp16 pop 面/算子融合]非框架侧）。指纹跨银行数全同（2 银行
+≡12 银行逐位）+ 逐代变（SetPopulation 生效）。G9 门四件套全绿（均匀 pop=
+单模型逐位同/重跑同/换代必变/代次失效端到端不串代）。
+cpu 后端路由模式（decl.pop_p>0 自动追加 pop/mid；flat 布局=BuildMlpWeights
+生成序，CpuBuildMlpFlat 公开序列化器）；TRT fail fast（前缀拷协议未覆盖
+population 面，路由图走 ort/cpu）。

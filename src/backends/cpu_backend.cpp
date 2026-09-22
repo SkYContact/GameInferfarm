@@ -62,10 +62,35 @@ struct CpuSession {
     std::vector<float> b1;
     std::vector<std::vector<std::vector<float>>> w2;               // [j][k][t]
     std::vector<std::vector<float>> b2;                            // [j][k]
+    // population 路由（判决16）：P>0=路由模式——权重不在会话，在 pop 平面
+    // [P, flat_w]，每行按 mid 取；flat 布局=CpuBuildMlpFlat 生成序
+    int P = 0;
+    size_t flat_w = 0;
+    int pop_in = -1, mid_in = -1;              // ins 下标
+    std::vector<size_t> b1_rel;                // [t]
+    std::vector<std::vector<size_t>> w1_rel;   // [t][feature_i]（feature=非 pop/mid）
+    std::vector<std::vector<size_t>> b2_rel;   // [j][k]
+    std::vector<std::vector<size_t>> w2_rel;   // [j][k]（H 连续）
+    std::vector<int> feat_idx;                 // 特征输入的 ins 下标（剔除 pop/mid）
     unsigned seq = 0;
     int last_n = 0;
     bool computed = false;
 };
+
+// decl 输入的特征宽度（f32=行首 min(元素数,K)，整型=1）——LoadSpec/权重生成/flat 布局共用
+static size_t CpuFeatureLen(const CpuModelDecl::In& i, int poly_k) {
+    if (i.et != DTYPE_F32) return 1;
+    size_t elems = 1;
+    for (int64_t d : i.row_dims) elems *= (size_t)d;
+    return elems < (size_t)poly_k ? elems : (size_t)poly_k;
+}
+
+// 会话 meta 的特征宽度（spec 侧同口径）
+static size_t MetaL(const InputMeta& m, int K) {
+    if (m.et != DTYPE_F32) return 1;
+    size_t elems = m.row_bytes / 4;
+    return elems < (size_t)K ? elems : (size_t)K;
+}
 
 class CpuBackend : public InferBackend {
 public:
@@ -107,6 +132,40 @@ public:
             std::fprintf(stderr, "[cpu] 声明 slots=%d ≠ 配置 slots=%d\n", out.slots, slots);
             return false;
         }
+        if (d.pop_p > 0) {
+            // population 路由模式（判决16）：追加 pop 平面+mid 路由键。
+            // flat 布局=BuildMlpWeights 生成序（b1[t]+w1[t][*] 按 t，再 b2[j][k]+w2[j][k][*]）
+            if (d.hidden <= 0 || d.pop_p > 65536) {
+                std::fprintf(stderr, "[cpu] 路由模式须 hidden>0 且 pop_p≤65536"
+                             "（hidden=%d pop_p=%d）\n", d.hidden, d.pop_p);
+                return false;
+            }
+            size_t fw = 0;
+            for (int t = 0; t < d.hidden; t++) {
+                fw += 1;   // b1[t]
+                for (const auto& i : d.ins) fw += CpuFeatureLen(i, d.poly_k);
+            }
+            for (const auto& o : d.outs)
+                for (int k = 0; k < o.width; k++) {
+                    fw += 1;                  // b2[j][k]
+                    fw += (size_t)d.hidden;   // w2[j][k][t]
+                }
+            InputMeta pm;
+            pm.name = "pop";
+            pm.et = DTYPE_F32;
+            pm.esize = 4;
+            pm.dims = {(int64_t)d.pop_p, (int64_t)fw};
+            pm.row_bytes = fw * 4;
+            pm.population = true;
+            out.ins.push_back(std::move(pm));
+            InputMeta mm;
+            mm.name = "mid";
+            mm.et = DTYPE_I64;
+            mm.esize = 8;
+            mm.dims = {out.slots};
+            mm.row_bytes = 8;
+            out.ins.push_back(std::move(mm));
+        }
         return true;
     }
 
@@ -123,7 +182,10 @@ public:
         s->ins.resize(spec.ins.size());
         for (size_t i = 0; i < spec.ins.size(); i++) {
             s->ins[i].meta = spec.ins[i];
-            size_t bytes = spec.ins[i].row_bytes * (size_t)spec.slots;
+            // population 面：总量=行宽×P（dim0=P≠slots，非每槽输入）
+            size_t bytes = spec.ins[i].population
+                ? spec.ins[i].row_bytes * (size_t)spec.ins[i].dims[0]
+                : spec.ins[i].row_bytes * (size_t)spec.slots;
             off = (off + kAlign - 1) / kAlign * kAlign;
             s->ins[i].off = off;
             off += bytes;
@@ -144,14 +206,68 @@ public:
         s->out_arena.assign(off / 4 + 64, 0.0f);
         for (auto& o : s->outs)
             o.host = s->out_arena.data() + o.off;
-        BuildWeights(s, cfg.cpu.weight_seed);
+        // population 路由初始化：记录 pop/mid 下标+flat 偏移表（生成序回放），
+        // 默认填充 pop 行 p=CpuBuildMlpFlat(seed+p)——probe 可分辨的前提
+        for (size_t i = 0; i < spec.ins.size(); i++) {
+            if (spec.ins[i].population) s->pop_in = (int)i;
+            else if (spec.ins[i].name == "mid") s->mid_in = (int)i;
+            else s->feat_idx.push_back((int)i);
+        }
+        if (s->pop_in >= 0) {
+            s->P = (int)spec.ins[(size_t)s->pop_in].dims[0];
+            s->flat_w = spec.ins[(size_t)s->pop_in].row_bytes / 4;
+            s->b1_rel.assign((size_t)s->H, 0);
+            s->w1_rel.assign((size_t)s->H, std::vector<size_t>(s->feat_idx.size(), 0));
+            s->b2_rel.assign(s->outs.size(), {});
+            s->w2_rel.assign(s->outs.size(), {});
+            size_t rel = 0;
+            auto feat_L = [&](int fi) -> size_t {
+                const InputMeta& m = s->ins[(size_t)fi].meta;
+                if (m.et != DTYPE_F32) return 1;
+                size_t elems = m.row_bytes / 4;
+                return elems < (size_t)s->K ? elems : (size_t)s->K;
+            };
+            for (int t = 0; t < s->H; t++) {
+                s->b1_rel[(size_t)t] = rel++;
+                for (size_t fi = 0; fi < s->feat_idx.size(); fi++) {
+                    s->w1_rel[(size_t)t][fi] = rel;
+                    rel += feat_L(s->feat_idx[fi]);
+                }
+            }
+            for (size_t j = 0; j < s->outs.size(); j++) {
+                s->b2_rel[j].assign((size_t)s->outs[j].meta.width, 0);
+                s->w2_rel[j].assign((size_t)s->outs[j].meta.width, 0);
+                for (int k = 0; k < s->outs[j].meta.width; k++) {
+                    s->b2_rel[j][(size_t)k] = rel++;
+                    s->w2_rel[j][(size_t)k] = rel;
+                    rel += (size_t)s->H;
+                }
+            }
+            float* poph = (float*)s->ins[(size_t)s->pop_in].host;
+            for (int p = 0; p < s->P; p++) {
+                std::vector<float> flat = CpuBuildMlpFlat(cfg.cpu,
+                                                          cfg.cpu.weight_seed + (uint32_t)p);
+                if (flat.size() != s->flat_w) {
+                    std::fprintf(stderr, "[cpu] flat 布局不一致（%zu ≠ %zu）\n",
+                                 flat.size(), s->flat_w);
+                    delete s;
+                    return nullptr;
+                }
+                memcpy(poph + (size_t)p * s->flat_w, flat.data(), s->flat_w * 4);
+            }
+        } else {
+            BuildWeights(s, cfg.cpu.weight_seed);
+        }
         Track(s);
         return s;
     }
 
     bool Warmup(void* session) override {
         CpuSession* s = (CpuSession*)session;
-        std::memset(s->in_arena.data(), 0, s->in_arena.size());
+        // 选择性清零：population 面不动（默认填充是 probe 可分辨的前提）
+        for (auto& i : s->ins)
+            if (!i.meta.population)
+                memset(i.host, 0, i.meta.row_bytes * (size_t)s->slots);
         unsigned seq = 0;
         for (int r = 0; r < 3; r++)
             if (!SubmitBatch(session, s->slots, seq)) return false;
@@ -218,6 +334,65 @@ public:
         s->last_n = n_rows;
         s->computed = true;
         // 行独立计算 [0,n)（尾行保持旧值——与 GPU 银行同语义）
+        if (s->P > 0) {
+            // population 路由（判决16）：每行按 mid 取 flat 权重，累加序与
+            // MLP 模式逐位镜像（均匀 pop=同权重 ⇒ 输出逐位同，门 G9a 的根基）
+            const int64_t* midp = (const int64_t*)s->ins[(size_t)s->mid_in].host;
+            const float* poph = (const float*)s->ins[(size_t)s->pop_in].host;
+            for (int r = 0; r < n_rows; r++) {
+                int64_t mid = midp[r];
+                if (mid < 0) mid = 0;
+                if (mid >= s->P) mid = s->P - 1;
+                const float* flat = poph + (size_t)mid * s->flat_w;
+                std::vector<float> h((size_t)s->H);
+                for (int t = 0; t < s->H; t++) {
+                    float acc = flat[s->b1_rel[(size_t)t]];
+                    for (size_t fi = 0; fi < s->feat_idx.size(); fi++) {
+                        CpuIn& ci = s->ins[(size_t)s->feat_idx[fi]];
+                        const float* wv = flat + s->w1_rel[(size_t)t][fi];
+                        size_t L = MetaL(ci.meta, s->K);
+                        const unsigned char* row =
+                            (const unsigned char*)ci.host + (size_t)r * ci.meta.row_bytes;
+                        if (ci.meta.et == DTYPE_F32) {
+                            const float* x = (const float*)row;
+                            float dot = 0.0f;
+                            for (size_t e = 0; e < L; e++) dot += x[e] * wv[e];
+                            acc += dot;
+                        } else if (ci.meta.et == DTYPE_I64) {
+                            const int64_t* x = (const int64_t*)row;
+                            size_t elems = ci.meta.row_bytes / 8;
+                            int64_t sum = 0;
+                            for (size_t e = 0; e < elems; e++) sum += x[e];
+                            acc += (float)sum * wv[0];
+                        } else if (ci.meta.et == DTYPE_I32) {
+                            const int32_t* x = (const int32_t*)row;
+                            size_t elems = ci.meta.row_bytes / 4;
+                            int64_t sum = 0;
+                            for (size_t e = 0; e < elems; e++) sum += x[e];
+                            acc += (float)sum * wv[0];
+                        } else {
+                            const unsigned char* x = row;
+                            size_t elems = ci.meta.row_bytes;
+                            int64_t sum = 0;
+                            for (size_t e = 0; e < elems; e++) sum += x[e];
+                            acc += (float)sum * wv[0];
+                        }
+                    }
+                    h[(size_t)t] = acc > 0.0f ? acc : 0.0f;   // relu
+                }
+                for (size_t j = 0; j < s->outs.size(); j++) {
+                    CpuOut& o = s->outs[j];
+                    for (int k = 0; k < o.meta.width; k++) {
+                        float acc = flat[s->b2_rel[j][(size_t)k]];
+                        const float* wv = flat + s->w2_rel[j][(size_t)k];
+                        for (int t = 0; t < s->H; t++) acc += h[(size_t)t] * wv[(size_t)t];
+                        o.host[(size_t)r * (size_t)o.meta.width + (size_t)k] = std::tanh(acc);
+                    }
+                }
+            }
+            seq_out = s->seq;
+            return true;
+        }
         if (s->H > 0) {
             for (int r = 0; r < n_rows; r++) {
                 std::vector<float> h((size_t)s->H);
@@ -316,6 +491,17 @@ public:
         return s->computed && s->seq >= seq;
     }
     void CompletionFence() override {}
+
+    // population 面写入（演化路由）：整平面 memcpy（cpu 直读宿主=写完即生效）
+    bool SetPopulation(void* session, const char* pop_input, const void* host) override {
+        CpuSession* s = (CpuSession*)session;
+        for (auto& i : s->ins)
+            if (i.meta.population && i.meta.name == pop_input) {
+                memcpy(i.host, host, i.meta.row_bytes * (size_t)i.meta.dims[0]);
+                return true;
+            }
+        return false;
+    }
 
     const float* OutputRow(void* session, const char* name, int slot) override {
         CpuSession* s = (CpuSession*)session;
@@ -455,6 +641,27 @@ public:
 };
 
 } // namespace
+
+// population flat 权重序列化（与 BuildMlpWeights 同 RNG 流同生成序）：
+// 测试/驱动侧构造 pop 平面用——均匀 pop（各行同权重）与普通单模型腿逐位可比
+std::vector<float> CpuBuildMlpFlat(const CpuModelDecl& d, uint32_t seed) {
+    std::vector<float> flat;
+    for (int t = 0; t < d.hidden; t++) {
+        uint32_t st = seed ^ (uint32_t)(t * 2654435761u + 97);
+        flat.push_back(WNext(st));   // b1[t]
+        for (const auto& i : d.ins) {
+            size_t L = CpuFeatureLen(i, d.poly_k);
+            for (size_t e = 0; e < L; e++) flat.push_back(WNext(st));
+        }
+    }
+    for (size_t j = 0; j < d.outs.size(); j++)
+        for (int k = 0; k < d.outs[j].width; k++) {
+            uint32_t st = seed ^ (uint32_t)(j * 7919 + (size_t)k * 104729 + 5);
+            flat.push_back(WNext(st));   // b2[j][k]
+            for (int t = 0; t < d.hidden; t++) flat.push_back(WNext(st));
+        }
+    return flat;
+}
 
 InferBackend* CreateCpuBackend() { return new CpuBackend(); }
 

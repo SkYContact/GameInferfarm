@@ -84,6 +84,11 @@ bool Farm::Init(FarmConfig cfg) {
                      cfg_.window_ms, cfg_.stagger_ms, cfg_.max_decisions, cfg_.cache_log2);
         return false;
     }
+    // cpu 路由模式便利：pop_p>0 而未点名 population_input → 缺省 "pop"
+    // （须在设备组展开拷贝 model 之前）
+    if (cfg_.model.population_input.empty() && cfg_.model.backend == "cpu"
+        && cfg_.model.cpu.pop_p > 0)
+        cfg_.model.population_input = "pop";
     // ---- 设备组展开（空=单设备老行为=cfg.model+cfg.banks）----
     std::vector<DeviceConfig> devs = cfg_.devices;
     if (devs.empty()) {
@@ -171,6 +176,23 @@ bool Farm::Init(FarmConfig cfg) {
     spec_ok_ = true;
     backend_ = group_bes_[0];
     n_dev_ = (int)devs.size();
+    // population 路由校验（判决16）：须银行制（inline 单会话面未覆盖）+ 主组
+    // spec 确有标记为 population 的输入
+    if (!cfg_.model.population_input.empty()) {
+        if (total_banks <= 0) {
+            std::fprintf(stderr, "[farm] population 路由须银行制（banks>0）\n");
+            return false;
+        }
+        bool has_pop = false;
+        for (auto& m : spec_.ins)
+            if (m.population) { has_pop = true; break; }
+        if (!has_pop) {
+            std::fprintf(stderr, "[farm] population_input=\"%s\" 在模型输入中未找到"
+                         "（cpu 后端=decl.pop_p>0 自动追加；ort=路由图导出）\n",
+                         cfg_.model.population_input.c_str());
+            return false;
+        }
+    }
     // 链→组分配：平滑加权轮询（nginx 同款；确定性=链号函数，重跑逐位不破）。
     // 缺省全 share=1 ⇒ 两组时≡c%n_groups 老行为。share=0 ⇒ 该组不接链
     // （备用/测试位）。
@@ -267,6 +289,7 @@ CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
     uint32_t gn = (uint32_t)grp * 0x1B873593u;   // 设备命名空间：异构组同字节
     h.Update(&gn, sizeof gn);                     // 行输出逐位可异，不共享条目
     for (size_t i = 0; i < spec_.ins.size(); i++) {
+        if (spec_.ins[i].population) continue;   // pop 面不哈希（代次 gen 已管）
         size_t rb = 0;
         void* row = bank_->InputRow(bk, sl, spec_.ins[i].name.c_str(), &rb);
         if (row && rb) h.Update(row, rb);

@@ -93,6 +93,19 @@ public:
         return true;
     }
 
+    // population 代际换权重（演化路由，判决16）：host=[P, flat_w] f32 种群平面
+    // → 写满全部银行会话的 pop 输入 + 缓存代次失效（SetPopulation 后新代
+    // 决策用新权重；旧代条目永不再命中）。前置条件=腿已返回（同 RefitWeights
+    // 纪律）。false=非路由模式/任一银行写入失败
+    bool SetPopulation(const void* host) {
+        if (!bank_ || cfg_.model.population_input.empty()) return false;
+        for (int bk = 0; bk < bank_->banks(); bk++)
+            if (!bank_->SetPopulation(bk, cfg_.model.population_input.c_str(), host))
+                return false;
+        infer_gen_++;
+        return true;
+    }
+
     const FarmTally& tally() const { return tally_; }
     const FarmConfig& config() const { return cfg_; }
     ModelSpec* spec() { return spec_ok_ ? &spec_ : nullptr; }

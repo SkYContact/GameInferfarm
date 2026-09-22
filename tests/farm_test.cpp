@@ -9,6 +9,8 @@
 //  G5 refit：同 blob 两次换心 → 逐位同；不同 blob → 结果必变（A1/A2 的 CPU 版）
 //  G7 推理缓存：键=组装行字节+权重代次；开=关逐位同；代次门；热缓存腿全同
 //  G8a 多设备组（同构仿真）：分组=单组逐位同+重跑逐位同（真硬件=R4/gomoku --device）
+//  G9 population 路由（演化，判决16）：均匀 pop=普通单模型腿逐位同；重跑同；
+//     SetPopulation 换代必变；换代后缓存不串代（=新鲜无缓存农场逐位同）
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/cache.h"
@@ -421,6 +423,112 @@ int main() {
             const FarmTally& t = farm.tally();
             CHECK(t.decisions == s1.decisions && t.fingerprint == s1.fp,
                   "G8b 混批形状=单组逐位同（含指纹；游标/窗满/越界三界按组）");
+        }
+    }
+
+    // G9：population 路由（演化，判决16）——mid 缺省 0（Claim 清零）⇒ 均匀 pop
+    // （各行=同 flat 权重）时全部行用 pop[0] ⇒ 与普通单模型腿同权重同输出。
+    {
+        const int kH = 6, kP = 4;
+        auto mk_decl = [&](int slots, int pop_p) {
+            CpuModelDecl d = ToyModelDecl(slots);
+            d.hidden = kH;
+            d.pop_p = pop_p;
+            return d;
+        };
+        auto plain_leg = [&](uint32_t wseed) {
+            FarmConfig cfg;
+            cfg.name = "g9p";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 4242;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = mk_decl(cfg.slots, 0);
+            cfg.model.cpu.weight_seed = wseed;
+            Farm farm;
+            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            farm.RunLeg(MakeToyAdapter, nullptr);
+            const FarmTally& t = farm.tally();
+            LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
+                        t.decisions};
+            r.fp = t.fingerprint;
+            return r;
+        };
+        auto routed_leg = [&](uint32_t wseed, int cache_log2) {
+            FarmConfig cfg;
+            cfg.name = "g9r";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 4242;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.cache_log2 = cache_log2;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = mk_decl(cfg.slots, kP);
+            Farm farm;
+            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            std::vector<float> flat = CpuBuildMlpFlat(cfg.model.cpu, wseed);
+            std::vector<float> pop(flat.size() * (size_t)kP);
+            for (int p = 0; p < kP; p++)
+                memcpy(pop.data() + p * flat.size(), flat.data(), flat.size() * 4);
+            if (!farm.SetPopulation(pop.data())) { g_fail++; return LegResult{0, 0, 0, 0, -2}; }
+            farm.RunLeg(MakeToyAdapter, nullptr);
+            const FarmTally& t = farm.tally();
+            LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
+                        t.decisions};
+            r.fp = t.fingerprint;
+            return r;
+        };
+        LegResult plain = plain_leg(4242u);
+        LegResult rt1 = routed_leg(4242u, 0);
+        LegResult rt2 = routed_leg(4242u, 0);
+        CHECK(plain.decisions > 0 && rt1.decisions == plain.decisions,
+              "G9 路由腿完成（决策数=普通腿）");
+        CHECK(plain.fp == rt1.fp && plain.fw == rt1.fw && plain.sw == rt1.sw,
+              "G9a 均匀 population=普通单模型腿逐位同（路由不扰动行数学）");
+        CHECK(rt1.fp == rt2.fp, "G9b 路由腿重跑逐位同");
+        LegResult rt3 = routed_leg(4242u, 12);
+        CHECK(rt3.fp == rt1.fp, "G9 路由+缓存=逐位同（pop 面不哈希、代次管）");
+        LegResult alt = routed_leg(12345u, 0);
+        CHECK(alt.fp != rt1.fp, "G9c SetPopulation 换代必变（新权重生效）");
+        // G9d：同农场连换两代（缓存开）——第二代结果=新鲜农场第二代逐位同
+        //（代次失效端到端：旧代缓存条目不得串门）
+        {
+            FarmConfig cfg;
+            cfg.name = "g9d";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 4242;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.cache_log2 = 12;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = mk_decl(cfg.slots, kP);
+            Farm farm;
+            CHECK(farm.Init(cfg), "G9d 农场起");
+            std::vector<float> fa = CpuBuildMlpFlat(cfg.model.cpu, 4242u);
+            std::vector<float> fb = CpuBuildMlpFlat(cfg.model.cpu, 12345u);
+            std::vector<float> pa(fa.size() * (size_t)kP), pb(fb.size() * (size_t)kP);
+            for (int p = 0; p < kP; p++) {
+                memcpy(pa.data() + p * fa.size(), fa.data(), fa.size() * 4);
+                memcpy(pb.data() + p * fb.size(), fb.data(), fb.size() * 4);
+            }
+            CHECK(farm.SetPopulation(pa.data()), "G9d 第一代写入");
+            farm.RunLeg(MakeToyAdapter, nullptr);
+            unsigned long long fp1 = farm.tally().fingerprint;
+            CHECK(farm.SetPopulation(pb.data()), "G9d 第二代写入");
+            farm.RunLeg(MakeToyAdapter, nullptr);
+            unsigned long long fp2 = farm.tally().fingerprint;
+            CHECK(fp1 == rt1.fp && fp2 == alt.fp,
+                  "G9d 同农场连换两代=各自新鲜农场逐位同（代次失效端到端）");
         }
     }
 

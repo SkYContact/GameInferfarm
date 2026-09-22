@@ -48,6 +48,9 @@ target_link_libraries(refit_probe PRIVATE inferfarm)
 add_executable(gomoku examples/gomoku/gomoku_main.cpp)
 target_link_libraries(gomoku PRIVATE inferfarm)
 
+add_executable(othello examples/othello/othello_main.cpp)
+target_link_libraries(othello PRIVATE inferfarm)
+
 # 真模型可选门：模型工件缺席=SKIP 退 0（无 GPU/CI 不拦路）
 add_executable(gomoku_backend_test tests/gomoku_backend_test.cpp)
 target_link_libraries(gomoku_backend_test PRIVATE inferfarm)

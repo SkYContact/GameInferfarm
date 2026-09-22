@@ -142,6 +142,7 @@ struct OrtSess {
     bool graph_on = false;
     bool dml = false;
     int dev_id = 0;
+    bool pop_dirty = false;   // population 面脏旗（cuda：下次 SubmitBatch 全量 H2D）
     int slots = 64;
     // 完成协议（整设备同步血律）：Submit 后首个 CompletionReached 做一次
     // device sync + 前缀 D2H，随后同 seq 恒 true（dml：Run 同步=恒真）
@@ -299,16 +300,29 @@ public:
         if (!s->dml) {
             // 多卡守卫：分配/拷贝作用于当前设备（会话设备）。dml 无 CUDA 面。
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+            // population 脏旗（演化路由，判决16）：代际换权重后的单次全量 H2D
+            //（代间零拷贝——pop 非每槽输入，不参与前缀）
+            if (s->pop_dirty) {
+                for (size_t i = 0; i < s->ins.size(); i++)
+                    if (s->ins[i].meta.population
+                        && g_cu.Memcpy(s->ins[i].dev, s->ins[i].host,
+                                       s->ins[i].meta.row_bytes
+                                           * (size_t)s->ins[i].meta.dims[0], 1))
+                        return false;
+                s->pop_dirty = false;
+            }
             // 前缀 H2D：同步拷贝（返回即完成——与 ORT 内部流旗标无关，零竞态；
-            // n>7/8·slots 走整块）
+            // n>7/8·slots 走整块；population 面跳过）
             if (n_rows > (s->slots * 7) / 8) {
                 if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
                     return false;
             } else {
-                for (size_t i = 0; i < s->ins.size(); i++)
+                for (size_t i = 0; i < s->ins.size(); i++) {
+                    if (s->ins[i].meta.population) continue;
                     if (g_cu.Memcpy(s->ins[i].dev, s->ins[i].host,
                                     (size_t)n_rows * s->ins[i].meta.row_bytes, 1))
                         return false;
+                }
             }
             if (!RunOnce(s)) return false;
         } else {
@@ -359,6 +373,19 @@ public:
     bool RefitWeights(const char*) override {
         std::fprintf(stderr, "[ort] ORT 无权重热换 API——换心仅 TRT 后端支持"
                      "（演化场景走 TRT；ORT 候选迭代=每腿重载会话）\n");
+        return false;
+    }
+
+    // population 面写入（演化路由）：宿主 arena 落盘 + cuda 置脏旗（下次批全量
+    // H2D 一次）；dml=宿主绑定直读，写完即生效（无拷贝）
+    bool SetPopulation(void* session, const char* pop_input, const void* host) override {
+        OrtSess* s = (OrtSess*)session;
+        for (auto& i : s->ins)
+            if (i.meta.population && i.meta.name == pop_input) {
+                memcpy(i.host, host, i.meta.row_bytes * (size_t)i.meta.dims[0]);
+                s->pop_dirty = true;
+                return true;
+            }
         return false;
     }
 
@@ -621,6 +648,15 @@ private:
             a->SessionGetInputName(s->sess, i, alloc, &nm);
             s->ins[i].meta.name = nm ? nm : "?";
             if (nm) a->AllocatorFree(alloc, nm);
+            s->ins[i].meta.population =
+                !cfg.population_input.empty()
+                && s->ins[i].meta.name == cfg.population_input;   // 路由模式标记
+            if (s->ins[i].meta.population && s->ins[i].meta.et != DTYPE_F32) {
+                std::fprintf(stderr, "[ort] population 输入 %s 须 f32\n",
+                             s->ins[i].meta.name.c_str());
+                DestroySession(s);
+                return nullptr;
+            }
             OrtTypeInfo* ti = nullptr;
             if (a->SessionGetInputTypeInfo(s->sess, i, &ti)) { DestroySession(s); return nullptr; }
             const OrtTensorTypeAndShapeInfo* info = nullptr;
@@ -639,7 +675,8 @@ private:
                 DestroySession(s);
                 return nullptr;
             }
-            if ((int)s->ins[i].meta.dims[0] != slots) {
+            if ((int)s->ins[i].meta.dims[0] != slots
+                && !(s->ins[i].meta.population)) {
                 std::fprintf(stderr, "[ort] 输入 %s dim0=%lld ≠ slots=%d——模型须先烤"
                              "成固定批形状（fb）\n", s->ins[i].meta.name.c_str(),
                              (long long)s->ins[i].meta.dims[0], slots);
@@ -705,8 +742,10 @@ private:
         const size_t kAlign = 256;
         size_t off = 0;
         for (size_t i = 0; i < n_in; i++)
-            off = (off + s->ins[i].meta.row_bytes * (size_t)slots + kAlign - 1)
-                      / kAlign * kAlign;
+            off = (off + (s->ins[i].meta.population
+                              ? s->ins[i].meta.row_bytes * (size_t)s->ins[i].meta.dims[0]
+                              : s->ins[i].meta.row_bytes * (size_t)slots)
+                      + kAlign - 1) / kAlign * kAlign;
         s->in_h_bytes = off;
         if (dml) {
             s->in_d_bytes = 0;

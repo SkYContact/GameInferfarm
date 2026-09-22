@@ -133,3 +133,16 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   摊薄+链密度）。核显 CNN 全配置空间零正收益定谳（批形×银行×share×异步全扫，
   机理三层入 benchmark.md）；每组独立批形状落地（G8b 门+fb1/2/4/8 小图烤制
   逐位验证）。stagger=10ms 默认在 128 链=1.08s 纯税——bench 必须 0。
+
+## population 路由落地（2026-09-22，spike_othello 演化需求）
+- 子代理产出：export_pop_onnx.py + models/othello_pop.fb{128,16}.onnx；
+  对拍（CPU EP）：torch 路由 vs 单模型=逐位同（验收参考标准达成）；ONNX vs
+  torch=1.5e-05 末位差（MLAS/kernel 序），argmax 翻转 0。
+- 框架：InputMeta.population 三豁免+SetPopulation API+cpu 路由模式+G9 门
+  （4+4 检查全绿，均匀 pop=单模型逐位同一次过）。
+- 实测：12 银行 fb128×1024 链 → 0.52-0.54s/代（2.0× torch 1.07s）；2048 局
+  腿=1.03s 线性（60K 决策/s 持续=routed 图吞吐绑定）；指纹跨银行数全同、
+  逐代必变。途中案：--device 组不继承 population_input（CLI 两处修）；
+  othello ES 模式缺省链=个体/局=8×P。
+- 负载 B 侧：SetPopulation=毫秒级换心原语（21MB/代 H2D ~1ms），锚点对手
+  =适配器侧后续（对手行走推理的 adapter 改造，spike 侧工作）。

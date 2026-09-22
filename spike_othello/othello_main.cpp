@@ -1,41 +1,31 @@
-// gomoku_main.cpp — 五子棋范例入口：一层 MLP（未训练）vs 规则对手，
-// 跑通推理农场全流程。三后端可换：cpu（默认，免 GPU）/ ort（onnx）/ trt（engine）。
+// othello_main.cpp — 黑白棋尖刺入口：BC MLP（41k 参数，实验09 检查点导出）
+// vs 随机合法对手。结构与 gomoku_main 相同；ort 后端（cpu 后端仅支持一层 MLP）。
 //
-//   gomoku [--backend cpu|ort|trt] [--model <fb.onnx>] [--engine <plan>]
-//          [--chains 8] [--games 16] [--banks 2] [--workers 4] [--slots 8]
-//          [--cache-log2 16] [--device <spec>]... [--inline] [--threads]
-//          [--census] [--show-board]
-//
-//   --device 多设备组（判决15，可重复；首个替换主设备，后续追加设备组）：
-//     spec = backend[,ep=cuda|dml][,dev=N][,banks=K][,share=W][,slots=S][,model=路径][,engine=路径][,dir=运行时目录]
-//   例（NVIDIA 主卡 + AMD 核显，share=按算力配链、slots=核显小批图破形状墙）：
-//     gomoku --backend ort --model m.fb16.onnx --banks 2 \
-//            --device ort,ep=dml,dev=1,banks=1,share=0.4,slots=4,model=m.fb4.onnx,dir=D:/dml_rt
-//
-// ort/trt 模型工件由 tools/bake_gomoku_mlp.py 烤制（一层 MLP，权重由种子
-// 生成——确定性）。三后端同架构；指纹只在与自身同后端双腿间可比。
-#include "gomoku_adapter.h"
+//   othello --backend ort --model models/othello_bc_mlp.fb16.onnx
+//           [--chains 64] [--games 1280] [--banks 2] [--workers 14] [--slots 16]
+//           [--device <spec>]... [--census] [--show-board]
+#include "othello_adapter.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
 
 using namespace inferfarm;
-using namespace inferfarm::gomoku;
+using namespace inferfarm::othello;
 
 int main(int argc, char** argv) {
     FarmConfig cfg;
-    cfg.name = "gomoku";
-    cfg.chains = 8;
-    cfg.games = 16;
+    cfg.name = "othello";
+    cfg.chains = 64;
+    cfg.games = 1280;
     cfg.seed0 = 20260922u;
     cfg.fibers = true;
-    cfg.workers = 4;
+    cfg.workers = 14;
     cfg.banks = 2;
-    cfg.slots = 8;
+    cfg.slots = 16;
     cfg.window_ms = 0.2;
-    cfg.stagger_ms = 1;
-    cfg.model.backend = "cpu";
-    cfg.model.cpu = GomokuModelDecl(cfg.slots);
+    cfg.stagger_ms = 0;
+    cfg.model.backend = "ort";
+    cfg.model.cpu = OthelloModelDecl(cfg.slots);
     bool show_board = false;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
@@ -51,16 +41,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--ort-dir") && i + 1 < argc) cfg.model.ort_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--trt-dir") && i + 1 < argc) cfg.model.trt_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--cuda-dir") && i + 1 < argc) cfg.model.cuda_dir = argv[++i];
-        else if (!std::strcmp(argv[i], "--refit") && i + 1 < argc) cfg.model.refit_weights = argv[++i];
         else if (!std::strcmp(argv[i], "--banks") && i + 1 < argc) cfg.banks = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--chains") && i + 1 < argc) cfg.chains = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--games") && i + 1 < argc) cfg.games = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--workers") && i + 1 < argc) cfg.workers = atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--slots") && i + 1 < argc) { cfg.slots = atoi(argv[++i]); cfg.model.cpu = GomokuModelDecl(cfg.slots); }
+        else if (!std::strcmp(argv[i], "--slots") && i + 1 < argc) { cfg.slots = atoi(argv[++i]); cfg.model.cpu = OthelloModelDecl(cfg.slots); }
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) cfg.seed0 = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--cache-log2") && i + 1 < argc) cfg.cache_log2 = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--device") && i + 1 < argc) {
-            // spec = backend[,ep=..][,dev=N][,banks=K][,model=..][,engine=..][,dir=..]
             std::string spec = argv[++i];
             DeviceConfig d;
             size_t pos = 0, first = spec.find(',');
@@ -90,12 +78,11 @@ int main(int argc, char** argv) {
                 if (d.model.backend == "ort") d.model.model_path = cfg.model.model_path;
                 if (d.model.backend == "trt") d.model.engine_path = cfg.model.engine_path;
             }
-            d.model.population_input = cfg.model.population_input;   // 路由模式组继承
-            if (d.model.backend == "cpu") d.model.cpu = GomokuModelDecl(cfg.slots);
-            if (cfg.devices.empty()) {   // 首个：替换主设备
+            if (d.model.backend == "cpu") d.model.cpu = OthelloModelDecl(cfg.slots);
+            if (cfg.devices.empty()) {
                 cfg.model = d.model;
                 cfg.banks = d.banks;
-                cfg.devices.push_back(d);   // 占位（Farm 展开时 devices 非空即走多组）
+                cfg.devices.push_back(d);
             } else {
                 cfg.devices.push_back(d);
             }
@@ -107,25 +94,21 @@ int main(int argc, char** argv) {
         else { std::printf("未知参数 %s\n", argv[i]); return 2; }
     }
     if (cfg.model.backend == "ort" && cfg.model.model_path.empty()) {
-        std::fprintf(stderr, "[gomoku] ort 后端需 --model <fb.onnx>"
-                     "（tools/bake_gomoku_mlp.py 烤制）\n");
-        return 2;
-    }
-    if (cfg.model.backend == "trt" && cfg.model.engine_path.empty()) {
-        std::fprintf(stderr, "[gomoku] trt 后端需 --engine <plan>"
-                     "（tools/bake_gomoku_mlp.py --trt 烤制）\n");
+        std::fprintf(stderr, "[othello] ort 后端需 --model <fb.onnx>（spike/export_bc_onnx.py）\n");
         return 2;
     }
     Farm farm;
     if (!farm.Init(cfg)) return 1;
-    double sec = farm.RunLeg(MakeGomokuAdapter, nullptr);
+    double sec = farm.RunLeg(MakeOthelloAdapter, nullptr);
     const FarmTally& t = farm.tally();
-    std::printf("[gomoku] %d 局 / %.2fs；先手 %d/%d 后手 %d/%d；指纹 %016llx\n",
-                t.games_done, sec, t.first_wins, t.first_total, t.second_wins,
-                t.second_total, (unsigned long long)t.fingerprint);
+    std::printf("[othello] %d 局 / %.2fs = %.0f 局/s；先手 %d/%d 后手 %d/%d；"
+                "决策 %lld；推理故障 %d；指纹 %016llx\n",
+                t.games_done, sec, t.games_done / sec,
+                t.first_wins, t.first_total, t.second_wins, t.second_total,
+                (long long)t.decisions, t.infer_fails, (unsigned long long)t.fingerprint);
     if (show_board) {
-        std::printf("\n终局样例棋盘（链 0 末局）：\n");
-        PrintBoard(GomokuAdapter::last_board);
+        std::printf("\n终局样例棋盘（末局快照）：\n");
+        PrintBoard(OthelloAdapter::last_board);
     }
     return 0;
 }

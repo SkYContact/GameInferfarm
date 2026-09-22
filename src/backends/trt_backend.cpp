@@ -307,6 +307,12 @@ class TrtBackend : public InferBackend {
 public:
     const char* Name() const override { return "trt"; }
     bool LoadSpec(const ModelConfig& cfg, int slots, ModelSpec& out) override {
+        if (!cfg.population_input.empty()) {
+            std::fprintf(stderr, "[trt] population 路由（演化）暂不支持 TRT 后端"
+                         "——路由图走 ort/cpu（判决16：pop 为图输入，TRT 前缀拷"
+                         "协议未覆盖该面）\n");
+            return false;
+        }
         if (!LoadTrtLib(cfg) || !g_cu.Load(DefaultCudaDir(cfg))) return false;
         dev_id_ = cfg.device_id;   // 多卡：engine 反序列化落定设备（同架构双卡
         if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);   // 可共享 engine；>0 本机未测）

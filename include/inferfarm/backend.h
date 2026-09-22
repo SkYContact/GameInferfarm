@@ -60,6 +60,15 @@ public:
     // → false：满座不自驱，Notify 调度台发车。TRT 图回放线程无关、CPU 无图
     // → true（默认）。
     virtual bool DispatchFromWriterOk() const { return true; }
+
+    // population 面写入（演化路由，判决16）：把 host 指向的 [P, flat_w] 种群
+    // 权重平面拷入本会话的 population 输入。cuda 路线置脏旗（下次 SubmitBatch
+    // 全量 H2D 一次）；cpu/dml 直读宿主=写完即生效。前置条件=腿已返回
+    // （与 RefitWeights 同纪律）。不支持 population 的后端/找不到该输入=false
+    virtual bool SetPopulation(void* session, const char* pop_input, const void* host) {
+        (void)session; (void)pop_input; (void)host;
+        return false;
+    }
 };
 
 } // namespace inferfarm

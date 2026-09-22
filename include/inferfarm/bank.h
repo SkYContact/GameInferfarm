@@ -78,6 +78,7 @@ public:
     void Shutdown();
 
     bool active() const { return banks_ > 0; }
+    int banks() const { return banks_; }
 
     // ---- 写手侧（对局 fiber 或 OS 线程）----
     // 领槽（自旋+等池背压；成功即行清零=零基组装契约：未写区与"python
@@ -97,6 +98,11 @@ public:
     bool SubmitWait(int bank, int slot, const OutputDest* dests, int n_dests);
     // 弃槽（异常路径）：作废槽（发车跳过）+完工照减（drain 不堵）
     void Abandon(int bank, int slot);
+
+    // population 面写入（演化路由，判决16）：写满指定银行的种群平面+置脏
+    // （cuda 下次批全量 H2D；cpu/dml 即时生效）。前置条件=腿已返回。
+    // false=银行越界/后端不支持/无此输入
+    bool SetPopulation(int bank, const char* pop_input, const void* host);
 
     // inline（无银行）路径的会话/锁：Farm 用（row0 专用，整批照发=垃圾行无害）
     InferBackend& backend() { return *primary_be_; }

@@ -30,6 +30,10 @@ struct InputMeta {
     size_t esize = 4;
     std::vector<int64_t> dims;   // 全量形状：dim0=槽数（fb），其余=行形状
     size_t row_bytes = 0;        // 一行的字节数（dims[1:] 乘积 × esize）
+    bool population = false;     // population 输入面（演化路由，判决16）：
+                                 // 整张量=[P, flat_w] 种群权重平面——Claim 不清零/
+                                 // 缓存不哈希（代次 gen 已在键）/SubmitBatch 脏旗
+                                 // 全量拷（cuda）；dim0=P ≠ slots 合法
 };
 
 struct OutputMeta {
@@ -58,8 +62,18 @@ struct CpuModelDecl {
     int hidden = 0;                    // >0=一层 MLP（H 隐藏单元：relu(W1·x+b1)
                                       // → tanh(W2·h+b2)）；0=纯线性（refit 协议
                                       // 仅覆盖线性模式）
+    int pop_p = 0;                     // >0=population 路由模式（演化，判决16）：
+                                      // 追加输入 "pop"[pop_p, flat_w]（f32 种群权重
+                                      // 平面，population=true）与 "mid"[slots]
+                                      // （i64，每行个体号）；权重=pop[mid 行]，
+                                      // flat 布局=CpuBuildMlpFlat 序。须 hidden>0
     uint32_t weight_seed = 0xC0FFEEu; // 权重种子（同种子=同权重=逐位确定）
 };
+
+// population 路由模式的 flat 权重序列化（与 cpu 后端 BuildMlpWeights 同生成序）：
+// b1[H] | w1[t][i][L] | b2[j][k] | w2[j][k][H]——测试/驱动侧用来构造 pop 平面，
+// 使"均匀 pop（各行同权重）"与普通单模型腿逐位可比（门 G9a）
+std::vector<float> CpuBuildMlpFlat(const CpuModelDecl& d, uint32_t seed);
 
 // 模型配置：Farm 初始化时交给后端（多设备：每设备组一份，见 FarmConfig.devices）
 struct ModelConfig {
@@ -77,6 +91,9 @@ struct ModelConfig {
     bool ort_cuda_graph = true;       // ort: enable_cuda_graph（仅银行会话生效——图会话
                                       // 绑线程[PerThreadContext 铁律]，inline 会话强制关；
                                       // dml 恒无图）
+    std::string population_input;     // population 路由（演化，判决16）：模型里种群
+                                      // 权重平面的输入名（如 "pop"；空=普通单模型）。
+                                      // 配套 Farm::SetPopulation 代际换权重
     std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
                                       // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效

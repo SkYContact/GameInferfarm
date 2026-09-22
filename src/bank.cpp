@@ -134,6 +134,7 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
         {
             const long long tz0 = I.cen && I.cen->on ? NowNsI() : 0;
             for (size_t i = 0; i < I.spec.ins.size(); i++) {
+                if (I.spec.ins[i].population) continue;   // population 面不清零
                 size_t rb = 0;
                 void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
                 if (row) memset(row, 0, rb);
@@ -196,6 +197,12 @@ void* BankScheduler::InputRow(int bank, int slot, const char* name, size_t* row_
     if (!banks_ || bank < 0 || bank >= banks_ || !name) return nullptr;
     BankCtl& b = impl_->banks[(size_t)bank];
     return b.be->InputRow(b.sess, name, slot, row_bytes);   // 按银行取组后端
+}
+
+bool BankScheduler::SetPopulation(int bank, const char* pop_input, const void* host) {
+    if (!banks_ || bank < 0 || bank >= banks_ || !pop_input) return false;
+    BankCtl& b = impl_->banks[(size_t)bank];
+    return b.be->SetPopulation(b.sess, pop_input, host);
 }
 
 // ---------------- 提交与收割 ----------------
