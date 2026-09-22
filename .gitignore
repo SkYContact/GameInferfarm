@@ -1,0 +1,12 @@
+build*/
+out/
+*.rw1
+*.engine
+*.onnx
+*.pdb
+*.obj
+*.lib
+*.exp
+__pycache__/
+.vs/
+.vscode/
