@@ -53,7 +53,9 @@ public:
     // 建池+起调度台。**在专用调度台线程上建会话**（ORT 图会话 PerThreadContext
     // 铁律：创建/热身/回放须同线程；TRT 同规更稳）。含图地址烧死小实验门：
     // 不过=拒绝启动（字节安全性不赌）。阻塞至就绪或失败。
-    bool Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSpec* spec_out = nullptr);
+    bool Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSpec* spec_out);
+    // **前置条件：所有腿已返回**（无在途 FLIGHT、无挂起写手）。停机路径会
+    // 唤醒挂起领槽者（弃领退出）但**不保证收割在途航班**——中途强停属误用。
     void Shutdown();
 
     bool active() const { return banks_ > 0; }
@@ -72,9 +74,6 @@ public:
     bool SubmitWait(int bank, int slot, const OutputDest* dests, int n_dests);
     // 弃槽（异常路径）：作废槽（发车跳过）+完工照减（drain 不堵）
     void Abandon(int bank, int slot);
-
-    // ---- 观测（[bank] 行每 300 回信一行：srv-lat/批均/在飞/背压）----
-    void PrintStatsIfDue(bool force = false);
 
     // inline（无银行）路径的会话/锁：Farm 用（row0 专用，整批照发=垃圾行无害）
     InferBackend& backend() { return *be_; }
@@ -95,6 +94,8 @@ private:
 class InlineRunner {
 public:
     bool Init(InferBackend& be, const ModelConfig& cfg, const ModelSpec& spec);
+    // **前置条件：所有腿已返回**（无在途 FLIGHT、无挂起写手）。停机路径会
+    // 唤醒挂起领槽者（弃领退出）但**不保证收割在途航班**——中途强停属误用。
     void Shutdown();
     // 整个决策在锁内（正确性优先；生产性能形态=银行制）：清零 row0 → 组装
     // → 整批照发（垃圾行无害）→ 等完 → 回填 dests。与银行路径逐位一致

@@ -28,6 +28,10 @@ bool ParseRw1(const std::string& path, std::vector<char>& blob,
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        fclose(f);
+        return false;
+    }
     blob.resize((size_t)sz);
     size_t got = sz > 0 ? fread(blob.data(), 1, (size_t)sz, f) : 0;
     fclose(f);

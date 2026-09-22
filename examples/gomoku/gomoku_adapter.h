@@ -61,7 +61,8 @@ struct GomokuAdapter : GameAdapter {
     // 调试用棋盘快照（--show-board 用；链 0 末局）
     static inline uint8_t last_board[kCells] = {0};   // 调试快照（C++17 inline）
 
-    explicit GomokuAdapter(int) {}
+    int chain_id = 0;
+    explicit GomokuAdapter(int chain) : chain_id(chain) {}
 
     static uint32_t Lcg(uint32_t& s) {
         s = s * 1664525u + 1013904223u;
@@ -118,11 +119,11 @@ struct GomokuAdapter : GameAdapter {
         if (MakesFive(bd, cell, p)) {
             over = true;
             winner = p;
-            memcpy(last_board, bd, sizeof bd);
+            if (chain_id == 0) memcpy(last_board, bd, sizeof bd);   // 仅链 0 写
         } else if (moves >= kCells) {
             over = true;
             winner = 3;
-            memcpy(last_board, bd, sizeof bd);
+            if (chain_id == 0) memcpy(last_board, bd, sizeof bd);   // 仅链 0 写
         }
     }
 

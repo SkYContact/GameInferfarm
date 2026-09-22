@@ -66,7 +66,7 @@ void FiberSuspend() {
     // 让出：Switch 回本工人调度器（恢复点=FiberPost 投递后工人再切入；
     // 恢复即结果就绪——收割侧先拷输出后投递）
     if (!t_fi_task) return;   // 线程腿误调=无操作（防御）
-    if (g_fps.cen) g_fps.cen->OnSuspend();
+    if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnSuspend();
     SwitchToFiber(t_fi_task->sched);
     // 恢复点：工人取走时已把状态翻回 RUNNING（见工人循环取走处）
 }
@@ -74,7 +74,7 @@ void FiberSuspend() {
 void FiberPost(void* cookie) {
     // 收割侧投递：该局 fiber 进其所属工人的就绪队列+唤醒（唤醒队列本体）
     FiTask* t = (FiTask*)cookie;
-    if (g_fps.cen) {
+    if (g_fps.cen && g_fps.cen->on) {
         g_fps.cen->OnPost(t->ts_post);   // WAIT→READY + 投递时刻
         g_fps.cen->q_len[t->worker].fetch_add(1);
     }
@@ -97,7 +97,7 @@ static void WINAPI FiGameMain(void* p) {
     // 创建于工人=同链不跨工人）。到 per=链收卷。
     if (tk->gi + 1 < ch2->per)
         FiSpawnGame(ch2, tk->gi + 1, tk->worker);
-    if (g_fps.cen) g_fps.cen->OnDone();   // RUNNING→DONE + live--
+    if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnDone();   // RUNNING→DONE + live--
     tk->finished = true;
     SwitchToFiber(tk->sched);   // 不归路（工人侧 DeleteFiber；函数返回=杀线程）
 }
@@ -110,6 +110,20 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
     t->gi = gi;
     t->worker = wid;
     t->sched = g_fps.fiw[(size_t)wid].main_fib;
+    if (!t->sched) {
+        // 工人 ConvertThreadToFiberEx 失败（已退线程）：本链无人供职——与
+        // CreateFiberEx 失败同路：按剩余局记完成，防收卷谓词挂死
+        std::printf("[fiber] 工人 %d 转换失败已退役（链 %d 局 %d 按已收卷计）\n",
+                    wid, ch->chain, gi);
+        std::fflush(stdout);
+        delete t;
+        {
+            std::lock_guard<std::mutex> lk(g_fps.mx);
+            g_fps.done += ch->per - gi;
+        }
+        g_fps.cv.notify_all();
+        return;
+    }
     t->fiber = CreateFiberEx(0, 0, FIBER_FLAG_FLOAT_SWITCH, FiGameMain, t);
     if (!t->fiber) {
         std::printf("[fiber] CreateFiberEx 失败（链 %d 局 %d，本链放弃=按已收卷计）\n",
@@ -127,18 +141,20 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
     FiWorker& w = g_fps.fiw[(size_t)wid];
     {
         std::lock_guard<std::mutex> lk(w.mx);
+        // census 入册在入队之前（锁内）：工人取走前必已 live++/READY，
+        // 消灭"先减后加"瞬时 -1 的 X≠0 假警报
+        if (g_fps.cen && g_fps.cen->on) {
+            g_fps.cen->OnSpawn();
+            g_fps.cen->q_len[wid].fetch_add(1);
+        }
         w.ready.push_back(t);
-    }
-    if (g_fps.cen) {   // 新局入册：live++ + →READY（首跑也算就绪）
-        g_fps.cen->OnSpawn();
-        g_fps.cen->q_len[wid].fetch_add(1);
     }
     w.cv.notify_one();
 }
 
 static void FiWorkerLoop(int wid, Census* cen) {
     FiWorker& w = g_fps.fiw[(size_t)wid];
-    if (cen && cen->tids_worker_n < Census::kMaxWorkers)
+    if (cen && cen->on && cen->tids_worker_n < Census::kMaxWorkers)
         cen->tids_worker[cen->tids_worker_n++] = GetCurrentThreadId();
     w.main_fib = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
     if (!w.main_fib) {
@@ -150,7 +166,8 @@ static void FiWorkerLoop(int wid, Census* cen) {
     g_fps.workers_ready.fetch_add(1);   // 点火线程等到全体转换完（sched 指针就绪）
     for (;;) {
         FiTask* t = nullptr;
-        uint64_t t_wait0 = cen ? Census::NowUs() : 0;
+        const bool con = cen && cen->on;   // census 门（默认关=零开销）
+        uint64_t t_wait0 = con ? Census::NowUs() : 0;
         {
             std::unique_lock<std::mutex> lk(w.mx);
             w.cv.wait(lk, [&w] { return w.stop || !w.ready.empty(); });
@@ -158,8 +175,8 @@ static void FiWorkerLoop(int wid, Census* cen) {
             t = w.ready.front();
             w.ready.pop_front();
         }
-        const uint64_t t_run0 = cen ? Census::NowUs() : 0;
-        if (cen) {
+        const uint64_t t_run0 = con ? Census::NowUs() : 0;
+        if (con) {
             // 闲段（cv 等待）入账 + 取走转移 READY→RUNNING + 复活样（投递→取走）
             cen->idle_ns[wid].fetch_add((t_run0 - t_wait0) * 1000);
             cen->OnPick(wid, t->ts_post);
@@ -181,7 +198,7 @@ static void FiWorkerLoop(int wid, Census* cen) {
             g_fps.cv.notify_all();
         }
         // else：让出于等待点，FiberPost 投回本队列
-        if (cen)   // 忙段（含 fiber 全部执行）入账
+        if (con)   // 忙段（含 fiber 全部执行）入账
             cen->busy_ns[wid].fetch_add((Census::NowUs() - t_run0) * 1000);
     }
     ConvertFiberToThread();
@@ -192,6 +209,8 @@ void FiberPool::Configure(int workers, Census* census) {
         int hc = (int)std::thread::hardware_concurrency();
         workers = hc >= 2 ? hc / 2 : 1;   // 物理核≈hc/2（SMT 负资产判决）
     }
+    if (workers > Census::kMaxWorkers)   // census 定长数组容量（防 OOB）
+        workers = Census::kMaxWorkers;
     workers_ = workers;
     census_ = census;
 }
@@ -259,9 +278,6 @@ struct ThreadLegCtx {
     FiberFrameFn frame_fn;
     void* user;
     int chain, per;
-    double stagger_ms;
-    int chains;
-    std::atomic<int>* started;
 };
 
 static void ThreadChainMain(ThreadLegCtx c) {
@@ -275,7 +291,7 @@ double RunLegThreads(int chains, int per, FiberGameFn game_fn, FiberFrameFn fram
                      void* user, double stagger_ms) {
     auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> ths;
-    ThreadLegCtx base{game_fn, frame_fn, user, 0, per, stagger_ms, chains, nullptr};
+    ThreadLegCtx base{game_fn, frame_fn, user, 0, per};
     for (int c = 0; c < chains; c++) {
         ThreadLegCtx lc = base;
         lc.chain = c;

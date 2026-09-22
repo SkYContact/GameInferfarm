@@ -15,6 +15,14 @@
 //
 // 图会话收益仍全额：批提交 3-4 次 WDDM 合成 1 次（ORT 内部 CUDA Graph）；
 // 零拷贝直写槽/攒批/多批在飞等调度层收益与后端无关。
+//
+// 【PerThreadContext 与满座自驱的实测注记（2026-09-22）】铁律字面要求图会话
+// 的创建/热身/回放同线程；本库银行会话的创建+热身在调度台线程，但**满座自驱
+// 发车**让最后完笔的工人线程就地 RunWithBinding（回放跨线程）。已在
+// onnxruntime 1.30.0（q35 DLL）上以 FARM_BANK_WINDOW_FLOOR=1000 强制逐批自驱
+// （self_dep=42/38）实测：结果逐位一致、无异常——即当前版本对回放的实际
+// 约束比文档宽松。升级 ORT 版本时此结论须复验（自驱路径可退化为"置旗由
+// 调度台发射"）。
 #include "inferfarm/backend.h"
 #include "cudart_dyn.h"
 #include "onnxruntime_c_api.h"
@@ -424,7 +432,10 @@ private:
         }
         s->ins.resize(n_in);
         OrtAllocator* alloc = nullptr;
-        a->GetAllocatorWithDefaultOptions(&alloc);
+        if (a->GetAllocatorWithDefaultOptions(&alloc) || !alloc) {
+            DestroySession(s);
+            return nullptr;
+        }
         for (size_t i = 0; i < n_in; i++) {
             char* nm = nullptr;
             a->SessionGetInputName(s->sess, i, alloc, &nm);
@@ -480,7 +491,11 @@ private:
             OrtTypeInfo* ti = nullptr;
             if (a->SessionGetOutputTypeInfo(s->sess, j, &ti)) { DestroySession(s); return nullptr; }
             const OrtTensorTypeAndShapeInfo* info = nullptr;
-            a->CastTypeInfoToTensorInfo(ti, &info);
+            if (a->CastTypeInfoToTensorInfo(ti, &info) || !info) {
+                a->ReleaseTypeInfo(ti);
+                DestroySession(s);
+                return nullptr;
+            }
             ONNXTensorElementDataType et;
             a->GetTensorElementType(info, &et);
             size_t nd = 0;

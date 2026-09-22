@@ -384,7 +384,7 @@ public:
         }
         if (g_cu.StreamCreate(&s->stream, 0)) {
             std::fprintf(stderr, "[trt] 专用流创建失败\n");
-            delete s;
+            DestroySession(s);   // 中段失败完整回收（防泄漏）
             return nullptr;
         }
         const size_t kAlign = 256;
@@ -401,7 +401,7 @@ public:
         if (g_cu.HostAlloc(&s->in_h_arena, s->in_h_bytes, 0)
             || g_cu.Malloc(&s->in_d_arena, s->in_d_bytes)) {
             std::fprintf(stderr, "[trt] 输入 arena(%zuB) 分配失败\n", s->in_h_bytes);
-            delete s;
+            DestroySession(s);   // 中段失败完整回收（防泄漏）
             return nullptr;
         }
         off = 0;
@@ -414,7 +414,7 @@ public:
             if (!s->ctx->setTensorAddress(s->ins[i].meta.name.c_str(), s->ins[i].dev)) {
                 std::fprintf(stderr, "[trt] setTensorAddress(%s) 失败\n",
                              s->ins[i].meta.name.c_str());
-                delete s;
+                DestroySession(s);   // 中段失败完整回收（防泄漏）
                 return nullptr;
             }
         }
@@ -430,7 +430,7 @@ public:
         if (g_cu.HostAlloc(&s->out_h_arena, s->out_h_bytes, 0)
             || g_cu.Malloc(&s->out_d_arena, s->out_d_bytes)) {
             std::fprintf(stderr, "[trt] 输出 arena(%zuB) 分配失败\n", s->out_h_bytes);
-            delete s;
+            DestroySession(s);   // 中段失败完整回收（防泄漏）
             return nullptr;
         }
         off = 0;
@@ -442,7 +442,7 @@ public:
             if (!s->ctx->setTensorAddress(s->outs[j].meta.name.c_str(), s->outs[j].dev)) {
                 std::fprintf(stderr, "[trt] setTensorAddress(%s) 失败\n",
                              s->outs[j].meta.name.c_str());
-                delete s;
+                DestroySession(s);   // 中段失败完整回收（防泄漏）
                 return nullptr;
             }
         }
@@ -648,6 +648,10 @@ private:
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
+        if (sz < 0) {
+            fclose(f);
+            return false;
+        }
         std::vector<char> blob((size_t)sz);
         size_t got = sz > 0 ? fread(blob.data(), 1, (size_t)sz, f) : 0;
         fclose(f);

@@ -41,11 +41,12 @@ public:
     unsigned long tids_worker[kMaxWorkers];
     int tids_worker_n = 0;
     unsigned long tid_disp = 0, tid_printer = 0;
-    // ---- 银行调度台分段（ns；调度台单线程自累加/复位）----
-    long long seg_wait_ns = 0, seg_poll_ns = 0, seg_close_ns = 0;
-    long long seg_dep_disp_ns = 0, seg_dep_self_ns = 0;
-    long long seg_harvest_ns = 0, seg_rot_ns = 0, seg_iter_ns = 0;
-    long long seg_iter_n = 0, seg_disp_n = 0, seg_self_dep_n = 0;
+    // ---- 银行调度台分段（ns；调度台单写 relaxed，打印/汇总线程读——原子
+    //      消除与 StopPrinter 的正式数据竞争）----
+    std::atomic<long long> seg_wait_ns{0}, seg_poll_ns{0}, seg_close_ns{0};
+    std::atomic<long long> seg_dep_disp_ns{0}, seg_dep_self_ns{0};
+    std::atomic<long long> seg_harvest_ns{0}, seg_rot_ns{0}, seg_iter_ns{0};
+    std::atomic<long long> seg_iter_n{0}, seg_disp_n{0}, seg_self_dep_n{0};
     // ---- 工人侧（原子；多工人累加）----
     std::atomic<long long> claim_n{0};
     std::atomic<long long> claim_try_ns{0}, claim_zero_ns{0};

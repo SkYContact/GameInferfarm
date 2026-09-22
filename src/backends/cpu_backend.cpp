@@ -116,7 +116,8 @@ public:
         s->slots = spec.slots;
         s->K = cfg.cpu.poly_k > 0 ? cfg.cpu.poly_k : 8;
         s->H = cfg.cpu.hidden > 0 ? cfg.cpu.hidden : 0;
-        // 输入 arena（256B 对齐 carve——与 GPU 路径同布局纪律）
+        // 输入 arena（偏移按 256B 粒度递进；基址=vector data（16B 级对齐）——
+        // carve 边界是 256 的倍数但非绝对 256 对齐，toy 语义无碍）
         const size_t kAlign = 256;
         size_t off = 0;
         s->ins.resize(spec.ins.size());
@@ -235,6 +236,12 @@ public:
                         } else if (ci.meta.et == DTYPE_I64) {
                             const int64_t* x = (const int64_t*)row;
                             size_t elems = ci.meta.row_bytes / 8;
+                            int64_t sum = 0;
+                            for (size_t e = 0; e < elems; e++) sum += x[e];
+                            acc += (float)sum * wv[0];
+                        } else if (ci.meta.et == DTYPE_I32) {
+                            const int32_t* x = (const int32_t*)row;
+                            size_t elems = ci.meta.row_bytes / 4;
                             int64_t sum = 0;
                             for (size_t e = 0; e < elems; e++) sum += x[e];
                             acc += (float)sum * wv[0];

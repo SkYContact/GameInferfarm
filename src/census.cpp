@@ -46,10 +46,10 @@ void Census::ResetLeg() {
         busy_ns[i].store(0);
         idle_ns[i].store(0);
     }
-    seg_wait_ns = seg_poll_ns = seg_close_ns = 0;
-    seg_dep_disp_ns = seg_dep_self_ns = 0;
-    seg_harvest_ns = seg_rot_ns = seg_iter_ns = 0;
-    seg_iter_n = seg_disp_n = seg_self_dep_n = 0;
+    seg_wait_ns.store(0); seg_poll_ns.store(0); seg_close_ns.store(0);
+    seg_dep_disp_ns.store(0); seg_dep_self_ns.store(0);
+    seg_harvest_ns.store(0); seg_rot_ns.store(0); seg_iter_ns.store(0);
+    seg_iter_n.store(0); seg_disp_n.store(0); seg_self_dep_n.store(0);
     claim_n.store(0);
     claim_try_ns.store(0); claim_zero_ns.store(0);
     claim_spin_ns.store(0); claim_park_ns.store(0);
@@ -246,7 +246,7 @@ void Census::StopPrinter() {
                     (double)claim_spin_ns.load() / 1e6,
                     sn, sn ? (double)sub_ns.load() / 1e6 / sn : 0.0,
                     sn ? (double)copyslot_ns.load() / 1e6 / sn : 0.0,
-                    seg_self_dep_n);
+                    seg_self_dep_n.load());
         std::fflush(stdout);
     }
     delete pr;

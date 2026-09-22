@@ -89,6 +89,9 @@ static std::vector<char> MakeRw1(const std::vector<std::pair<std::string, std::v
     }
     return b;
 }
+static std::vector<std::pair<std::string, std::vector<float>>> ents_empty() {
+    return {{"policy.Wobs", std::vector<float>(8, 0.1f)}};
+}
 static bool WriteFile(const char* path, const std::vector<char>& b) {
     FILE* f = fopen(path, "wb");
     if (!f) return false;
@@ -232,6 +235,17 @@ int main() {
         std::vector<Rw1Entry> es;
         CHECK(!ParseRw1("refit_bad.rw1", blob, es), "G5 坏 magic fail fast");
         CHECK(!ParseRw1("no_such_file.rw1", blob, es), "G5 缺文件 fail fast");
+        {
+            // 截断（半条目）与 dtype 非法两条负路径
+            std::vector<char> full = MakeRw1({ents_empty()});
+            WriteFile("refit_trunc.rw1", std::vector<char>(full.begin(), full.begin() + full.size() / 2));
+            CHECK(!ParseRw1("refit_trunc.rw1", blob, es), "G5 截断 blob fail fast");
+            std::vector<char> bad_dt = full;
+            size_t dt_off = 14 + std::string("policy.Wobs").size();   // 头12B+名长2B+名
+            bad_dt[dt_off] = (char)9;   // 首条目 dtype 字段改非法值
+            WriteFile("refit_dtype.rw1", bad_dt);
+            CHECK(!ParseRw1("refit_dtype.rw1", blob, es), "G5 dtype 非法 fail fast");
+        }
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
