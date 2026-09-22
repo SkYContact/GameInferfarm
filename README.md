@@ -155,12 +155,17 @@ TRT 后端：`cmake -B build-trt -DINFERFARM_WITH_TRT=ON`
 AMD 核显/独显）下保"同配置重跑逐位同"（实测跨厂商指纹三跑全同）。同构双卡
 （2× NVIDIA TRT）逐位门天然保。推理缓存按组命名空间。
 
-五子棋范例 `--device` 语法（首个替换主设备，后续追加组）：
+五子棋范例 `--device` 语法（首个替换主设备，后续追加组；`share=` 链分配
+权重，缺省均分，异构按算力配比如 `share=4`；`share=0`=该组不接链）：
 
 ```
-gomoku --device ort,ep=cuda,dev=0,banks=2,model=m.onnx \
-       --device ort,ep=dml,dev=1,banks=1,model=m.onnx,dir=D:/dml_rt/capi
+gomoku --device ort,ep=cuda,dev=0,banks=2,share=4,model=m.onnx \
+       --device ort,ep=dml,dev=1,banks=1,share=1,model=m.onnx,dir=D:/dml_rt/capi
 ```
+
+**分组定律（实测）**：链被分组切薄 ⇒ 批密度稀释（小负载分组亏——双 CUDA
+同构组也一样慢，非异构之罪）；链够稠 ⇒ 两组=两条并行填充管线（512 局尺度
+均分异构 1113 局/s > 单卡 654）。真实算力场景按 share 配比或压 0。
 
 AMD 卡走 `ep=dml`（DirectML，宿主绑定+同步 Run；需 onnxruntime-directml
 构建，`pip install --target <dir> onnxruntime-directml` 后 `dir=` 指其

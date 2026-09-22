@@ -150,12 +150,20 @@ bitwise determinism (measured: NVIDIA CUDA + AMD DML, identical fingerprints
 across three runs). Two same-model NVIDIA cards keep the bitwise gate for free.
 The inference cache namespaces keys per group.
 
-Sample `--device` syntax (first replaces the primary device, later ones append):
+Sample `--device` syntax (first replaces the primary device, later ones append;
+`share=` is the chain-assignment weight — default splits evenly, set by
+compute ratio on heterogeneous rigs, `share=0` parks a group):
 
 ```
-gomoku --device ort,ep=cuda,dev=0,banks=2,model=m.onnx \
-       --device ort,ep=dml,dev=1,banks=1,model=m.onnx,dir=D:/dml_rt/capi
+gomoku --device ort,ep=cuda,dev=0,banks=2,share=4,model=m.onnx \
+       --device ort,ep=dml,dev=1,banks=1,share=1,model=m.onnx,dir=D:/dml_rt/capi
 ```
+
+**Partitioning law (measured)**: splitting chains thins each group's arrival
+stream — at low load partitioning loses (even two CUDA groups on the same
+card run slower; not an iGPU problem), while at high load two groups are two
+parallel fill pipelines (512 games: even-split heterogeneous 1113 games/s vs
+single-GPU 654). Weight by `share` (or park weak GPUs at 0) on real models.
 
 AMD GPUs go through `ep=dml` (DirectML: host binding + synchronous Run; needs
 an onnxruntime-directml build — `pip install --target <dir>

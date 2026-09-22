@@ -7,10 +7,10 @@
 //          [--census] [--show-board]
 //
 //   --device 多设备组（判决15，可重复；首个替换主设备，后续追加设备组）：
-//     spec = backend[,ep=cuda|dml][,dev=N][,banks=K][,model=路径][,engine=路径][,dir=运行时目录]
-//   例（NVIDIA 主卡 + AMD 核显，链按 c%2 钉扎到组）：
+//     spec = backend[,ep=cuda|dml][,dev=N][,banks=K][,share=W][,model=路径][,engine=路径][,dir=运行时目录]
+//   例（NVIDIA 主卡 + AMD 核显，share=按算力配链；缺省均分）：
 //     gomoku --backend ort --model m.onnx --banks 2 \
-//            --device ort,ep=dml,dev=1,banks=1,model=m.onnx,dir=D:/dml_rt
+//            --device ort,ep=dml,dev=1,banks=1,share=0.25,model=m.onnx,dir=D:/dml_rt
 //
 // ort/trt 模型工件由 tools/bake_gomoku_mlp.py 烤制（一层 MLP，权重由种子
 // 生成——确定性）。三后端同架构；指纹只在与自身同后端双腿间可比。
@@ -84,6 +84,7 @@ int main(int argc, char** argv) {
             if (!(v = field("dir")).empty()) d.model.ort_dir = v;
             if (!(v = field("banks")).empty()) d.banks = atoi(v.c_str());
             else d.banks = 1;
+            if (!(v = field("share")).empty()) d.share = atof(v.c_str());
             if (!have_model) {
                 if (d.model.backend == "ort") d.model.model_path = cfg.model.model_path;
                 if (d.model.backend == "trt") d.model.engine_path = cfg.model.engine_path;

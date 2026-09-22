@@ -109,6 +109,19 @@ bool Farm::Init(FarmConfig cfg) {
         return false;
     }
     // ---- 每组建后端 + LoadSpec + 组间结构核对 ----
+    double share_sum = 0;
+    for (auto& d : devs) {
+        if (d.share < 0) {
+            std::fprintf(stderr, "[farm] 设备组 share=%.2f 非法（≥0；且不可全 0）\n",
+                         d.share);
+            return false;
+        }
+        share_sum += d.share;
+    }
+    if (share_sum <= 0) {
+        std::fprintf(stderr, "[farm] 设备组 share 全 0——至少一组 >0\n");
+        return false;
+    }
     group_bes_.clear();
     for (size_t gi = 0; gi < devs.size(); gi++) {
         InferBackend* be = MakeBackend(devs[gi].model.backend);
@@ -147,6 +160,22 @@ bool Farm::Init(FarmConfig cfg) {
     spec_ok_ = true;
     backend_ = group_bes_[0];
     n_dev_ = (int)devs.size();
+    // 链→组分配：平滑加权轮询（nginx 同款；确定性=链号函数，重跑逐位不破）。
+    // 缺省全 share=1 ⇒ 两组时≡c%n_groups 老行为。share=0 ⇒ 该组不接链
+    // （备用/测试位）。
+    {
+        chain_grp_.assign((size_t)cfg_.chains, 0);
+        std::vector<double> cw(devs.size(), 0.0);
+        for (int c = 0; c < cfg_.chains; c++) {
+            int best = -1;
+            for (size_t gi = 0; gi < devs.size(); gi++) {
+                cw[gi] += devs[gi].share;
+                if (best < 0 || cw[gi] > cw[(size_t)best]) best = (int)gi;
+            }
+            cw[(size_t)best] -= share_sum;
+            chain_grp_[(size_t)c] = best;
+        }
+    }
     // init 期一次性换心：多设备组不支持（半换心农场撕裂确定性）——fail fast
     if (!cfg_.model.refit_weights.empty()) {
         if (n_dev_ > 1) {
@@ -301,7 +330,9 @@ bool Farm::DriveDecision(GameAdapter* g, int grp) {
 void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
                       int chain_id, int game_id) {
     g->NewGame(seed, we_first);
-    const int grp = (int)((uint32_t)chain_id % (uint32_t)n_dev_);   // 链→组钉扎
+    const int grp = chain_grp_.empty() ? 0
+        : chain_grp_[(size_t)((uint32_t)chain_id % (uint32_t)chain_grp_.size())];
+                                          // 链→组（加权轮询表；表长=chains）
     long long dec = 0;
     bool infer_fail = false;
     for (long long guard = 0; guard < cfg_.max_decisions; guard++) {
@@ -371,11 +402,15 @@ double Farm::RunLeg(AdapterFactory make, void* user) {
             d.banks = cfg_.banks;
             devs.push_back(d);
         }
-        for (size_t gi = 0; gi < devs.size(); gi++)
-            std::printf("[%s] 设备组 %zu: %s ep=%s dev=%d ×%d 银行（链 c%%%zu 钉扎）\n",
+        for (size_t gi = 0; gi < devs.size(); gi++) {
+            int nch = 0;
+            for (int c = 0; c < cfg_.chains; c++)
+                if (chain_grp_[(size_t)c] == (int)gi) nch++;
+            std::printf("[%s] 设备组 %zu: %s ep=%s dev=%d ×%d 银行 share=%.2f → %d 链\n",
                         cfg_.name.c_str(), gi, devs[gi].model.backend.c_str(),
                         devs[gi].model.ort_ep.c_str(), devs[gi].model.device_id,
-                        devs[gi].banks, devs.size());
+                        devs[gi].banks, devs[gi].share, nch);
+        }
     }
     std::fflush(stdout);
     double sec;
