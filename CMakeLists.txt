@@ -45,5 +45,8 @@ target_link_libraries(farm_test PRIVATE inferfarm)
 add_executable(refit_probe tests/refit_probe.cpp)
 target_link_libraries(refit_probe PRIVATE inferfarm)
 
+add_executable(gomoku examples/gomoku/gomoku_main.cpp)
+target_link_libraries(gomoku PRIVATE inferfarm)
+
 enable_testing()
 add_test(NAME farm_test COMMAND farm_test)

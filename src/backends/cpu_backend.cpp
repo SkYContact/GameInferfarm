@@ -54,7 +54,7 @@ struct CpuSession {
     std::vector<unsigned char> in_arena;
     std::vector<float> out_arena;
     // 权重：out j 行 k 对 in i 的向量（长 = min(in 元素数, K)）
-    static const int kK = 8;       // 每输入取行首元素数上限
+    int K = 8;                     // 每输入取行首元素数上限（decl.poly_k）
     std::vector<std::vector<std::vector<std::vector<float>>>> w;   // [j][k][i]
     unsigned seq = 0;
     int last_n = 0;
@@ -108,6 +108,7 @@ public:
         (void)for_bank;   // CPU 无图会话/线程绑定问题
         CpuSession* s = new CpuSession();
         s->slots = spec.slots;
+        s->K = cfg.cpu.poly_k > 0 ? cfg.cpu.poly_k : 8;
         // 输入 arena（256B 对齐 carve——与 GPU 路径同布局纪律）
         const size_t kAlign = 256;
         size_t off = 0;
@@ -331,8 +332,8 @@ private:
                     CpuIn& ci = s->ins[i];
                     size_t L;
                     if (ci.meta.et == DTYPE_F32)
-                        L = ci.meta.row_bytes / 4 < (size_t)CpuSession::kK
-                                ? ci.meta.row_bytes / 4 : (size_t)CpuSession::kK;
+                        L = ci.meta.row_bytes / 4 < (size_t)s->K
+                                ? ci.meta.row_bytes / 4 : (size_t)s->K;
                     else
                         L = 1;
                     std::vector<float>& wv = s->w[j][(size_t)k][i];

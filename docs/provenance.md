@@ -46,6 +46,12 @@
   （银行协议 Claim/SubmitWait 直读）+ G5 完全复刻三腿。
 - 首夜血案两起入坑目录：帧所有权 delete、测试指纹忘回填（空过+假败一对）。
 
+## 开源化（2026-09-22 同日）
+- 五子棋接入范例 examples/gomoku（未训练 CPU 模型 vs 规则对手——流程示范，
+  不赢棋是特性说明）；farm_test 增 G6（五子棋银行 vs inline 逐位门）。
+- README 重写为开源中文主文档 + README.en.md 英文副本；LICENSE=MIT。
+- CPU 后端点积宽度可配（CpuModelDecl.poly_k，棋类全局面输入=行宽）。
+
 ## 未决
 - run25 发车仍在 YGO 侧停车等用户口令（发车卡 D:/ygo_data/es_run25_launch.txt）
   ——**框架会话勿动它**。

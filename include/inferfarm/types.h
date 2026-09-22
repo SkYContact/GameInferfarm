@@ -53,6 +53,8 @@ struct CpuModelDecl {
     std::vector<In> ins;
     std::vector<Out> outs;
     int slots = 64;
+    int poly_k = 8;                    // 每输入参与点积的行首元素数上限（棋类
+                                      // 全局面输入=行宽，如五子棋 225）
     uint32_t weight_seed = 0xC0FFEEu; // 权重种子（同种子=同权重=逐位确定）
 };
 

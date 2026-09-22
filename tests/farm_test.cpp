@@ -8,6 +8,7 @@
 //  G4 census：X（失踪人口）恒 0、腿末 live=0、全状态归零
 //  G5 refit：同 blob 两次换心 → 逐位同；不同 blob → 结果必变（A1/A2 的 CPU 版）
 #include "../examples/toy/toy_adapter.h"
+#include "../examples/gomoku/gomoku_adapter.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -190,6 +191,38 @@ int main() {
               "G5 同 blob 两次换心=逐位同（含指纹）");
         CHECK(ra.fp != rd.fp,
               "G5 异 blob 必变（换心生效，指纹级）");
+
+        // RW1 解析负路径（下面继续）
+        // G6：五子棋范例——银行 vs inline 逐位（真实棋类的接缝验证）
+        {
+            auto gomoku_leg = [&](int banks) {
+                FarmConfig cfg;
+                cfg.name = "gomoku";
+                cfg.chains = 4;
+                cfg.games = 8;
+                cfg.seed0 = 20260922u;
+                cfg.banks = banks;
+                cfg.slots = 8;
+                cfg.workers = 4;
+                cfg.stagger_ms = 1;
+                cfg.model.backend = "cpu";
+                cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+                Farm farm;
+                if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+                farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+                const FarmTally& t = farm.tally();
+                LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
+                            t.decisions};
+                r.fp = t.fingerprint;
+                return r;
+            };
+            LegResult gb = gomoku_leg(2);
+            LegResult gi = gomoku_leg(0);
+            CHECK(gb.decisions > 0, "G6 五子棋腿完成（决策 > 0）");
+            CHECK(gb.fw == gi.fw && gb.sw == gi.sw && gb.decisions == gi.decisions
+                  && gb.fp == gi.fp,
+                  "G6 五子棋银行 vs inline 逐位一致（含指纹）");
+        }
 
         // RW1 解析负路径：坏 magic
         std::vector<char> bad = MakeRw1(ents);

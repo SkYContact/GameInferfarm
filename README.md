@@ -1,96 +1,153 @@
-# inferfarm（推理农场）
+# inferfarm · 推理农场
 
-**通用 C++ 游戏决策推理框架库**——把"大量同构游戏并发推进 + 批量神经网络决策"这件事做成
-游戏无关的库。YGO（游戏王）产线是第一个乘客与参考实现（42→317-368 局/s，7.5-8.7×）；
-其他游戏按 `GameAdapter` 接缝接入。
+**通用 C++ 游戏决策推理框架**——把"大量同构游戏并发推进 + 神经网络批量决策"做成游戏无关的库。
+写一个 `GameAdapter` 接入你的游戏，剩下的并发、攒批、GPU 提交、取证全部交给农场。
 
-## 四件游戏无关资产（全部跑过生产）
+```
+[English version](README.en.md)
+```
 
-1. **fiber 调度器**（`fiber_pool.h`）：K 工人线程（默认=物理核）+ 每局一 fiber +
-   per-worker 唤醒队列。推理等待=Switch 回调度器让出，不睡 cv、不进 OS 运行队列
-   ——唤醒税由此消除（实测 ort_Run 4.55ms 里 3.3ms 是 OS 调度等待）。
-   链-工人亲和保住 thread_local 语义；切换点装卸链寿命 TLS 帧（`tls_frame.h`）。
-2. **零拷贝槽位银行制**（`bank.h`）：N 家银行 × slots 槽 pinned、地址终身固定、
-   **每家一张专属预捕获图**（图与地址一夫一妻）。原子游标领号（先占在途再领号）
-   →组装**直写槽**（零同进程拷贝）→满座自驱/闹钟发车→close-drain（有界 µs，
-   不写超时不写迁移）→只拷前 n 行（行独立前提）→异步整批回放→旗标收割→还池。
-   池容量=在飞上限=天然背压。
-3. **refit 热换**（`refit.h` + `tools/refit_blob.py`）：RW1 权重 blob 毫秒级换心；
-   量化尺度 parent 定死=候选比较共模自洽。TRT 后端独有（ORT 无此 API）。
-4. **census 取证**（`census.h`）：全原子状态机（running/ready/wait_answer，X 恒 0
-   硬不变量）+复活路径直方图+工人忙闲+线程级 CPU 普查+调度台循环分段。
-   `FARM_CENSUS=1` 选通，默认关=零开销。
+## 为什么需要它
 
-## 三后端（`InferBackend` 接口并列）
+自博弈/强化学习评估/对局生成这类负载的瓶颈几乎从不在神经网络本身，而在：
+每个决策一次线程唤醒的 OS 调度税、特征组装的同进程拷贝链、小批次付整批的
+GPU 门票。推理农场把这三层做成游戏无关的机件（实测 7.5-8.7×，见
+[docs/design-judgments.md](docs/design-judgments.md)）：
 
-| 后端 | 图会话 | 完成检测 | refit | 用途 |
-|---|---|---|---|---|
-| `cpu` | 无需 | 即时 | ✓（toy 协议） | 无 GPU 全链验证、确定性门、refit 语义试验 |
-| `ort` | enable_cuda_graph（银行会话绑调度台线程——PerThreadContext 铁律） | 整设备同步（不赌 ORT 流序） | ✗ | 不烤 TRT 的路线：调度/拷贝/攒批层收益全额，围栏税留在调度台线程 |
-| `trt` | CUDA Graph 批捕获（一银行一图） | GPU 邮箱 4B 盖章+volatile 自旋（µs 级，绕开 WDDM 围栏） | ✓ | 生产路线：提交合并+围栏消灭+INT8 换心 |
+1. **fiber 调度器**：K 工人线程 + 每局一 fiber + per-worker 唤醒队列。推理等待
+   =纤程让出（不睡 cv、不进 OS 运行队列）——唤醒税归零；链-工人亲和保住
+   thread_local 语义，切换点装卸链寿命 TLS 帧。
+2. **零拷贝槽位银行制**：N 家银行 × slots 槽 pinned、地址终身固定、每家一张
+   专属 CUDA Graph。原子游标领号 → **组装直写槽**（零同进程拷贝）→ 满座自驱/
+   闹钟发车 → close-drain（有界 µs）→ 只拷前 n 行 → 异步整批回放 → 旗标收割 →
+   还池。池容量=在飞上限=天然背压。
+3. **refit 热换**：RW1 权重 blob 毫秒级换心（演化/评估场景一代候选免烤引擎）。
+4. **census 取证**：全原子状态机（人口恒等式 X≡0）、复活路径直方图、线程级
+   CPU 普查、调度台循环分段——性能问题先有测量再有解释。
+
+## 五子棋接入范例（无需训练任何模型）
+
+[examples/gomoku](examples/gomoku) 用一个真实的完整游戏示范接入全流程：
+**未训练神经网络**（CPU 后端确定性模型，权重由种子生成）vs **规则对手**
+（能赢就赢/必须堵就堵/启发式落子）。它不会赢——但种子协议、直写槽、银行
+攒批、收割回投、逐位确定性全部真实工作；换成你训练好的模型只是改一处模型
+声明（或换 ort/trt 后端），适配器零改动。
+
+```bash
+build/Release/gomoku.exe --chains 8 --games 16 --show-board
+```
+
+```
+[gomoku] 汇总: 先手 0/8, 后手 0/8, 综合 0/16 (0.0%)，决策 152，推理故障局 0
+[gomoku] 16 局 / 0.05s；先手 0/8 后手 0/8；指纹 eef000cc10107e1c
+
+终局样例棋盘（链 0 末局）：
+   0123456789ABCDE
+ 0 ..............O
+ 4 ....O..X..OO.O.
+ 6 ......XXX......
+ 7 ......XXX......
+ 8 .O....XXX....O.
+   ...（O=我方神经网络 X=对手规则——未训练模型被规则对手击败，符合预期）
+```
+
+### 接入你的游戏只需要这个
+
+```cpp
+#include "inferfarm/inferfarm.h"
+
+struct MyGame : inferfarm::GameAdapter {
+    void NewGame(uint64_t seed, bool we_first) override;      // 开局（清干净=确定性前提）
+    bool AdvanceToDecision() override;                        // 推进到我方下一个决策点
+    void AssembleInto(inferfarm::SlotWriter& slot) override;  // 特征直写槽行（零拷贝）
+    int  CollectOutputs(inferfarm::OutputDest* d, int cap) override;  // 申报输出缓冲
+    void ApplyResult() override;                              // 消费输出、推进局面
+    void OnInferFail() override;                              // 推理故障=判负纪律
+    bool IsDone() override;  int Outcome() override;          // 1 胜 0 负 -1 平
+    bool WeAreFirst() override;  inferfarm::ITlsFrame* TlsFrame() override;
+};
+
+int main() {
+    inferfarm::FarmConfig cfg;              // workers/banks/slots/window/stagger/model...
+    cfg.model.backend = "cpu";              // "cpu" | "ort" | "trt"
+    inferfarm::Farm farm;
+    farm.Init(cfg);
+    farm.RunLeg([](int chain, void*) -> inferfarm::GameAdapter* {
+        return new MyGame();
+    }, nullptr);
+}
+```
+
+三条契约（详见 [include/inferfarm/game_adapter.h](include/inferfarm/game_adapter.h)）：
+1. **advance 与 assemble 无挂起点**——银行 close-drain 有界的前提；
+2. **行独立**——模型无 batchnorm 类跨行算子（银行不满整批照发、尾行旧数据无害）；
+3. **逐位确定性由适配器保证**——种子协议：`game seed = seed0 + chain*per + game`。
+
+有跨让出存活 thread_local 状态的游戏（如脚本引擎），把它装进
+[`ITlsFrame`](include/inferfarm/tls_frame.h)（附 TLS 审计清单）——调度器在
+切换点自动装卸。
 
 ## 快速开始
 
 ```bash
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+git clone <本仓库> && cd inferfarm
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # 或任意支持的生成器
 cmake --build build --config Release
-build/Release/farm_test.exe      # 确定性门（G1-G5，全绿才算数）
-build/Release/toy.exe            # 示范：玩具适配器 × CPU 后端 × fiber × 银行
+
+build/Release/farm_test.exe    # 确定性门（G1-G6 全绿才算数）
+build/Release/toy.exe          # 最小玩具（TLS 帧用法示范）
+build/Release/gomoku.exe       # 五子棋范例
 ```
 
 TRT 后端：`cmake -B build-trt -DINFERFARM_WITH_TRT=ON`
 （`INFERFARM_TRT_INCLUDE_DIR` 指向含 NvInferRuntime.h 的目录）。
 
-## 接一个游戏
+## 三后端
 
-实现 `GameAdapter`（见 `game_adapter.h` 与 `examples/toy/toy_adapter.h`）：
+| 后端 | 批图 | 完成检测 | refit 换心 | 定位 |
+|---|---|---|---|---|
+| `cpu` | — | 即时 | ✓（demo 协议） | 无 GPU 全链验证、确定性门、CI |
+| `ort` | enable_cuda_graph（银行会话绑调度台线程） | 整设备同步 | ✗（ORT 无此 API） | 不烤 TRT：调度/拷贝/攒批层收益全额 |
+| `trt` | CUDA Graph 批捕获（一银行一图） | GPU 邮箱 4B 盖章 + volatile 自旋 | ✓ | 生产路线：提交合并 + 围栏税消灭 + 毫秒换心 |
 
-```cpp
-struct MyAdapter : GameAdapter {
-    void NewGame(uint64_t seed, bool we_first) override;
-    bool AdvanceToDecision() override;          // 契约1：无挂起点
-    void AssembleInto(SlotWriter& slot) override;  // 直写槽行（零拷贝）
-    int  CollectOutputs(OutputDest* d, int cap) override;
-    void ApplyResult() override;
-    bool IsDone() override;  int Outcome() override;
-    ITlsFrame* TlsFrame() override;             // 跨让出 TLS 装进帧（血律）
-};
+三后端同一 `InferBackend` 接口，同一银行协议——吞吐差在提交层，行为逐位可比。
 
-FarmConfig cfg;   // workers/banks/slots/window/stagger/census/model...
-Farm farm;
-farm.Init(cfg);
-farm.RunLeg([](int chain, void*) -> GameAdapter* { return new MyAdapter(); }, nullptr);
-```
+## 环境旋钮（显式 Config 为准，env 快速实验）
 
-三条契约（违反=框架正确性前提破洞）：**①advance 与 assemble 无挂起点**（drain 有界的前提）；
-**②行独立**（无 batchnorm 类跨行算子——银行不满整批照发、尾行旧数据无害）；
-**③逐位确定性由适配器保证**（种子协议：game seed = seed0 + chain*per + game）。
+`FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
+`FARM_STAGGER_MS` `FARM_CENSUS` `FARM_ORT_DIR` `FARM_CUDA_DIR` `FARM_TRT_DIR`
 
 ## 目录
 
 ```
-include/inferfarm/   公共头（types/backend/fiber_pool/bank/census/refit/game_adapter/farm）
-src/                 实现（bank.cpp=银行协议；backends/=cpu|ort|trt）
-examples/toy/        最小示范适配器（含 TLS 帧用法）
-tests/farm_test.cpp  确定性门（G1 逐位/G2 复跑/G3 fiber vs 线程/G4 census X=0/G5 refit）
-tools/refit_blob.py  RW1 权威导出器（θ→blob；银行家舍入与 ORT 逐位一致）
-docs/                design-judgments（12 条实测判决）/ pitfalls（血律）/ provenance（来历与账本）
+include/inferfarm/    公共头：types / backend / fiber_pool / bank / census /
+                      refit / game_adapter / tls_frame / farm
+src/                  实现（bank.cpp=银行协议；backends/=cpu|ort|trt）
+examples/toy/         最小玩具适配器（TLS 帧用法）
+examples/gomoku/      五子棋接入范例（本 README 主角）
+tests/                farm_test 确定性门 + refit_probe
+tools/refit_blob.py   RW1 权重 blob 权威导出器
+docs/                 design-judgments（实测判决）/ pitfalls（血律）/ provenance（来历）
 ```
 
-## 环境旋钮（`FARM_*`，显式 Config 为准、env 快速实验）
+## 测试与门
 
-`FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
-`FARM_STAGGER_MS` `FARM_CENSUS` `FARM_ORT_DIR` `FARM_CUDA_DIR` `FARM_TRT_DIR`
-`FARM_TRT_VERSION_INT`（与 YGO 产线 `YGO_*` 旋钮一一对应，见 docs/provenance.md）
+`farm_test` 承接产线验证纪律：
+- **G1** 银行 vs inline 逐位一致（outcome+决策数+逐局指纹）——行独立+零基组装
+  的自带性质，失败=有 bug；
+- **G2** 同配置复跑全同；**G3** fiber vs 线程模式全同（TLS 帧纪律的行为级验证）；
+- **G4** census 开=结果逐位同 + 人口恒等式 X≡0 + 复活路径有样本；
+- **G5** refit 同 blob 逐位同 / 异 blob 必变 / RW1 负路径 fail fast；
+- **G6** 五子棋真实接缝：银行 vs inline 逐位一致。
 
-## 状态与路线
+## 约束与路线
 
-- [x] 四资产抽层成库（协议逐句同源于 D:/ygo/ygopro/ai_core 现役代码）
-- [x] 三后端接口并列（cpu/ort 编译+cpu 全门绿；trt 编译通过）
-- [x] 确定性门：G1-G5 全绿（银行 vs inline 逐位、fiber vs 线程、census X=0、refit 同/异 blob）
-- [ ] ORT/TRT 后端真模型实测（本机 q35 环境就绪即可跑；读数纪律见 docs/pitfalls.md）
-- [ ] YGO 适配器回接（现役代码按 GameAdapter 接缝改写——参考实现已在 D:/ygo）
-- [ ] 低负载混合发车（solo 银行慢 65% 的解药：内联发车+自旋，已设计未建）
-- [ ] POSIX fiber 移植面（fiber_pool.cpp 内 Switch 族一文件收口）
+- 当前为 **Windows 优先**（fiber 走 Windows Fibers；POSIX 移植面收口在
+  fiber_pool.cpp 的 Switch 族）。C++17，CMake ≥3.16。
+- 路线：ORT/TRT 真模型实测基准、低负载混合发车（单局场景银行税的解药）、
+  POSIX 纤程、更多游戏范例。
 
-命名 inferfarm（推理农场）为暂名（交接书 2026-09-22 待定项）；仓库独立于 D:/ygo。
+## 许可
+
+[MIT](LICENSE)。TRT/ORT/CUDA 本体不随仓分发——运行时由各自官方渠道安装，
+路径走 `ModelConfig`/`FARM_*` 指定。
