@@ -24,7 +24,7 @@
 
 ## 实现谱系与结果（2026-09-22，4 腿交替，中位数）
 
-环境：AMD 锐龙 AI 9 9955HX（16C/32T，Zen 5）+ RTX 5070 Ti Laptop 12GB；ORT CUDA EP
+环境：AMD Ryzen 9 9955HX（16C/32T，Zen 5）+ RTX 5070 Ti Laptop 12GB；ORT CUDA EP
 （onnxruntime-gpu，CUDA 12）；torch cu128 训练侧。
 
 | # | 实现 | 形态 | 局/s | 决策/s | 相对最慢 |
