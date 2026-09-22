@@ -277,7 +277,9 @@ void BankScheduler::Abandon(int bank, int slot) {
     if (slot < 0 || slot >= cfg_.slots) return;
     b.reqs[(size_t)slot] = nullptr;                        // 作废槽：发车跳过
     b.inflight.fetch_sub(1, std::memory_order_acq_rel);    // 完工照减（drain 不堵）
-    I.Notify();
+    // 不 Notify：inflight-- 只被 close-drain 的自旋等待（不依赖 cv）；全弃批的
+    // 关舱由窗闹钟兜底。缓存命中路径高频走此（判决13）——每次 notify_all 会把
+    // 调度台打成唤醒风暴（实测 53% 命中反慢 2.4× 的主因）。
 }
 
 // 收割：完成旗标到（=输出已驻留主机）→ 逐 req 拷输出+回投 → 还池。

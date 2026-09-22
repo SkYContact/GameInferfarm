@@ -3,7 +3,7 @@
 //
 //   gomoku [--backend cpu|ort|trt] [--model <fb.onnx>] [--engine <plan>]
 //          [--chains 8] [--games 16] [--banks 2] [--workers 4] [--slots 8]
-//          [--inline] [--threads] [--census] [--show-board]
+//          [--cache-log2 16] [--inline] [--threads] [--census] [--show-board]
 //
 // ort/trt 模型工件由 tools/bake_gomoku_mlp.py 烤制（一层 MLP，权重由种子
 // 生成——确定性）。三后端同架构；指纹只在与自身同后端双腿间可比。
@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--workers") && i + 1 < argc) cfg.workers = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--slots") && i + 1 < argc) { cfg.slots = atoi(argv[++i]); cfg.model.cpu = GomokuModelDecl(cfg.slots); }
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) cfg.seed0 = (uint32_t)strtoul(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--cache-log2") && i + 1 < argc) cfg.cache_log2 = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--inline")) cfg.banks = 0;
         else if (!std::strcmp(argv[i], "--threads")) cfg.fibers = false;
         else if (!std::strcmp(argv[i], "--census")) cfg.census = true;

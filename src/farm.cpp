@@ -44,24 +44,27 @@ bool Farm::Init(FarmConfig cfg) {
     cfg_.banks = EnvInt("FARM_BANKS", cfg_.banks);
     cfg_.window_floor = EnvDouble("FARM_BANK_WINDOW_FLOOR", cfg_.window_floor);
     cfg_.stagger_ms = EnvDouble("FARM_STAGGER_MS", cfg_.stagger_ms);
+    cfg_.cache_log2 = EnvInt("FARM_CACHE_LOG2", cfg_.cache_log2);
 
 #ifdef _WIN32
     timeBeginPeriod(1);   // 窗的真相：不开=定时量子 15.6ms（银行窗 ms 级全废）
     timer_armed_ = true;
 #endif
     census_.on = cfg_.census;
+    cache_.Init(cfg_.cache_log2);   // 推理缓存（0=关零行为差）
     // 配置校验（除零/巨分配防线）：误配 fail fast 而非崩溃
     if (cfg_.chains < 1 || cfg_.chains > 4096 || cfg_.games < 1 || cfg_.games > 100000000
         || cfg_.slots < 1 || cfg_.slots > 1024 || cfg_.banks < 0 || cfg_.banks > 32
         || cfg_.workers < 0 || cfg_.workers > 512
+        || cfg_.cache_log2 < 0 || cfg_.cache_log2 > 24
         || !(cfg_.window_ms > 0) || !(cfg_.stagger_ms >= 0)
         || cfg_.max_decisions < 1) {
         std::fprintf(stderr, "[farm] 配置非法: chains=%d games=%d slots=%d banks=%d "
-                     "workers=%d window=%.3f stagger=%.3f max_decisions=%lld"
+                     "workers=%d window=%.3f stagger=%.3f max_decisions=%lld cache_log2=%d"
                      "（界: chains[1,4096] games[1,1e8] slots[1,1024] banks[0,32] "
-                     "workers[0,512] window>0 stagger>=0）\n",
+                     "workers[0,512] window>0 stagger>=0 cache_log2[0,24]）\n",
                      cfg_.chains, cfg_.games, cfg_.slots, cfg_.banks, cfg_.workers,
-                     cfg_.window_ms, cfg_.stagger_ms, cfg_.max_decisions);
+                     cfg_.window_ms, cfg_.stagger_ms, cfg_.max_decisions, cfg_.cache_log2);
         return false;
     }
     backend_ = MakeBackend(cfg_.model.backend);
@@ -133,6 +136,19 @@ void Farm::NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fa
 }
 
 // ---------------- 驱动环 ----------------
+// 组装行字节 → 缓存键。槽独占期内（Claim 后 Submit/Abandon 前）调用：本槽
+// 行不可能被他人触碰（游标串行发号），读的是本决策刚组装的最终字节
+// （含 Claim 清零后未写区的零——零基组装契约的一部分）。
+CacheKey128 Farm::HashSlot(int bk, int sl) {
+    CacheHasher h;
+    for (size_t i = 0; i < spec_.ins.size(); i++) {
+        size_t rb = 0;
+        void* row = bank_->InputRow(bk, sl, spec_.ins[i].name.c_str(), &rb);
+        if (row && rb) h.Update(row, rb);
+    }
+    return h.Finalize();
+}
+
 bool Farm::DriveDecision(GameAdapter* g) {
     if (bank_) {
         OutputDest dests[8];
@@ -151,6 +167,49 @@ bool Farm::DriveDecision(GameAdapter* g) {
         w.b = bk;
         w.s = sl;
         g->AssembleInto(w);
+        // 推理缓存（判决13）：键=本槽全输入行字节+权重代次。命中=Abandon
+        // 弃槽（协议原生路径：作废槽+完工照减+发车跳过）+逐字节回放 dests；
+        // 未命中=正常 SubmitWait，收割后从 dests 采录（n 全宽重放语义）。
+        // 布局门：条目输出面（名字+n 逐位）与本次申报不符=视同未命中——
+        // 同行字节不同申报面的适配器不共享条目，正确性无条件保住。
+        if (cache_.on()) {
+            CacheKey128 key = HashSlot(bk, sl);
+            std::shared_ptr<const CachedResult> hit = cache_.Lookup(key, infer_gen_);
+            if (hit && (int)hit->outs.size() == nd) {
+                bool layout_ok = true;
+                for (int i = 0; i < nd && layout_ok; i++)
+                    if (!dests[i].name || hit->outs[(size_t)i].name != dests[i].name
+                        || hit->outs[(size_t)i].n != dests[i].n)
+                        layout_ok = false;
+                if (layout_ok) {
+                    bank_->Abandon(bk, sl);
+                    for (int i = 0; i < nd; i++)
+                        if (dests[i].dst && hit->outs[(size_t)i].n > 0)
+                            std::memcpy(dests[i].dst, hit->outs[(size_t)i].vals.data(),
+                                        sizeof(float) * (size_t)hit->outs[(size_t)i].n);
+                    return true;
+                }
+            }
+            bool ok = bank_->SubmitWait(bk, sl, dests, nd);
+            if (ok) {
+                std::vector<CachedOut> outs;
+                outs.reserve((size_t)nd);
+                for (int i = 0; i < nd; i++)
+                    if (dests[i].name) {
+                        CachedOut co;
+                        co.name = dests[i].name;
+                        co.n = dests[i].n;
+                        if (dests[i].dst && co.n > 0) {
+                            co.vals.resize((size_t)co.n);
+                            std::memcpy(co.vals.data(), dests[i].dst,
+                                        sizeof(float) * (size_t)co.n);
+                        }
+                        outs.push_back(std::move(co));
+                    }
+                cache_.Insert(key, infer_gen_, std::move(outs));
+            }
+            return ok;
+        }
         return bank_->SubmitWait(bk, sl, dests, nd);
     }
     return inline_.Run(g);
@@ -202,6 +261,7 @@ static ITlsFrame* FarmFrameFactory(int chain, void* p) {
 
 double Farm::RunLeg(AdapterFactory make, void* user) {
     tally_ = FarmTally{};   // 腿清零（refit-jobs 形态：每作业一腿）
+    const unsigned long long lu0 = cache_.lookups(), hi0 = cache_.hits();
     int per = (cfg_.games + cfg_.chains - 1) / cfg_.chains;
     FarmGameCtx ctx;
     ctx.farm = this;
@@ -232,6 +292,8 @@ double Farm::RunLeg(AdapterFactory make, void* user) {
     if (census_.on) census_.StopPrinter();
     for (auto* a : ctx.adapters) delete a;
     // 腿汇总（[wb-bench] 同款语义）
+    tally_.cache_lookups = cache_.lookups() - lu0;
+    tally_.cache_hits = cache_.hits() - hi0;
     const FarmTally& t = tally_;
     int total = t.first_total + t.second_total;
     int wins = t.first_wins + t.second_wins;
@@ -240,6 +302,10 @@ double Farm::RunLeg(AdapterFactory make, void* user) {
                 cfg_.name.c_str(), t.first_wins, t.first_total, t.second_wins,
                 t.second_total, wins, total, total ? wins * 100.0 / total : 0.0,
                 t.decisions, t.infer_fails);
+    if (t.cache_lookups > 0)
+        std::printf("[%s] 缓存: 查 %llu 命中 %llu (%.1f%%)\n", cfg_.name.c_str(),
+                    t.cache_lookups, t.cache_hits,
+                    t.cache_lookups ? t.cache_hits * 100.0 / t.cache_lookups : 0.0);
     std::printf("[%s] 全链结束: %d 局用时 %.2fs（%.2f 局/秒）\n",
                 cfg_.name.c_str(), total, sec, sec > 0 ? total / sec : 0.0);
     std::fflush(stdout);

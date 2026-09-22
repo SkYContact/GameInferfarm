@@ -108,7 +108,7 @@ git clone https://github.com/SkYContact/GameInferfarm.git && cd GameInferfarm
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # or any supported generator
 cmake --build build --config Release
 
-build/Release/farm_test.exe    # determinism gates (G1-G6, all green or it ships not)
+build/Release/farm_test.exe    # determinism gates (G1-G7, all green or it ships not)
 build/Release/toy.exe          # minimal toy (TLS-frame usage)
 build/Release/gomoku.exe       # the Gomoku sample
 ```
@@ -128,16 +128,30 @@ All three implement the same `InferBackend` interface over the same banking
 protocol — throughput differs in the submission layer, behavior stays bitwise
 comparable.
 
+## Inference cache (optional; idea absorbed from KataGo's NNCache)
+
+Set `FarmConfig.cache_log2` (env `FARM_CACHE_LOG2`) > 0 to enable: the key is a
+128-bit hash of the assembled input-row bytes plus a weight generation counter
+(invalidated automatically on refit); a hit skips harvest/roundtrip and replays
+the outputs byte-for-byte. **Where it pays (measured)**: the CPU backend
+loses at low hit rates (53% hits ran 2.4x slower — abandoned rows still compute,
+plus claim-machinery stampede) and wins at high rates (fully warm cache: 430 vs
+153 games/s). GPU backends run a fixed batch shape, so garbage rows are free —
+mechanically a pure win (at toy scale the effect is below run-to-run noise; the
+real verdict waits for YGO-scale models). Bitwise identity is guaranteed by gate
+G7 either way. Off by default.
+
 ## Environment knobs (explicit Config wins; env for quick experiments)
 
 `FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
-`FARM_STAGGER_MS` `FARM_CENSUS` `FARM_ORT_DIR` `FARM_CUDA_DIR` `FARM_TRT_DIR`
+`FARM_STAGGER_MS` `FARM_CENSUS` `FARM_CACHE_LOG2` `FARM_ORT_DIR`
+`FARM_CUDA_DIR` `FARM_TRT_DIR`
 
 ## Layout
 
 ```
 include/inferfarm/    public headers: types / backend / fiber_pool / bank /
-                      census / refit / game_adapter / tls_frame / farm
+                      cache / census / refit / game_adapter / tls_frame / farm
 src/                  implementation (bank.cpp = banking protocol; backends/ = cpu|ort|trt)
 examples/toy/         minimal toy adapter (TLS frames)
 examples/gomoku/      the Gomoku integration sample
@@ -158,6 +172,8 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
 - **G5** refit: same blob twice = bitwise identical; different blob = must
   change; RW1 negative paths fail fast;
 - **G6** a real game (Gomoku): bank vs inline bitwise identical;
+- **G7** inference cache: on = off bitwise identical (including a second leg on a
+  fully warm cache) + generation-invalidation gate + real hits;
 - **R1/R2** (optional; runs only when real-model artifacts exist, otherwise
   SKIP): ORT/TRT backends — identical reruns + bank vs inline bitwise
   identical (`gomoku_backend_test`).
@@ -166,9 +182,11 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
 
 - **Windows-first** for now (fibers via Windows Fibers; the POSIX port surface
   is confined to the Switch-family in fiber_pool.cpp). C++17, CMake ≥3.16.
-- Roadmap: ORT/TRT real-model benchmarks, hybrid low-load dispatch (the cure
-  for the banking tax in single-game scenarios), POSIX fibers, more game
-  samples.
+- Roadmap: ORT/TRT real-model benchmarks (paradigm borrowed from KataGo's
+  benchmarkPureForward: barrier start + per-thread medians + wall clock),
+  multi-GPU (bank↔device pinning), an fp16 bake tier, hybrid low-load dispatch
+  (the cure for the banking tax in single-game scenarios), POSIX fibers, more
+  game samples.
 
 ## Naming
 

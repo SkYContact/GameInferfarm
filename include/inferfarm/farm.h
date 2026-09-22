@@ -11,10 +11,14 @@
 //    FARM_BANK_WINDOW_FLOOR   有效窗底限 ms（0.2）
 //    FARM_STAGGER_MS          点火错峰（10ms 甜点）
 //    FARM_CENSUS=1            取证层（~5% 税，仅取证开）
+//    FARM_CACHE_LOG2          推理缓存表容 log2（0=关；如 16=64K 条）——
+//                             键=组装行字节哈希+权重代次（KataGo NNCache
+//                             思想吸收，判决13；有重复状态的游戏红利大）
 // ============================================================
 #pragma once
 #include "backend.h"
 #include "bank.h"
+#include "cache.h"
 #include "census.h"
 #include "fiber_pool.h"
 #include "game_adapter.h"
@@ -37,6 +41,7 @@ struct FarmConfig {
     double stagger_ms = 10;       // 到达层羊群判决：错峰甜点
     long long max_decisions = 1000000;   // 对局决策数护栏（防适配器死循环）
     bool census = false;
+    int cache_log2 = 0;          // 推理缓存：0=关（缺省零行为差）；如 16=64K 条
     ModelConfig model;
 };
 
@@ -46,6 +51,7 @@ struct FarmTally {
     int games_done = 0, infer_fails = 0;
     long long decisions = 0;
     unsigned long long fingerprint = 0;   // 逐局指纹 XOR（顺序无关；逐位门用）
+    unsigned long long cache_lookups = 0, cache_hits = 0;   // 推理缓存（开后才有数）
 };
 
 class Farm {
@@ -60,9 +66,11 @@ public:
     double RunLeg(AdapterFactory make, void* user);
 
     // 运行期换心（RW1 blob；仅后端支持时生效——TRT=refitter，CPU=直改，
-    // ORT=不支持返回 false）。成功后后续腿用新权重。
+    // ORT=不支持返回 false）。成功后后续腿用新权重（缓存代次同步失效）。
     bool RefitWeights(const char* rw1_path) {
-        return backend_ ? backend_->RefitWeights(rw1_path) : false;
+        if (!backend_ || !backend_->RefitWeights(rw1_path)) return false;
+        infer_gen_++;   // 换心=旧缓存全表逻辑失效（代次门，不清表）
+        return true;
     }
 
     const FarmTally& tally() const { return tally_; }
@@ -81,6 +89,8 @@ public:
     bool DriveDecision(GameAdapter* g);
 
 private:
+    // 组装行字节 → 缓存键（逐输入 InputRow 全行宽；槽独占期内调用安全）
+    CacheKey128 HashSlot(int bk, int sl);
     FarmConfig cfg_;
     InferBackend* backend_ = nullptr;
     BankScheduler bank_obj_;
@@ -91,6 +101,8 @@ private:
     ModelSpec spec_;
     bool spec_ok_ = false;
     bool timer_armed_ = false;
+    InferCache cache_;            // 推理缓存（cache_log2>0 时启）
+    uint64_t infer_gen_ = 1;      // 权重代次：换心成功即 ++
     FarmTally tally_;
     std::mutex tally_mx_;
     void NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,

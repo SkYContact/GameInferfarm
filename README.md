@@ -121,7 +121,7 @@ git clone https://github.com/SkYContact/GameInferfarm.git && cd GameInferfarm
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # 或任意支持的生成器
 cmake --build build --config Release
 
-build/Release/farm_test.exe    # 确定性门（G1-G6 全绿才算数）
+build/Release/farm_test.exe    # 确定性门（G1-G7 全绿才算数）
 build/Release/toy.exe          # 最小玩具（TLS 帧用法示范）
 build/Release/gomoku.exe       # 五子棋范例
 ```
@@ -139,16 +139,26 @@ TRT 后端：`cmake -B build-trt -DINFERFARM_WITH_TRT=ON`
 
 三后端同一 `InferBackend` 接口，同一银行协议——吞吐差在提交层，行为逐位可比。
 
+## 推理缓存（可选，KataGo NNCache 思想吸收）
+
+`FarmConfig.cache_log2`（env `FARM_CACHE_LOG2`）> 0 即启用：键 = 组装行字节
+128 位哈希 + 权重代次（换心自动失效），命中 = 跳过收割/往返、逐字节回放。
+**适用面（实测）**：CPU 后端低命中率会亏（53% 命中 2.4× 慢——弃槽行照算+
+  领号踩踏），高命中才赚（热缓存 100% 命中 430 vs 153 局/s）；GPU 后端批形状
+  钉死=垃圾行免费，机械上纯赢（玩具尺度效应小于跑间噪声不可判，YGO 尺度见
+  分晓）。指纹不变性由门 G7 保证。默认关。
+
 ## 环境旋钮（显式 Config 为准，env 快速实验）
 
 `FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
-`FARM_STAGGER_MS` `FARM_CENSUS` `FARM_ORT_DIR` `FARM_CUDA_DIR` `FARM_TRT_DIR`
+`FARM_STAGGER_MS` `FARM_CENSUS` `FARM_CACHE_LOG2` `FARM_ORT_DIR`
+`FARM_CUDA_DIR` `FARM_TRT_DIR`
 
 ## 目录
 
 ```
-include/inferfarm/    公共头：types / backend / fiber_pool / bank / census /
-                      refit / game_adapter / tls_frame / farm
+include/inferfarm/    公共头：types / backend / fiber_pool / bank / cache /
+                      census / refit / game_adapter / tls_frame / farm
 src/                  实现（bank.cpp=银行协议；backends/=cpu|ort|trt）
 examples/toy/         最小玩具适配器（TLS 帧用法）
 examples/gomoku/      五子棋接入范例（本 README 主角）
@@ -166,6 +176,7 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
 - **G4** census 开=结果逐位同 + 人口恒等式 X≡0 + 复活路径有样本；
 - **G5** refit 同 blob 逐位同 / 异 blob 必变 / RW1 负路径 fail fast；
 - **G6** 五子棋真实接缝：银行 vs inline 逐位一致；
+- **G7** 推理缓存：开=关逐位同（含纯命中路径二腿）+ 代次失效门 + 真实命中；
 - **R1/R2**（可选，真模型工件存在才跑，缺席=SKIP）：ORT/TRT 后端复跑逐位同
   + 银行 vs inline 逐位同（`gomoku_backend_test`）。
 
@@ -173,8 +184,10 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
 
 - 当前为 **Windows 优先**（fiber 走 Windows Fibers；POSIX 移植面收口在
   fiber_pool.cpp 的 Switch 族）。C++17，CMake ≥3.16。
-- 路线：ORT/TRT 真模型实测基准、低负载混合发车（单局场景银行税的解药）、
-  POSIX 纤程、更多游戏范例。
+- 路线：ORT/TRT 真模型实测基准（范式=KataGo benchmarkPureForward：barrier
+  同起跑+每线程中位数+全体墙钟）、多 GPU（银行↔卡钉扎，KataGo
+  gpuIdxByServerThread 同构）、fp16 烤制档（int8 与 fp32 之间）、低负载混合
+  发车（单局场景银行税的解药）、POSIX 纤程、更多游戏范例。
 
 ## 命名说明
 

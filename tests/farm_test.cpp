@@ -7,8 +7,10 @@
 //  G3 fiber vs 线程模式（banks=2）：全同（TLS 帧纪律的行为级验证）
 //  G4 census：X（失踪人口）恒 0、腿末 live=0、全状态归零
 //  G5 refit：同 blob 两次换心 → 逐位同；不同 blob → 结果必变（A1/A2 的 CPU 版）
+//  G7 推理缓存：键=组装行字节+权重代次；开=关逐位同；代次门；热缓存腿全同
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
+#include "inferfarm/cache.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -34,10 +36,11 @@ struct LegResult {
     int live = 0, R = 0, Q = 0, W = 0;
     long long rev_n = 0;
     unsigned long long fp = 0;   // 逐局指纹 XOR
+    unsigned long long clo = 0, chi = 0;   // 缓存查/命中（G7）
 };
 
 static LegResult RunOne(int banks, bool fibers, int workers, uint32_t seed0,
-                         bool census = false) {
+                         bool census = false, int cache_log2 = 0) {
     FarmConfig cfg;
     cfg.name = "test";
     cfg.chains = 6;
@@ -50,6 +53,7 @@ static LegResult RunOne(int banks, bool fibers, int workers, uint32_t seed0,
     cfg.window_ms = 0.2;
     cfg.stagger_ms = 1;
     cfg.census = census;
+    cfg.cache_log2 = cache_log2;
     cfg.model.backend = "cpu";
     cfg.model.cpu = ToyModelDecl(cfg.slots);
     Farm farm;
@@ -68,6 +72,8 @@ static LegResult RunOne(int banks, bool fibers, int workers, uint32_t seed0,
     r.W = c->state[3].load();
     r.rev_n = c->rev_n.load();
     r.fp = t.fingerprint;
+    r.clo = t.cache_lookups;
+    r.chi = t.cache_hits;
     return r;
 }
 
@@ -246,6 +252,99 @@ int main() {
             WriteFile("refit_dtype.rw1", bad_dt);
             CHECK(!ParseRw1("refit_dtype.rw1", blob, es), "G5 dtype 非法 fail fast");
         }
+    }
+
+    // G7：推理缓存（KataGo NNCacheTable 思想吸收，判决13）——键=组装行字节
+    // 哈希+权重代次；命中=Abandon 弃槽+逐字节回放 dests。
+    {
+        // 单元门：命中回放 / 空表 / 代次门 / 同键新代覆盖
+        {
+            InferCache c;
+            c.Init(4);
+            CacheHasher h;
+            h.Update("abc", 3);
+            CacheKey128 k = h.Finalize();
+            CHECK(!c.Lookup(k, 1), "G7 单元：空表未命中");
+            c.Insert(k, 1, {{"policy", 2, {1.f, 2.f}}});
+            auto p = c.Lookup(k, 1);
+            CHECK(p && p->outs.size() == 1 && p->outs[0].name == "policy"
+                      && p->outs[0].vals.size() == 2 && p->outs[0].vals[1] == 2.f,
+                  "G7 单元：命中逐字节回放");
+            CHECK(!c.Lookup(k, 2), "G7 单元：代次不符=未命中（换心失效）");
+            c.Insert(k, 2, {{"policy", 2, {9.f, 9.f}}});
+            auto p2 = c.Lookup(k, 2);
+            CHECK(p2 && p2->outs[0].vals[0] == 9.f, "G7 单元：同键新代覆盖旧代");
+        }
+        // 行为门 A：玩具（3 输入）缓存开=关逐位同
+        LegResult toy_on = RunOne(2, true, 4, 4242, false, 12);
+        CHECK(bank1.fw == toy_on.fw && bank1.sw == toy_on.sw
+              && bank1.decisions == toy_on.decisions && bank1.fp == toy_on.fp,
+              "G7 玩具（多输入）缓存开=关逐位同（含指纹）");
+        CHECK(toy_on.clo > 0, "G7 玩具缓存有查询样本");
+        // 行为门 B：五子棋（空盘首决策跨局重放=天然命中面）开=关逐位同+真命中；
+        // 同农场二腿=热缓存全命中路径也逐位同
+        LegResult g_off, g_hot;
+        LegResult g_on;
+        {
+            FarmConfig cfg;
+            cfg.name = "gomoku-cache";
+            cfg.chains = 4;
+            cfg.games = 8;
+            cfg.seed0 = 20260922u;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+            Farm f;
+            CHECK(f.Init(cfg), "G7 五子棋缓存关农场起");
+            f.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            g_off = {f.tally().first_wins, f.tally().first_total,
+                     f.tally().second_wins, f.tally().second_total,
+                     f.tally().decisions};
+            g_off.fp = f.tally().fingerprint;
+        }
+        {
+            FarmConfig cfg;
+            cfg.name = "gomoku-cache";
+            cfg.chains = 4;
+            cfg.games = 8;
+            cfg.seed0 = 20260922u;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+            cfg.cache_log2 = 12;
+            Farm f;
+            CHECK(f.Init(cfg), "G7 五子棋缓存开农场起");
+            f.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            const FarmTally& t1 = f.tally();
+            g_on = {t1.first_wins, t1.first_total, t1.second_wins, t1.second_total,
+                    t1.decisions};
+            g_on.fp = t1.fingerprint;
+            g_on.clo = t1.cache_lookups;
+            g_on.chi = t1.cache_hits;
+            // 二腿（同农场同种子）：全部状态已在缓存=纯命中路径
+            f.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            const FarmTally& t2 = f.tally();
+            g_hot = {t2.first_wins, t2.first_total, t2.second_wins, t2.second_total,
+                     t2.decisions};
+            g_hot.fp = t2.fingerprint;
+            g_hot.clo = t2.cache_lookups;
+            g_hot.chi = t2.cache_hits;
+        }
+        CHECK(g_on.decisions > 0 && g_off.decisions == g_on.decisions,
+              "G7 五子棋缓存腿完成（决策数=缓存关）");
+        CHECK(g_off.fw == g_on.fw && g_off.sw == g_on.sw && g_off.fp == g_on.fp,
+              "G7 五子棋缓存开=关逐位同（含指纹）");
+        CHECK(g_on.chi > 0, "G7 五子棋真实命中（空盘首决策跨局重放）");
+        CHECK(g_hot.fp == g_on.fp && g_hot.decisions == g_on.decisions,
+              "G7 热缓存二腿逐位同（纯命中路径）");
+        CHECK(g_hot.chi > 0 && g_hot.chi * 10 >= g_hot.clo * 9,
+              "G7 热缓存二腿命中率高（≥90%）");
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
