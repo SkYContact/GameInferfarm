@@ -41,11 +41,13 @@
 #include "onnxruntime_c_api.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -144,8 +146,18 @@ struct OrtSess {
     // 完成协议（整设备同步血律）：Submit 后首个 CompletionReached 做一次
     // device sync + 前缀 D2H，随后同 seq 恒 true（dml：Run 同步=恒真）
     unsigned seq = 0;
-    int last_n = 0;
+    int last_n =  0;
     bool synced_for_seq = false;
+    // DML 专属发射线程（队头阻塞解药，2026-09-22）：DML 的 Run 是同步的——
+    // 若在共享调度台线程上执行，多 ms 的核显计算会把全部异构组的收割/发车
+    // 挡在身后（实测 4cuda+dml(2链) 反而 1.87s vs 0.80s）。解法=每 DML 会话
+    // 一条发射线程：SubmitBatch 投递即返回，完成旗标轮询（TRT 邮箱同款衣服）。
+    std::thread* helper = nullptr;
+    std::mutex h_mx;
+    std::condition_variable h_cv;
+    unsigned h_pending = 0;                 // 在飞作业 seq（0=无；银行单飞≤1）
+    std::atomic<unsigned> h_done{0};        // 已完成作业 seq
+    bool h_stop = false;
 };
 
 class OrtBackend : public InferBackend {
@@ -238,6 +250,16 @@ public:
     void DestroySession(void* session) override {
         OrtSess* s = (OrtSess*)session;
         if (!s) return;
+        if (s->helper) {   // 发射线程先停（Join 后再动会话对象）
+            {
+                std::lock_guard<std::mutex> lk(s->h_mx);
+                s->h_stop = true;
+            }
+            s->h_cv.notify_all();
+            s->helper->join();
+            delete s->helper;
+            s->helper = nullptr;
+        }
         const OrtApi* a = api_;
         if (s->iob) a->ReleaseIoBinding(s->iob);
         for (auto& i : s->ins) if (i.val) a->ReleaseValue(i.val);
@@ -288,15 +310,23 @@ public:
                                     (size_t)n_rows * s->ins[i].meta.row_bytes, 1))
                         return false;
             }
+            if (!RunOnce(s)) return false;
+        } else {
+            // DML：投递专属发射线程（同步 Run 不占调度台）；行数据在 host
+            // arena，投递前的写在锁释放后对发射线程可见。
+            {
+                std::lock_guard<std::mutex> lk(s->h_mx);
+                s->h_pending = s->seq;
+            }
+            s->h_cv.notify_one();
         }
-        if (!RunOnce(s)) return false;
         seq_out = s->seq;
-        return true;   // cuda：Run 返回=已入队（收割侧 sync）；dml：=已完成
+        return true;   // cuda：Run 返回=已入队（收割侧 sync）；dml：已投递
     }
 
     bool CompletionReached(void* session, unsigned seq) override {
         OrtSess* s = (OrtSess*)session;
-        if (s->dml) return true;               // 同步 Run：返回即输出就绪（probe 兜底）
+        if (s->dml) return s->h_done.load(std::memory_order_acquire) >= seq;
         if (seq < s->seq) return true;         // 旧序号（早已完成）
         if (s->synced_for_seq) return true;
         // 整设备同步血律（不赌 ORT 内部流序）+ 前缀 D2H
@@ -769,6 +799,29 @@ private:
         if (spec_out) {
             spec_out->backend = dml ? "ort-dml" : "ort";
             spec_out->slots = slots;
+        }
+        if (dml) {
+            // 专属发射线程（队头阻塞解药）：银行单飞（线性生命周期）⇒ 在飞
+            // 作业 ≤1，投递槽单变量即够。失败仍记完成（loud print——银行无
+            // 完成即败通道，看门狗/指纹门兜底）。
+            s->helper = new std::thread([s] {
+                for (;;) {
+                    unsigned job = 0;
+                    {
+                        std::unique_lock<std::mutex> lk(s->h_mx);
+                        s->h_cv.wait(lk, [s] { return s->h_stop || s->h_pending != 0; });
+                        if (s->h_stop) return;
+                        job = s->h_pending;
+                    }
+                    if (!RunOnce(s))
+                        std::printf("[ort] DML 发射线程批异常（输出将陈旧）\n");
+                    {
+                        std::lock_guard<std::mutex> lk(s->h_mx);
+                        s->h_pending = 0;
+                    }
+                    s->h_done.store(job, std::memory_order_release);
+                }
+            });
         }
         return s;
     }
