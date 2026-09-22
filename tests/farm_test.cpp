@@ -391,6 +391,37 @@ int main() {
               "G8a 同构分组=单组逐位同（含指纹；组池/组门/链钉扎行为级等价）");
         CHECK(p1.fp == p2.fp,
               "G8a 分组腿重跑逐位同（钉扎确定性）");
+        // G8b：异构批形状（同构后端仿真）——组 0 fb8 + 组 1 fb4：行宽/输入名/
+        // 输出宽同、dim0 异；行独立 ⇒ 行的值与批形无关 ⇒ 结果=单组逐位同。
+        // （真硬件异构小图=R5/gomoku --device slots=；本门 CI 可跑。）
+        {
+            FarmConfig cfg;
+            cfg.name = "g8b";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 4242;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(8);
+            DeviceConfig a, b;
+            a.model.backend = "cpu";
+            a.model.cpu = gomoku::GomokuModelDecl(8);
+            a.banks = 1;
+            b.model.backend = "cpu";
+            b.model.cpu = gomoku::GomokuModelDecl(4);   // 小批形（dim0 异）
+            b.banks = 1;
+            b.slots = 4;
+            cfg.devices = {a, b};
+            Farm farm;
+            CHECK(farm.Init(cfg), "G8b 混形状农场起（fb8+fb4）");
+            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            const FarmTally& t = farm.tally();
+            CHECK(t.decisions == s1.decisions && t.fingerprint == s1.fp,
+                  "G8b 混批形状=单组逐位同（含指纹；游标/窗满/越界三界按组）");
+        }
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

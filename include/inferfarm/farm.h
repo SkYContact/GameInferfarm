@@ -34,6 +34,8 @@ struct DeviceConfig {
     double share = 1.0;   // 链分配权重（平滑加权轮询）：异构卡速差大时按算力
                           // 配比（如主卡 share=4 核显 share=1）；0=该组不接链。
                           // 缺省 1=均分（两组时≡c%n_groups 老行为）
+    int slots = 0;        // 0=统一形状（cfg.slots）；>0=本组批形状（异构小图，
+                          // 仅非主组有意义；行宽/输入名/输出宽须与主组一致）
 };
 
 struct FarmConfig {
@@ -113,6 +115,7 @@ private:
     FarmConfig cfg_;
     InferBackend* backend_ = nullptr;      // =组 0 后端（inline/兼容面）
     std::vector<InferBackend*> group_bes_; // 每设备组一个后端实例（Farm 建/毁）
+    std::vector<ModelSpec> group_specs_;   // 每组模型规格（slots=组实际形状）
     int n_dev_ = 1;                        // 设备组数（链钉扎 c%n_dev_）
     std::vector<int> chain_grp_;           // 链→组（平滑加权轮询，share 配比）
     BankScheduler bank_obj_;

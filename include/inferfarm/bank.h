@@ -48,10 +48,15 @@ struct BankConfig {
 
 // 设备组（多 GPU，判决15）：一组=一套后端实例+模型配置+本组银行数。链 c 钉扎
 // 到组 c%n_groups（异构设备保跨跑逐位的钥匙：每链恒用同组=同后端=同位）。
+// **每组独立批形状**（slots>0 时）：异构卡速差大时给慢卡烤小批图（如主卡
+// fb16 + 核显 fb4——批延迟÷4，破"形状钉死的串行决策延迟"恒定墙）。各行宽/
+// 输入名/输出宽须与主组一致（结构核对不含 dim0）。
 struct BankGroupCfg {
     InferBackend* be = nullptr;  // 组后端（Farm 建/毁；会话仍按银行隔离）
     ModelConfig model;           // 组模型配置（backend/device_id/ort_ep/路径）
     int banks = 2;               // 本组银行数
+    int slots = 0;               // 0=统一形状（BankConfig.slots）；>0=本组形状
+    ModelSpec spec;              // 组模型规格（Farm LoadSpec 填；会话建于此）
 };
 
 class BankScheduler {

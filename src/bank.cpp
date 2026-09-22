@@ -53,6 +53,9 @@ struct BankCtl {
     int grp = 0;                          // 设备组号（多 GPU 判决15）
     InferBackend* be = nullptr;           // 组后端（会话仍按银行隔离）
     void* sess = nullptr;                // 后端会话（地址终身固定，图一夫一妻）
+    int slots = 0;                        // 本银行批形状（=组模型 dim0；异构
+                                          // 批形状：慢卡小图，游标/窗满/越界
+                                          // 三处界全按此，不按全局）
     std::atomic<int> cursor{0};          // 本集会游标：fetch_add 领号（出池时归零）
     std::atomic<int> inflight{0};        // 在途写手（领号前 +1 / 行写完 -1）
     std::atomic<int> state{BK_POOL};
@@ -109,13 +112,13 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
     Impl& I = *impl_;
     const int g = dev < 0 ? 0 : dev;
     if (g >= Impl::kMaxGrp || g >= I.n_groups) return false;
-    const int S = cfg_.slots;
     const long long ts0 = I.cen && I.cen->on ? NowNsI() : 0;
     auto try_claim = [&](int& b_out, int& s_out) -> bool {
         const long long tp0 = I.cen && I.cen->on ? NowNsI() : 0;
         int fi = I.fill_idx[g].load(std::memory_order_acquire);
         if (fi < 0) return false;
         BankCtl& b = I.banks[(size_t)fi];
+        const int S = b.slots;   // 界=本银行形状（异构批形状：慢卡小图）
         if (b.state.load(std::memory_order_acquire) != BK_FILL) return false;  // 预检（不占名额）
         b.inflight.fetch_add(1, std::memory_order_acq_rel);   // 占在途名额（占额者必完工）
         int v = b.cursor.fetch_add(1, std::memory_order_acq_rel);
@@ -219,14 +222,14 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
     if (!banks_) return false;
     Impl& I = *impl_;
     if (bank < 0 || bank >= banks_) return false;
-    if (slot < 0 || slot >= cfg_.slots) {
+    BankCtl& b = I.banks[(size_t)bank];
+    if (slot < 0 || slot >= b.slots) {
         // 越界槽：Claim 的 inflight 占额必须照减（占额者必完工——否则 drain 卡死）
-        I.banks[(size_t)bank].inflight.fetch_sub(1, std::memory_order_acq_rel);
+        b.inflight.fetch_sub(1, std::memory_order_acq_rel);
         I.Notify();
         return false;
     }
     const long long ts0 = I.cen && I.cen->on ? NowNsI() : 0;
-    BankCtl& b = I.banks[(size_t)bank];
     BankReq* r = new BankReq();
     r->bank = bank;
     r->slot = slot;
@@ -265,7 +268,7 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
     // 线程回放=ORT 重新捕获（CUDA 900/901）→ 此类后端只 Notify，调度台
     // "满座即发"兜底（唤醒延迟 µs 级）。
     if (b.be->DispatchFromWriterOk()
-        && prev_inf == 1 && b.cursor.load(std::memory_order_acquire) >= cfg_.slots) {
+        && prev_inf == 1 && b.cursor.load(std::memory_order_acquire) >= b.slots) {
         I.self_dep.fetch_add(1);
         BankCloseAndDispatch(I, b);
     }
@@ -286,7 +289,7 @@ void BankScheduler::Abandon(int bank, int slot) {
     if (!banks_ || bank < 0 || bank >= banks_) return;
     Impl& I = *impl_;
     BankCtl& b = I.banks[(size_t)bank];
-    if (slot < 0 || slot >= cfg_.slots) return;
+    if (slot < 0 || slot >= b.slots) return;
     b.reqs[(size_t)slot] = nullptr;                        // 作废槽：发车跳过
     b.inflight.fetch_sub(1, std::memory_order_acq_rel);    // 完工照减（drain 不堵）
     // 不 Notify：inflight-- 只被 close-drain 的自旋等待（不依赖 cv）；全弃批的
@@ -386,7 +389,7 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     }
     I.drain_us.fetch_add((long long)((NowMsD() - drain_t0) * 1000.0));
     int n = b.cursor.load(std::memory_order_acquire);
-    if (n > I.cfg.slots) n = I.cfg.slots;
+    if (n > b.slots) n = b.slots;
     if (n <= 0) {   // 空舱（不可达防御）：直接回池
         b.state.store(BK_POOL, std::memory_order_release);
         std::lock_guard<std::mutex> lk(I.mx);
@@ -532,7 +535,7 @@ static void BankLoop(BankScheduler::Impl& I) {
                     window_open[g] = true;
                     window_t0[g] = now;
                 }
-                bool full = taken >= I.cfg.slots;
+                bool full = taken >= b.slots;   // 界=本银行形状（异构批形状）
                 bool expired = (now - window_t0[g]) >= window_ms;
                 if (full || expired) {
                     // 关舱（CAS 输=写手已自驱）→ 先轮转开新窗（drain/提交不堵
@@ -667,6 +670,15 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                          g.banks, (void*)g.be, Impl::kMax);
             return false;
         }
+        if (g.slots < 0 || g.slots > 1024) {
+            std::fprintf(stderr, "[bank] 组 slots=%d ∉ [0,1024]（0=统一形状）\n", g.slots);
+            return false;
+        }
+        if (g.slots == 0 && g.spec.slots != cfg.slots) {
+            std::fprintf(stderr, "[bank] 组 spec.slots=%d ≠ cfg.slots=%d\n",
+                         g.spec.slots, cfg.slots);
+            return false;
+        }
         total += g.banks;
         if (total > Impl::kMax) {
             std::fprintf(stderr, "[bank] 总银行数 %d > %d（跨组合计上限）\n",
@@ -690,18 +702,22 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
         int id = 0;
         for (int g = 0; g < I.n_groups && ok; g++) {
             const BankGroupCfg& gc = groups[(size_t)g];
+            const int gslots = gc.slots > 0 ? gc.slots : gc.spec.slots;
+            ModelSpec gspec = gc.spec;
+            gspec.slots = gslots;   // 形状差只许 dim0：行宽/名字已由 Farm 核对
             for (int k = 0; k < gc.banks && ok; k++, id++) {
                 BankCtl& b = I.banks[(size_t)id];
                 b.id = id;
                 b.grp = g;
                 b.be = gc.be;
-                b.sess = b.be->CreateSession(gc.model, I.spec, /*for_bank=*/true);
+                b.slots = gslots;
+                b.sess = b.be->CreateSession(gc.model, gspec, /*for_bank=*/true);
                 if (!b.sess) { ok = false; break; }
                 if (!b.be->Warmup(b.sess)) { ok = false; break; }
                 b.cursor.store(0);
                 b.inflight.store(0);
                 b.state.store(BK_POOL);
-                b.reqs.assign((size_t)I.cfg.slots, nullptr);
+                b.reqs.assign((size_t)gslots, nullptr);
             }
         }
         int built = id;

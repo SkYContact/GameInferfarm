@@ -102,6 +102,10 @@ bool Farm::Init(FarmConfig cfg) {
             std::fprintf(stderr, "[farm] 设备组 banks=%d ∉ [0,32]\n", d.banks);
             return false;
         }
+        if (d.slots < 0 || d.slots > 1024) {
+            std::fprintf(stderr, "[farm] 设备组 slots=%d ∉ [0,1024]\n", d.slots);
+            return false;
+        }
         total_banks += d.banks;
     }
     if (total_banks > 32) {
@@ -123,6 +127,7 @@ bool Farm::Init(FarmConfig cfg) {
         return false;
     }
     group_bes_.clear();
+    group_specs_.clear();
     for (size_t gi = 0; gi < devs.size(); gi++) {
         InferBackend* be = MakeBackend(devs[gi].model.backend);
         if (!be) {
@@ -132,17 +137,20 @@ bool Farm::Init(FarmConfig cfg) {
             return false;
         }
         group_bes_.push_back(be);
+        // 组形状提示：主组=cfg.slots；非主组可自带（异构小图，如核显 fb4）
+        const int hint = (gi == 0 || devs[gi].slots <= 0) ? cfg_.slots
+                                                          : devs[gi].slots;
         ModelSpec s;
-        if (!be->LoadSpec(devs[gi].model, cfg_.slots, s)) {
+        if (!be->LoadSpec(devs[gi].model, hint, s)) {
             std::fprintf(stderr, "[farm] 设备 %zu LoadSpec 失败（backend=%s）\n",
                          gi, devs[gi].model.backend.c_str());
             for (auto* x : group_bes_) delete x;
             group_bes_.clear();
             return false;
         }
-        if (s.slots != cfg_.slots) {
-            std::fprintf(stderr, "[farm] 设备 %zu 模型批形状 dim0=%d ≠ slots=%d\n",
-                         gi, s.slots, cfg_.slots);
+        if (s.slots != hint) {
+            std::fprintf(stderr, "[farm] 设备 %zu 模型批形状 dim0=%d ≠ %d\n",
+                         gi, s.slots, hint);
             for (auto* x : group_bes_) delete x;
             group_bes_.clear();
             return false;
@@ -151,11 +159,14 @@ bool Farm::Init(FarmConfig cfg) {
             spec_ = s;
         } else if (!SpecStructurallyEqual(spec_, s)) {
             std::fprintf(stderr, "[farm] 设备 %zu 模型结构与设备 0 不一致"
-                         "（输入名/行宽/dtype、输出名/宽须全同）\n", gi);
+                         "（输入名/行宽/dtype、输出名/宽须全同；dim0 可异"
+                         "[异构批形状]）\n", gi);
             for (auto* x : group_bes_) delete x;
             group_bes_.clear();
+            group_specs_.clear();
             return false;
         }
+        group_specs_.push_back(s);
     }
     spec_ok_ = true;
     backend_ = group_bes_[0];
@@ -201,6 +212,8 @@ bool Farm::Init(FarmConfig cfg) {
             g.be = group_bes_[gi];
             g.model = devs[gi].model;
             g.banks = devs[gi].banks;
+            g.spec = group_specs_[gi];   // 组规格（slots=组实际形状）
+            g.slots = group_specs_[gi].slots;
             groups.push_back(g);
         }
         if (!bank_obj_.InitGroups(bc, groups, &spec_)) {
