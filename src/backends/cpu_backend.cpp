@@ -55,7 +55,13 @@ struct CpuSession {
     std::vector<float> out_arena;
     // 权重：out j 行 k 对 in i 的向量（长 = min(in 元素数, K)）
     int K = 8;                     // 每输入取行首元素数上限（decl.poly_k）
+    int H = 0;                     // 隐藏层单元数（0=纯线性）
     std::vector<std::vector<std::vector<std::vector<float>>>> w;   // [j][k][i]
+    // MLP：w1[t][i] 向量 + b1[t]；w2[j][k][t] + b2[j][k]
+    std::vector<std::vector<std::vector<float>>> w1;              // [t][i]
+    std::vector<float> b1;
+    std::vector<std::vector<std::vector<float>>> w2;               // [j][k][t]
+    std::vector<std::vector<float>> b2;                            // [j][k]
     unsigned seq = 0;
     int last_n = 0;
     bool computed = false;
@@ -109,6 +115,7 @@ public:
         CpuSession* s = new CpuSession();
         s->slots = spec.slots;
         s->K = cfg.cpu.poly_k > 0 ? cfg.cpu.poly_k : 8;
+        s->H = cfg.cpu.hidden > 0 ? cfg.cpu.hidden : 0;
         // 输入 arena（256B 对齐 carve——与 GPU 路径同布局纪律）
         const size_t kAlign = 256;
         size_t off = 0;
@@ -210,6 +217,50 @@ public:
         s->last_n = n_rows;
         s->computed = true;
         // 行独立计算 [0,n)（尾行保持旧值——与 GPU 银行同语义）
+        if (s->H > 0) {
+            for (int r = 0; r < n_rows; r++) {
+                std::vector<float> h((size_t)s->H);
+                for (int t = 0; t < s->H; t++) {
+                    float acc = s->b1[(size_t)t];
+                    for (size_t i = 0; i < s->ins.size(); i++) {
+                        CpuIn& ci = s->ins[i];
+                        const std::vector<float>& wv = s->w1[(size_t)t][i];
+                        const unsigned char* row =
+                            (const unsigned char*)ci.host + (size_t)r * ci.meta.row_bytes;
+                        if (ci.meta.et == DTYPE_F32) {
+                            const float* x = (const float*)row;
+                            float dot = 0.0f;
+                            for (size_t e = 0; e < wv.size(); e++) dot += x[e] * wv[e];
+                            acc += dot;
+                        } else if (ci.meta.et == DTYPE_I64) {
+                            const int64_t* x = (const int64_t*)row;
+                            size_t elems = ci.meta.row_bytes / 8;
+                            int64_t sum = 0;
+                            for (size_t e = 0; e < elems; e++) sum += x[e];
+                            acc += (float)sum * wv[0];
+                        } else {
+                            const unsigned char* x = row;
+                            size_t elems = ci.meta.row_bytes;
+                            int64_t sum = 0;
+                            for (size_t e = 0; e < elems; e++) sum += x[e];
+                            acc += (float)sum * wv[0];
+                        }
+                    }
+                    h[(size_t)t] = acc > 0.0f ? acc : 0.0f;   // relu
+                }
+                for (size_t j = 0; j < s->outs.size(); j++) {
+                    CpuOut& o = s->outs[j];
+                    for (int k = 0; k < o.meta.width; k++) {
+                        float acc = s->b2[j][(size_t)k];
+                        const std::vector<float>& wv = s->w2[j][(size_t)k];
+                        for (int t = 0; t < s->H; t++) acc += h[(size_t)t] * wv[(size_t)t];
+                        o.host[(size_t)r * (size_t)o.meta.width + (size_t)k] = std::tanh(acc);
+                    }
+                }
+            }
+            seq_out = s->seq;
+            return true;
+        }
         for (int j = 0; j < (int)s->outs.size(); j++) {
             CpuOut& o = s->outs[(size_t)j];
             for (int r = 0; r < n_rows; r++) {
@@ -274,12 +325,16 @@ public:
     }
 
     bool RefitWeights(const char* rw1_path) override {
+        std::lock_guard<std::mutex> lk(mx_);
+        for (CpuSession* s : sessions_)
+            if (s->H > 0) {
+                std::fprintf(stderr, "[cpu-refit] MLP 模式（hidden>0）refit 协议"
+                             "仅覆盖线性模式——fail fast\n");
+                return false;
+            }
         std::vector<char> blob;
         std::vector<Rw1Entry> ents;
         if (!ParseRw1(rw1_path, blob, ents)) return false;
-        // 会话级权重更新（toy 协议 "<out>.W<in>"）——对所有存活会话生效：
-        // 遍历本后端已建会话（登记表）
-        std::lock_guard<std::mutex> lk(mx_);
         int n_set = 0, n_skip = 0;
         for (CpuSession* s : sessions_) {
             for (const Rw1Entry& e : ents) {
@@ -341,6 +396,43 @@ private:
                     uint32_t st = seed ^ (uint32_t)(j * 7919 + (size_t)k * 104729 + i * 1299709);
                     for (size_t e = 0; e < L; e++) wv[e] = WNext(st);
                 }
+        }
+        if (s->H > 0) BuildMlpWeights(s, seed);
+    }
+
+    static void BuildMlpWeights(CpuSession* s, uint32_t seed) {
+        int H = s->H;
+        s->w1.assign((size_t)H, {});
+        s->b1.assign((size_t)H, 0.0f);
+        for (int t = 0; t < H; t++) {
+            s->w1[(size_t)t].assign(s->ins.size(), {});
+            uint32_t st = seed ^ (uint32_t)(t * 2654435761u + 97);
+            s->b1[(size_t)t] = WNext(st);
+            for (size_t i = 0; i < s->ins.size(); i++) {
+                CpuIn& ci = s->ins[i];
+                size_t L;
+                if (ci.meta.et == DTYPE_F32)
+                    L = ci.meta.row_bytes / 4 < (size_t)s->K
+                            ? ci.meta.row_bytes / 4 : (size_t)s->K;
+                else
+                    L = 1;
+                std::vector<float>& wv = s->w1[(size_t)t][i];
+                wv.resize(L);
+                for (size_t e = 0; e < L; e++) wv[e] = WNext(st);
+            }
+        }
+        s->w2.assign(s->outs.size(), {});
+        s->b2.assign(s->outs.size(), {});
+        for (size_t j = 0; j < s->outs.size(); j++) {
+            s->w2[j].assign((size_t)s->outs[j].meta.width, {});
+            s->b2[j].assign((size_t)s->outs[j].meta.width, 0.0f);
+            for (int k = 0; k < s->outs[j].meta.width; k++) {
+                uint32_t st = seed ^ (uint32_t)(j * 7919 + (size_t)k * 104729 + 5);
+                s->b2[j][(size_t)k] = WNext(st);
+                s->w2[j][(size_t)k].assign((size_t)H, 0.0f);
+                for (int t = 0; t < H; t++)
+                    s->w2[j][(size_t)k][(size_t)t] = WNext(st);
+            }
         }
     }
     std::mutex mx_;

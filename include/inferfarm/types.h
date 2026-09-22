@@ -55,6 +55,9 @@ struct CpuModelDecl {
     int slots = 64;
     int poly_k = 8;                    // 每输入参与点积的行首元素数上限（棋类
                                       // 全局面输入=行宽，如五子棋 225）
+    int hidden = 0;                    // >0=一层 MLP（H 隐藏单元：relu(W1·x+b1)
+                                      // → tanh(W2·h+b2)）；0=纯线性（refit 协议
+                                      // 仅覆盖线性模式）
     uint32_t weight_seed = 0xC0FFEEu; // 权重种子（同种子=同权重=逐位确定）
 };
 

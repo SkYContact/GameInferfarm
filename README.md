@@ -28,14 +28,23 @@ GPU 门票。推理农场把这三层做成游戏无关的机件（实测 7.5-8.
 ## 五子棋接入范例（无需训练任何模型）
 
 [examples/gomoku](examples/gomoku) 用一个真实的完整游戏示范接入全流程：
-**未训练神经网络**（CPU 后端确定性模型，权重由种子生成）vs **规则对手**
+**未训练一层 MLP**（450→64→225，权重由种子生成=逐位确定）vs **规则对手**
 （能赢就赢/必须堵就堵/启发式落子）。它不会赢——但种子协议、直写槽、银行
 攒批、收割回投、逐位确定性全部真实工作；换成你训练好的模型只是改一处模型
 声明（或换 ort/trt 后端），适配器零改动。
 
 ```bash
-build/Release/gomoku.exe --chains 8 --games 16 --show-board
+build/Release/gomoku.exe --chains 8 --games 16 --show-board          # cpu 后端（默认，免 GPU）
+# 真模型工件（一层 MLP → 钉批 onnx + TRT engine）：
+python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
+build/Release/gomoku.exe --backend ort --model models/gomoku_mlp.fb8.onnx   # ORT（含 CUDA Graph）
+build-trt/Release/gomoku.exe --backend trt --engine models/gomoku_mlp.fb8.trt  # TRT（图+邮箱）
 ```
+
+真模型实测（本机，32 局×2 银行）：三后端行为**逐位可比**（ORT 与 TRT 对
+同一 fp32 模型指纹逐位同；银行 vs inline 各自逐位同）——玩具尺度下 CPU 后端
+最快（MLP 太小，GPU 每批门票是纯开销），GPU 后端的吞吐价值在真模型尺度
+（产线参考：[docs/provenance.md](docs/provenance.md)）。
 
 ```
 [gomoku] 汇总: 先手 0/8, 后手 0/8, 综合 0/16 (0.0%)，决策 152，推理故障局 0
@@ -138,7 +147,9 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
 - **G2** 同配置复跑全同；**G3** fiber vs 线程模式全同（TLS 帧纪律的行为级验证）；
 - **G4** census 开=结果逐位同 + 人口恒等式 X≡0 + 复活路径有样本；
 - **G5** refit 同 blob 逐位同 / 异 blob 必变 / RW1 负路径 fail fast；
-- **G6** 五子棋真实接缝：银行 vs inline 逐位一致。
+- **G6** 五子棋真实接缝：银行 vs inline 逐位一致；
+- **R1/R2**（可选，真模型工件存在才跑，缺席=SKIP）：ORT/TRT 后端复跑逐位同
+  + 银行 vs inline 逐位同（`gomoku_backend_test`）。
 
 ## 约束与路线
 

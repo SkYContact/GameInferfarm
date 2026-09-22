@@ -52,8 +52,27 @@
 - README 重写为开源中文主文档 + README.en.md 英文副本；LICENSE=MIT。
 - CPU 后端点积宽度可配（CpuModelDecl.poly_k，棋类全局面输入=行宽）。
 
+## 真模型实测（2026-09-22 三后端五子棋）
+五子棋一层 MLP（450-64-225，未训练、种子权重；tools/bake_gomoku_mlp.py 烤
+fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
+
+- **ORT 后端首跑通**：CUDA EP + enable_cuda_graph（银行会话钉调度台线程）；
+  探针修两处潜伏 bug 后（探针漏 D2H、探针跑图漏 H2D）全链绿。
+  R1 门：复跑逐位同 + 银行 vs inline 逐位同（指纹 7f1cb31d293c961c）。
+  **账本缺口"ORT+银行制"实测点落地**：银行 508-722 局/s / inline 606-659 局/s。
+- **TRT 后端首跑通**：图捕获+邮箱照常；R2 门全绿（同指纹 7f1cb31d293c961c）。
+  银行 432-618 局/s；[bank] 行 gpu_flight 68%、dep 0.08ms（vs ORT 0.48——
+  图回放提交更便宜的直接证据）。
+- **跨后端逐位一致（观察项）**：ORT 与 TRT 对同一 fp32 模型指纹逐位同
+  （TF32 双端关闭的前提下）。
+- **诚实结论（玩具尺度）**：CPU 后端最快（约 1000 局/s）——MLP 太小，GPU
+  每批门票纯开销；GPU 后端的价值在 YGO 级模型（行宽 176.9KB）——产线账本
+  317-368 局/s 才是它的战场。银行制下三后端行为逐位可比本身就是可交付性质。
+- 门进套件：tests/gomoku_backend_test.cpp（工件缺席=SKIP 退 0，无 GPU/CI
+  不拦路）；主构建（ORT）与 build-trt（ORT+TRT）双 ALL PASS。
+
 ## 未决
 - run25 发车仍在 YGO 侧停车等用户口令（发车卡 D:/ygo_data/es_run25_launch.txt）
   ——**框架会话勿动它**。
 - 框架正式命名待定（暂名 inferfarm/推理农场）。
-- ORT+银行制吞吐实测点缺失（见判决 12）；YGO 适配器回接待做。
+- YGO 适配器回接待做（现役 ai_core 即参考实现）；TRT refit 真引擎换心冒烟（RW1 名单对齐 torch 权重名）待做。

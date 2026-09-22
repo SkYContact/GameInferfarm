@@ -2,6 +2,7 @@ build*/
 out/
 *.rw1
 *.engine
+*.trt
 *.onnx
 *.pdb
 *.obj

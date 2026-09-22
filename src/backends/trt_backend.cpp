@@ -57,6 +57,13 @@ static void* (*g_trt_create_runtime)(void*, int32_t) = nullptr;
 static void* (*g_trt_create_refitter)(void*, void*, int32_t) = nullptr;
 static int32_t g_trt_ver_int = 0;
 
+// cuda_dir 缺省链：cfg / env FARM_CUDA_DIR / q35 torch/lib（与 ORT 后端同款）
+static std::string DefaultCudaDir(const ModelConfig& cfg) {
+    if (!cfg.cuda_dir.empty()) return cfg.cuda_dir;
+    if (const char* e = getenv("FARM_CUDA_DIR")) if (*e) return e;
+    return "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/torch/lib";
+}
+
 static int32_t TrtVersionInt() {
     if (g_trt_ver_int) return g_trt_ver_int;
     if (const char* e = getenv("FARM_TRT_VERSION_INT")) {
@@ -98,8 +105,7 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
     {
         char buf[8192];
         GetEnvironmentVariableA("PATH", buf, sizeof buf);
-        std::string cuda_dir = !cfg.cuda_dir.empty() ? cfg.cuda_dir
-            : (getenv("FARM_CUDA_DIR") ? getenv("FARM_CUDA_DIR") : "");
+        std::string cuda_dir = DefaultCudaDir(cfg);
         SetEnvironmentVariableA("PATH",
             (cuda_dir + ";" + trt_dir + ";" + buf).c_str());
     }
@@ -301,7 +307,7 @@ public:
     const char* Name() const override { return "trt"; }
 
     bool LoadSpec(const ModelConfig& cfg, int slots, ModelSpec& out) override {
-        if (!LoadTrtLib(cfg) || !g_cu.Load(cfg.cuda_dir)) return false;
+        if (!LoadTrtLib(cfg) || !g_cu.Load(DefaultCudaDir(cfg))) return false;
         if (!EnsureEngine(cfg)) return false;
         nvinfer1::ICudaEngine* eng = g_trt_eng.eng;
         out.backend = "trt";

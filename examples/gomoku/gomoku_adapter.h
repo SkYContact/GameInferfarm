@@ -206,7 +206,8 @@ inline GameAdapter* MakeGomokuAdapter(int, void*) {
 inline CpuModelDecl GomokuModelDecl(int slots) {
     CpuModelDecl d;
     d.slots = slots;
-    d.poly_k = kCells;               // 全局面线性策略（未训练参考模型）
+    d.poly_k = kCells;               // 全局面输入
+    d.hidden = 64;                   // 一层 MLP（450→64→225，未训练参考模型）
     d.ins.push_back({"own", DTYPE_F32, {kCells}});
     d.ins.push_back({"opp", DTYPE_F32, {kCells}});
     d.outs.push_back({"policy", kCells});

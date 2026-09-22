@@ -1,12 +1,12 @@
-// gomoku_main.cpp — 五子棋范例入口：未训练神经网络（CPU 后端确定性模型）
-// vs 规则对手，跑通推理农场全流程（fiber/银行攒批/收割回投/种子协议）。
+// gomoku_main.cpp — 五子棋范例入口：一层 MLP（未训练）vs 规则对手，
+// 跑通推理农场全流程。三后端可换：cpu（默认，免 GPU）/ ort（onnx）/ trt（engine）。
 //
-//   gomoku [--chains 8] [--games 16] [--banks 2] [--workers 4] [--slots 8]
+//   gomoku [--backend cpu|ort|trt] [--model <fb.onnx>] [--engine <plan>]
+//          [--chains 8] [--games 16] [--banks 2] [--workers 4] [--slots 8]
 //          [--inline] [--threads] [--census] [--show-board]
 //
-// 预期：未训练模型胜率很低（这是诚实的——模型只是局面的固定线性函数）；
-// 本范例展示的是流程与逐位确定性：同参数复跑结果逐位同（FARM_CENSUS=1
-// 可看取证层输出）。
+// ort/trt 模型工件由 tools/bake_gomoku_mlp.py 烤制（一层 MLP，权重由种子
+// 生成——确定性）。三后端同架构；指纹只在与自身同后端双腿间可比。
 #include "gomoku_adapter.h"
 #include <cstdio>
 #include <cstring>
@@ -30,7 +30,21 @@ int main(int argc, char** argv) {
     cfg.model.cpu = GomokuModelDecl(cfg.slots);
     bool show_board = false;
     for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "--banks") && i + 1 < argc) cfg.banks = atoi(argv[++i]);
+        if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
+            cfg.model.backend = argv[++i];
+            if (cfg.model.backend != "cpu" && cfg.model.backend != "ort"
+                && cfg.model.backend != "trt") {
+                std::printf("未知后端 %s（cpu|ort|trt）\n", cfg.model.backend.c_str());
+                return 2;
+            }
+        }
+        else if (!std::strcmp(argv[i], "--model") && i + 1 < argc) cfg.model.model_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--engine") && i + 1 < argc) cfg.model.engine_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--ort-dir") && i + 1 < argc) cfg.model.ort_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--trt-dir") && i + 1 < argc) cfg.model.trt_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--cuda-dir") && i + 1 < argc) cfg.model.cuda_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--refit") && i + 1 < argc) cfg.model.refit_weights = argv[++i];
+        else if (!std::strcmp(argv[i], "--banks") && i + 1 < argc) cfg.banks = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--chains") && i + 1 < argc) cfg.chains = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--games") && i + 1 < argc) cfg.games = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--workers") && i + 1 < argc) cfg.workers = atoi(argv[++i]);
@@ -41,6 +55,16 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--census")) cfg.census = true;
         else if (!std::strcmp(argv[i], "--show-board")) show_board = true;
         else { std::printf("未知参数 %s\n", argv[i]); return 2; }
+    }
+    if (cfg.model.backend == "ort" && cfg.model.model_path.empty()) {
+        std::fprintf(stderr, "[gomoku] ort 后端需 --model <fb.onnx>"
+                     "（tools/bake_gomoku_mlp.py 烤制）\n");
+        return 2;
+    }
+    if (cfg.model.backend == "trt" && cfg.model.engine_path.empty()) {
+        std::fprintf(stderr, "[gomoku] trt 后端需 --engine <plan>"
+                     "（tools/bake_gomoku_mlp.py --trt 烤制）\n");
+        return 2;
     }
     Farm farm;
     if (!farm.Init(cfg)) return 1;

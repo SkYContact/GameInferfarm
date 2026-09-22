@@ -39,17 +39,28 @@ layers into game-agnostic machinery (measured 7.5-8.7×; see
 ## Gomoku sample (no training required)
 
 [examples/gomoku](examples/gomoku) demonstrates the full pipeline with a real
-complete game: an **untrained network** (deterministic CPU backend model,
-weights generated from a seed) vs a **rule-based opponent** (win if possible,
-block if forced, heuristic otherwise). It loses — on purpose. The seed
-protocol, direct-write slots, bank batching, harvest, and bitwise determinism
-all genuinely work; swapping in your trained model is a one-line model
-declaration change (or switch to the ort/trt backend) with zero adapter
+complete game: an **untrained one-layer MLP** (450→64→225, weights generated
+from a seed = bitwise deterministic) vs a **rule-based opponent** (win if
+possible, block if forced, heuristic otherwise). It loses — on purpose. The
+seed protocol, direct-write slots, bank batching, harvest, and bitwise
+determinism all genuinely work; swapping in your trained model is a one-line
+model declaration change (or switch to the ort/trt backend) with zero adapter
 changes.
 
 ```bash
-build/Release/gomoku.exe --chains 8 --games 16 --show-board
+build/Release/gomoku.exe --chains 8 --games 16 --show-board          # cpu backend (default, no GPU)
+# Real-model artifacts (one-layer MLP -> batch-pinned onnx + TRT engine):
+python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
+build/Release/gomoku.exe --backend ort --model models/gomoku_mlp.fb8.onnx   # ORT (with CUDA Graph)
+build-trt/Release/gomoku.exe --backend trt --engine models/gomoku_mlp.fb8.trt  # TRT (graph + mailbox)
 ```
+
+Real-model measurements (local, 32 games × 2 banks): all three backends are
+**bitwise comparable** (ORT and TRT produce identical fingerprints for the same
+fp32 model; bank vs inline bitwise identical per backend). At toy scale the
+CPU backend is fastest — the MLP is tiny, so the per-batch GPU ticket is pure
+overhead; the GPU backends pay off at real-model scale (see
+[docs/provenance.md](docs/provenance.md), in Chinese).
 
 ### Integrating your game
 
@@ -146,7 +157,10 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
   revival samples;
 - **G5** refit: same blob twice = bitwise identical; different blob = must
   change; RW1 negative paths fail fast;
-- **G6** a real game (Gomoku): bank vs inline bitwise identical.
+- **G6** a real game (Gomoku): bank vs inline bitwise identical;
+- **R1/R2** (optional; runs only when real-model artifacts exist, otherwise
+  SKIP): ORT/TRT backends — identical reruns + bank vs inline bitwise
+  identical (`gomoku_backend_test`).
 
 ## Constraints and roadmap
 

@@ -200,18 +200,27 @@ public:
         // 两图案可分辨 + 复跑稳定 + 换数据输出跟着变。
         OrtSess* s = (OrtSess*)session;
         std::vector<char> ref1, ref2, r2b;
+        // 探针自己搬 D2H（生产路径的 D2H 在 CompletionReached——探针必须显式拷
+        // 否则读到的是陈旧主机 arena）
         auto snap = [&](std::vector<char>& v) {
             g_cu.DeviceSynchronize();
+            for (size_t j = 0; j < s->outs.size(); j++)
+                g_cu.Memcpy(s->outs[j].host, s->outs[j].dev, s->outs[j].bytes, 2);
             v.assign((const char*)s->out_h_arena,
                      (const char*)s->out_h_arena + s->out_h_bytes);
         };
+        // 跑图=H2D 整块 → RunOnce（生产路径同款：输入搬运在图外由调用方做）
+        auto run_pat = [&]() {
+            g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1);
+            RunOnce(s);
+        };
         FillPattern(s, 1);
-        RunOnce(s);
+        run_pat();
         snap(ref1);
-        RunOnce(s);
-        snap(r2b);   // 复跑稳定（图回放非随机）
+        RunOnce(s);   // 复跑（不重拷——设备数据未变，纯图回放稳定性）
+        snap(r2b);
         FillPattern(s, 2);
-        RunOnce(s);
+        run_pat();
         snap(ref2);
         bool diff = ref1 != ref2;
         bool stable = ref1 == r2b;
