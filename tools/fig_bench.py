@@ -17,7 +17,7 @@ os.makedirs(OUT, exist_ok=True)
 labels = ["python 串行", "python 向量化\n(256环境同步)", "C++ 每链线程\n+逐次推理",
           "C++ 推理农场\n(6组银行攒批)"]
 gps = [19.8, 25.9, 190.2, 2300]
-rel = [1.0, 1.3, 9.6, 116.0]
+rel = [1.0, 1.3, 9.6, 116.2]
 colors = ["#8fa3b8", "#8fa3b8", "#5b7d99", "#c0504d"]
 
 fig, ax = plt.subplots(figsize=(7.6, 4.6), dpi=150)
