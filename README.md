@@ -1,5 +1,7 @@
 # GameInferfarm · 推理农场
 
+[![CI](https://github.com/SkYContact/GameInferfarm/actions/workflows/ci.yml/badge.svg)](https://github.com/SkYContact/GameInferfarm/actions/workflows/ci.yml)
+
 **通用 C++ 游戏决策推理框架**——把"大量同构游戏并发推进 + 神经网络批量决策"做成游戏无关的库。
 写一个 `GameAdapter` 接入你的游戏，剩下的并发、攒批、GPU 提交、取证全部交给农场。
 
@@ -45,6 +47,22 @@ build-trt/Release/gomoku.exe --backend trt --engine models/gomoku_mlp.fb8.trt  #
 同一 fp32 模型指纹逐位同；银行 vs inline 各自逐位同）——玩具尺度下 CPU 后端
 最快（MLP 太小，GPU 每批门票是纯开销），GPU 后端的吞吐价值在真模型尺度
 （产线参考：[docs/provenance.md](docs/provenance.md)）。
+
+### 公开基准：训练模型 + 五级实现谱系（2026-09-22）
+
+仓库自带一条**可复现的价值链**（`tools/` 一键再生，`docs/benchmark.md` 全口径）：
+
+- **模型真会下棋**：连型评估老师自博弈 4000 局（34.1 万样本）→ BC 训练
+  6.86M 参数 CNN（`models/gomoku_cnn.fb16.onnx` 随仓分发）→ 对内置规则
+  对手胜率 **0/16（未训练）→ 1100/1280 = 85.9%**（先手 87.2% / 后手 84.7%）。
+- **框架真跑得快**：同一负载五级实现谱系 4 腿交替实测——
+  python 串行 19.4 局/s → python 向量化 26.2 → C++ 每链线程+逐次 200.7 →
+  C++ fiber+逐次 200.1 → **C++ 推理农场（银行攒批）815.5 局/s**；
+  谱系首尾 **42.0×**，同 C++ 同模型下银行攒批一项 **4.06×**（批均 12.8 行）。
+- **行为逐位等价**：12 腿（3 实现 × 4 腿）指纹全同、决策数全同（16276）、
+  推理故障 0——吞吐与正确性一起交账。
+
+![谱系阶梯](docs/figures/bench_ladder.png)
 
 ```
 [gomoku] 汇总: 先手 0/8, 后手 0/8, 综合 0/16 (0.0%)，决策 152，推理故障局 0
