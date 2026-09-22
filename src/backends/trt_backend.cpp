@@ -299,15 +299,17 @@ struct TrtSession {
     void* graph = nullptr;
     bool graph_ok = false;
     int slots = 64;
+    int dev = 0;      // 会话设备（多卡：分配/流/图/邮箱全落此设备）
     int last_n = 0;
 };
 
 class TrtBackend : public InferBackend {
 public:
     const char* Name() const override { return "trt"; }
-
     bool LoadSpec(const ModelConfig& cfg, int slots, ModelSpec& out) override {
         if (!LoadTrtLib(cfg) || !g_cu.Load(DefaultCudaDir(cfg))) return false;
+        dev_id_ = cfg.device_id;   // 多卡：engine 反序列化落定设备（同架构双卡
+        if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);   // 可共享 engine；>0 本机未测）
         if (!EnsureEngine(cfg)) return false;
         nvinfer1::ICudaEngine* eng = g_trt_eng.eng;
         out.backend = "trt";
@@ -370,11 +372,13 @@ public:
     }
 
     void* CreateSession(const ModelConfig& cfg, const ModelSpec& spec, bool for_bank) override {
-        (void)cfg; (void)for_bank;
+        (void)for_bank;
         if (!g_trt_eng.eng) return nullptr;
         nvinfer1::ICudaEngine* eng = g_trt_eng.eng;
         TrtSession* s = new TrtSession();
         s->slots = spec.slots;
+        s->dev = cfg.device_id;
+        if (g_cu.SetDevice) g_cu.SetDevice(s->dev);   // 上下文/流/arena 落对设备
         s->ctx = eng->createExecutionContext(
             nvinfer1::ExecutionContextAllocationStrategy::kSTATIC);
         if (!s->ctx) {
@@ -461,6 +465,7 @@ public:
 
     bool Warmup(void* session) override {
         TrtSession* s = (TrtSession*)session;
+        if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
         memset(s->in_h_arena, 0, s->in_h_bytes);
         for (int r = 0; r < 3; r++) {
             if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
@@ -487,6 +492,7 @@ public:
     // ==在线参考 + 换数据图输出跟着变（非烧死快照）。任一不过=false。
     bool ProbeGraph(void* session) override {
         TrtSession* s = (TrtSession*)session;
+        if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
         if (!s->graph_ok) {
             std::fprintf(stderr, "[trt-probe] 无批图——银行制要求图+邮箱，拒绝\n");
             return false;
@@ -563,6 +569,7 @@ public:
     // 前缀 h2d（n > 7/8·slots 走整块；尾行旧数据=行独立无害）+ 异步发射
     bool SubmitBatch(void* session, int n_rows, unsigned& seq_out) override {
         TrtSession* s = (TrtSession*)session;
+        if (g_cu.SetDevice) g_cu.SetDevice(s->dev);   // 多卡守卫
         if (n_rows > s->slots) n_rows = s->slots;
         s->last_n = n_rows;
         if (n_rows > (s->slots * 7) / 8) {
@@ -581,6 +588,7 @@ public:
     bool CompletionReached(void* session, unsigned seq) override {
         TrtSession* s = (TrtSession*)session;
         if (!s->mb_ok) {   // 降级流同步路径：发射即等完（SubmitBatch 已同步）
+            if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
             g_cu.DeviceSynchronize();
             g_cu.Memcpy(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2);
             return true;
@@ -609,10 +617,12 @@ public:
             std::fprintf(stderr, "[trt] engine 未载——换心不可用\n");
             return false;
         }
+        if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);
         return ApplyRefitWeights(g_trt_eng.eng, rw1_path);
     }
 
 private:
+    int dev_id_ = 0;   // 实例设备（LoadSpec 落定；多卡守卫用）
     static bool EnsureEngine(const ModelConfig& cfg) {
         if (g_trt_eng.eng) {
             if (!cfg.engine_path.empty() && g_trt_eng.path != cfg.engine_path) {

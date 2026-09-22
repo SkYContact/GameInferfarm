@@ -97,3 +97,21 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   633/605——±10% 效应 < ±13% 跑间噪声，玩具尺度**不可判**；四腿指纹全部
   dbe3e3c5e59ba566（行为不变性成立）。缓存主战场=YGO 尺度（真模型+GPU 忙），
   回接时补数。ORT=q35 环境自带 onnxruntime 1.30（capi 目录）。
+
+## 多 GPU：设备挂银行（2026-09-22，判决15）
+- 动机：开源框架的泛用性（用户判据：显卡+核显跑通 ⇒ 别人双开直接用）。
+  KataGo gpuIdxByServerThread 同构吸收；610M 核显当验证台（非算力）。
+- **实现**：BankGroupCfg（组=后端+模型+银行数）；组池/组轮转/组窗分列；
+  Claim 组门（链→组钉扎 c%n_groups）；Farm devices 配置面+组间结构核对；
+  ORT 实例化（api/dll/env 下沉成员）+双 dll 改名共存；DML EP 分支（宿主
+  绑定+同步 Run+输入重绑血律）；TRT device_id 守卫（cudaSetDevice 入口化，
+  dev>0 本机未测——单卡行为不变）。
+- **实测**（5070Ti+610M）：双 ORT 同进程（1.30 CUDA+1.24 DML）；异构 64 局
+  315 局/s、指纹 a343f5f21dc49872 三跑全同（跨厂商钉扎确定性）；R4 门绿；
+  **观察**：该工件 CUDA/DML/TRT 三家指纹逐位一致（a3535388ff95061c，与
+  单设备腿同——大模型不保证，仅证明协议通）。DML 双设备初测 96K/66K
+  rows/s（玩具，调度开销绑定）。
+- 门：G8a（同构分组=单组逐位同，CI 可跑）；R4（真异构，FARM_DML_DIR
+  选通，缺席 SKIP）；gomoku --device 语法演示。
+- 途中案：InputRow 残留旧单组成员=空指针虚调用（坑目录）；DML iob 输入
+  忽略案（probe 哨兵抓到，判决15 血律 2）。

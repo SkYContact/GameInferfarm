@@ -141,6 +141,29 @@ mechanically a pure win (at toy scale the effect is below run-to-run noise; the
 real verdict waits for YGO-scale models). Bitwise identity is guaranteed by gate
 G7 either way. Off by default.
 
+## Multi-GPU (banks attached to devices; judgment 15)
+
+`FarmConfig.devices`: one entry per device group — `(backend, device_id,
+ort_ep, model, bank count)`. Each group has its own bank pool/window rotation,
+and **chain c is pinned to group c%n_groups** — the key to cross-vendor rerun
+bitwise determinism (measured: NVIDIA CUDA + AMD DML, identical fingerprints
+across three runs). Two same-model NVIDIA cards keep the bitwise gate for free.
+The inference cache namespaces keys per group.
+
+Sample `--device` syntax (first replaces the primary device, later ones append):
+
+```
+gomoku --device ort,ep=cuda,dev=0,banks=2,model=m.onnx \
+       --device ort,ep=dml,dev=1,banks=1,model=m.onnx,dir=D:/dml_rt/capi
+```
+
+AMD GPUs go through `ep=dml` (DirectML: host binding + synchronous Run; needs
+an onnxruntime-directml build — `pip install --target <dir>
+onnxruntime-directml`, point `dir=` at its capi directory; the name clash
+with the CUDA build's onnxruntime.dll is handled automatically by the
+framework via a renamed copy). TRT `device_id>0` guards are in place
+(untested on this single-GPU machine; ready for twin same-arch cards).
+
 ## Environment knobs (explicit Config wins; env for quick experiments)
 
 `FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
@@ -174,9 +197,14 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
 - **G6** a real game (Gomoku): bank vs inline bitwise identical;
 - **G7** inference cache: on = off bitwise identical (including a second leg on a
   fully warm cache) + generation-invalidation gate + real hits;
+- **G8a** multi-device groups (homogeneous simulation): partitioned = single-group
+  bitwise identical + rerun identical (real heterogeneous = R4 / `--device`);
 - **R1/R2** (optional; runs only when real-model artifacts exist, otherwise
   SKIP): ORT/TRT backends — identical reruns + bank vs inline bitwise
-  identical (`gomoku_backend_test`).
+  identical (`gomoku_backend_test`);
+- **R4** (optional; `FARM_DML_DIR` pointing at an onnxruntime-directml capi
+  directory): cuda+dml heterogeneous leg completes + rerun bitwise identical
+  (cross-vendor pinning determinism).
 
 ## Constraints and roadmap
 
@@ -184,9 +212,11 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
   is confined to the Switch-family in fiber_pool.cpp). C++17, CMake ≥3.16.
 - Roadmap: ORT/TRT real-model benchmarks (paradigm borrowed from KataGo's
   benchmarkPureForward: barrier start + per-thread medians + wall clock),
-  multi-GPU (bank↔device pinning), an fp16 bake tier, hybrid low-load dispatch
+  an fp16 bake tier, hybrid low-load dispatch
   (the cure for the banking tax in single-game scenarios), POSIX fibers, more
-  game samples.
+  game samples. (Multi-GPU has landed: cuda+dml heterogeneous verified with
+  cross-vendor rerun bitwise identity; TRT device_id guards await a twin-card
+  machine.)
 
 ## Naming
 

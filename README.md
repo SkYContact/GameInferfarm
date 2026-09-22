@@ -148,6 +148,25 @@ TRT 后端：`cmake -B build-trt -DINFERFARM_WITH_TRT=ON`
   钉死=垃圾行免费，机械上纯赢（玩具尺度效应小于跑间噪声不可判，YGO 尺度见
   分晓）。指纹不变性由门 G7 保证。默认关。
 
+## 多 GPU（设备挂银行，判决15）
+
+`FarmConfig.devices` 每设备组一份 `(后端, device_id, ort_ep, 模型, 银行数)`；
+组池/组窗独立轮转；**链 c 钉扎到组 c%n_groups**——异构设备（如 NVIDIA 主卡 +
+AMD 核显/独显）下保"同配置重跑逐位同"（实测跨厂商指纹三跑全同）。同构双卡
+（2× NVIDIA TRT）逐位门天然保。推理缓存按组命名空间。
+
+五子棋范例 `--device` 语法（首个替换主设备，后续追加组）：
+
+```
+gomoku --device ort,ep=cuda,dev=0,banks=2,model=m.onnx \
+       --device ort,ep=dml,dev=1,banks=1,model=m.onnx,dir=D:/dml_rt/capi
+```
+
+AMD 卡走 `ep=dml`（DirectML，宿主绑定+同步 Run；需 onnxruntime-directml
+构建，`pip install --target <dir> onnxruntime-directml` 后 `dir=` 指其
+capi 目录——与 CUDA 构建同名冲突由框架自动改名共存）。TRT `device_id>0`
+守卫已就位（单卡机未测，双同构卡即用）。
+
 ## 环境旋钮（显式 Config 为准，env 快速实验）
 
 `FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
@@ -177,17 +196,22 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
 - **G5** refit 同 blob 逐位同 / 异 blob 必变 / RW1 负路径 fail fast；
 - **G6** 五子棋真实接缝：银行 vs inline 逐位一致；
 - **G7** 推理缓存：开=关逐位同（含纯命中路径二腿）+ 代次失效门 + 真实命中；
+- **G8a** 多设备组（同构仿真）：分组=单组逐位同 + 重跑逐位同（真异构=R4/
+  `--device` 演示，需双卡）；
 - **R1/R2**（可选，真模型工件存在才跑，缺席=SKIP）：ORT/TRT 后端复跑逐位同
-  + 银行 vs inline 逐位同（`gomoku_backend_test`）。
+  + 银行 vs inline 逐位同（`gomoku_backend_test`）；
+- **R4**（可选，`FARM_DML_DIR` 指向 onnxruntime-directml 的 capi 目录）：
+  cuda+dml 异构双设备腿完成 + 复跑逐位同（跨厂商钉扎确定性）。
 
 ## 约束与路线
 
 - 当前为 **Windows 优先**（fiber 走 Windows Fibers；POSIX 移植面收口在
   fiber_pool.cpp 的 Switch 族）。C++17，CMake ≥3.16。
 - 路线：ORT/TRT 真模型实测基准（范式=KataGo benchmarkPureForward：barrier
-  同起跑+每线程中位数+全体墙钟）、多 GPU（银行↔卡钉扎，KataGo
-  gpuIdxByServerThread 同构）、fp16 烤制档（int8 与 fp32 之间）、低负载混合
-  发车（单局场景银行税的解药）、POSIX 纤程、更多游戏范例。
+  同起跑+每线程中位数+全体墙钟）、fp16 烤制档（int8 与 fp32 之间）、低负载
+  混合发车（单局场景银行税的解药）、POSIX 纤程、更多游戏范例。
+  （多 GPU 已落地：cuda+dml 异构实测跑通、跨厂商复跑逐位同；TRT device_id
+  守卫就位待双同构卡实测。）
 
 ## 命名说明
 

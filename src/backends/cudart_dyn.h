@@ -28,6 +28,9 @@ struct Cudart {
     int (*GraphInstantiate)(void**, void*, unsigned long long) = nullptr;
     int (*GraphLaunch)(void*, void*) = nullptr;
     int (*GraphDestroy)(void*) = nullptr;
+    int (*SetDevice)(int) = nullptr;            // 多卡守卫（可选符号：单卡行为不变）
+    int (*GetDevice)(int*) = nullptr;
+    int (*GetDeviceCount)(int*) = nullptr;
 
     bool ok = false;
 
@@ -63,6 +66,9 @@ struct Cudart {
         GraphInstantiate = (int (*)(void**, void*, unsigned long long))g("cudaGraphInstantiate");
         GraphLaunch = (int (*)(void*, void*))g("cudaGraphLaunch");
         GraphDestroy = (int (*)(void*))g("cudaGraphDestroy");
+        SetDevice = (int (*)(int))g("cudaSetDevice");
+        GetDevice = (int (*)(int*))g("cudaGetDevice");
+        GetDeviceCount = (int (*)(int*))g("cudaGetDeviceCount");
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
             || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
             std::fprintf(stderr, "[cudart] 缺导出符号\n");

@@ -5,11 +5,15 @@
 //   R2 trt 同款（trt 构建才可用；未编 TRT=SKIP）
 //   R3 ort vs trt 跨后端逐位一致（fp32+TF32 关的强性质；观察项，不设硬门
 //      ——不同引擎逐位等价不总是成立，本仓当前工件实测成立）
+//   R4 异构双设备（判决15）：ort/cuda 主卡 + ort/dml 第二卡（如 AMD 核显），
+//      腿完成 + 复跑逐位同（链→组钉扎的跨厂商确定性）。环境
+//      FARM_DML_DIR=onnxruntime-directml 的 capi 目录（缺席=SKIP）
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
 #include "../examples/gomoku/gomoku_adapter.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 using namespace inferfarm;
@@ -94,6 +98,45 @@ int main() {
         }
     } else {
         std::printf("SKIP R2: 无 %s\n", kTrt);
+    }
+    if (const char* dml_dir = getenv("FARM_DML_DIR")) {
+        if (have_ort) {
+            auto hetero_leg = [&](uint32_t seed0) {
+                FarmConfig cfg;
+                cfg.name = "hetero";
+                cfg.chains = 8;
+                cfg.games = 32;
+                cfg.seed0 = seed0;
+                cfg.slots = 8;
+                cfg.workers = 4;
+                cfg.stagger_ms = 1;
+                DeviceConfig a, b;
+                a.model.backend = "ort";
+                a.model.model_path = kOnnx;
+                a.banks = 2;
+                b.model.backend = "ort";
+                b.model.ort_ep = "dml";
+                b.model.device_id = 1;
+                b.model.model_path = kOnnx;
+                b.model.ort_dir = dml_dir;
+                b.banks = 1;
+                cfg.devices = {a, b};
+                Farm farm;
+                if (!farm.Init(cfg)) { g_fail++; return R{0, 0, 0}; }
+                double sec = farm.RunLeg(MakeGomokuAdapter, nullptr);
+                return R{farm.tally().fingerprint, farm.tally().games_done, sec};
+            };
+            R h1 = hetero_leg(20260922u);
+            R h2 = hetero_leg(20260922u);
+            CHECK(h1.games == 32, "R4 异构双设备腿完成（cuda+dml，32 局）");
+            CHECK(h1.fp == h2.fp, "R4 异构复跑逐位同（链→组钉扎的跨厂商确定性）");
+            std::printf("[R4] cuda+dml 异构 %.0f 局/s（指纹 %016llx）\n",
+                        h1.games / h1.sec, h1.fp);
+        } else {
+            std::printf("SKIP R4: 无 %s\n", kOnnx);
+        }
+    } else {
+        std::printf("SKIP R4: 无 FARM_DML_DIR（onnxruntime-directml 的 capi 目录）\n");
     }
     if (!have_ort && !have_trt) {
         std::printf("（本目录无模型工件——全部 SKIP 属正常）\n");

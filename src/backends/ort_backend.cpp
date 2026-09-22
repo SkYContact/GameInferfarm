@@ -23,9 +23,23 @@
 // （self_dep=42/38）实测：结果逐位一致、无异常——即当前版本对回放的实际
 // 约束比文档宽松。升级 ORT 版本时此结论须复验（自驱路径可退化为"置旗由
 // 调度台发射"）。
+//
+// 【多设备改造（2026-09-22，判决15）】实例化：api/dll/env 计数全部从进程级
+// 全局下沉为 OrtBackend 成员——一个实例=一套 ORT 运行时=一个设备组。双 ORT
+// 共存改名律：CUDA 构建与 DML 构建是两颗同名 onnxruntime.dll，Windows 按基名
+// 去重回柄——第二颗必须拷贝为 %TEMP%\inferfarm_ort_<n>.dll 再加载（依赖靠
+// PATH 前插解析）。
+//
+// 【DML 路线（AMD/核显）】ort_ep="dml"：宿主绑定（输入输出直接绑我们的
+// host arena，零 H2D/D2H）+ 同步 Run（返回即输出就绪——CompletionReached
+// 恒真）。此同步假设由 ProbeGraph 门口实验兜底：若 Run 异步，两图案可分辨/
+// 复跑稳定必挂，银行制拒绝启动。无图（graph 恒关）、无 cudart、写手自驱禁用
+// （同步提交会阻塞写手 fiber 整个 GPU 时长）。实测 610M 核显 66K rows/s
+// （玩具 MLP，DML 调度开销绑定）。
 #include "inferfarm/backend.h"
 #include "cudart_dyn.h"
 #include "onnxruntime_c_api.h"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -40,12 +54,18 @@
 
 namespace inferfarm {
 
-static Cudart g_cu;
-static std::mutex g_ort_mx;   // DLL/env 初始化互斥（会话各建 env；加载一次）
-static HMODULE g_ort_dll = nullptr;
-static const OrtApi* g_ort = nullptr;
-static int g_ort_env_seq = 0;
-static std::string g_ort_version = "?";
+static Cudart g_cu;   // 进程一份（cudart 与 ORT 实例无关；DML 实例不加载）
+
+// DLL 注册表：双 ORT 共存改名律（基名冲突=拷贝改名再装；依赖 PATH 前插）
+static std::mutex g_ort_dll_mx;
+struct OrtDllRec { std::string base; std::string dir; HMODULE h; };
+static std::vector<OrtDllRec> g_ort_dlls;
+static std::atomic<int> g_ort_dll_seq{0};
+
+static std::string ToLower(std::string s) {
+    for (auto& c : s) if (c >= 'A' && c <= 'Z') c += 32;
+    return s;
+}
 
 static size_t OnnxElemSize(ONNXTensorElementDataType t) {
     switch (t) {
@@ -75,51 +95,11 @@ static ONNXTensorElementDataType ElemToOnnx(ElemDtype t) {
     return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
 }
 
-static bool LoadOrtLib(const ModelConfig& cfg) {
-    std::lock_guard<std::mutex> lk(g_ort_mx);
-    if (g_ort) return true;
-    const char* ed = getenv("FARM_ORT_DIR");
-    std::string ort_dir = !cfg.ort_dir.empty() ? cfg.ort_dir
-        : (ed && *ed ? ed
-           : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/onnxruntime/capi");
-    const char* cd = getenv("FARM_CUDA_DIR");
-    std::string cuda_dir = !cfg.cuda_dir.empty() ? cfg.cuda_dir
-        : (cd && *cd ? cd : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/torch/lib");
-    // PATH 前插（onnxruntime CUDA 版的 cudart/cublas 依赖解析）
-    {
-        char old_path[8192];
-        GetEnvironmentVariableA("PATH", old_path, sizeof old_path);
-        SetEnvironmentVariableA("PATH",
-            (ort_dir + ";" + cuda_dir + ";" + old_path).c_str());
-    }
-    std::string dll = ort_dir + "\\onnxruntime.dll";
-    HMODULE h = LoadLibraryA(dll.c_str());   // 绝对路径：绕开 exe 同目录 CPU 版
-    if (!h) {
-        std::fprintf(stderr, "[ort] LoadLibrary %s 失败 GLE=%lu\n", dll.c_str(), GetLastError());
-        return false;
-    }
-    auto fn = (const OrtApiBase*(ORT_API_CALL*)())GetProcAddress(h, "OrtGetApiBase");
-    if (!fn) {
-        std::fprintf(stderr, "[ort] DLL 无 OrtGetApiBase\n");
-        return false;
-    }
-    const OrtApiBase* base = fn();
-    if (base->GetVersionString) {
-        const char* vs = base->GetVersionString();
-        if (vs && *vs) g_ort_version = vs;
-    }
-    g_ort = base->GetApi(ORT_API_VERSION);
-    if (!g_ort) {
-        std::fprintf(stderr, "[ort] GetApi(%d) 失败（头/DLL 版本不匹配）\n", ORT_API_VERSION);
-        return false;
-    }
-    g_ort_dll = h;
-    std::fprintf(stderr, "[ort] %s 就绪（%s）\n", g_ort_version.c_str(), dll.c_str());
-    return true;
-}
+// DML provider 挂载导出（dml_provider_factory.h 同签名；GetProcAddress 取）
+typedef OrtStatus* (ORT_API_CALL* OrtDmlAppendFn)(OrtSessionOptions*, int);
 
 // ScheduleSpin：设备等待恒忙等（Auto 策略睡 1-3ms/批）。须在 ORT 创建首个
-// CUDA 上下文（首个 CUDA EP 会话）之前设——LoadOrtLib 时机即满足。
+// CUDA 上下文（首个 CUDA EP 会话）之前设——首个 CUDA 实例 LoadLib 时机即满足。
 static void SetSpinFlagsOnce() {
     static bool done = false;
     if (done) return;
@@ -133,8 +113,8 @@ static void SetSpinFlagsOnce() {
 
 struct OrtIn {
     InputMeta meta;
-    void* host = nullptr;   // pinned carve
-    void* dev = nullptr;    // device carve
+    void* host = nullptr;   // pinned carve（dml=普通页 carve，语义同）
+    void* dev = nullptr;    // device carve（dml=host 同址，仅 CUDA 路径用）
     OrtValue* val = nullptr;
 };
 struct OrtOut {
@@ -146,9 +126,10 @@ struct OrtOut {
 };
 struct OrtSess {
     HMODULE dll = nullptr;      // 持引用（进程寿命不卸）
+    const OrtApi* api = nullptr;   // 所属实例的 api（实例终身不毁=指针终身有效）
     OrtEnv* env = nullptr;
     OrtSession* sess = nullptr;
-    OrtMemoryInfo* cuda_mem = nullptr;
+    OrtMemoryInfo* bind_mem = nullptr;   // CUDA 路径="Cuda"，DML 路径="Cpu"
     OrtIoBinding* iob = nullptr;
     std::vector<OrtIn> ins;
     std::vector<OrtOut> outs;
@@ -157,9 +138,11 @@ struct OrtSess {
     void* out_h_arena = nullptr; size_t out_h_bytes = 0;
     void* out_d_arena = nullptr; size_t out_d_bytes = 0;
     bool graph_on = false;
+    bool dml = false;
+    int dev_id = 0;
     int slots = 64;
     // 完成协议（整设备同步血律）：Submit 后首个 CompletionReached 做一次
-    // device sync + 前缀 D2H，随后同 seq 恒 true
+    // device sync + 前缀 D2H，随后同 seq 恒 true（dml：Run 同步=恒真）
     unsigned seq = 0;
     int last_n = 0;
     bool synced_for_seq = false;
@@ -167,17 +150,20 @@ struct OrtSess {
 
 class OrtBackend : public InferBackend {
 public:
-    const char* Name() const override { return "ort"; }
+    const char* Name() const override { return dml_ ? "ort-dml" : "ort"; }
 
-    // ORT 图会话绑调度台线程（PerThreadContext 铁律）：写手线程回放=触发
-    // ORT 重新捕获（CUDA 900/901）——满座自驱禁用，发车一律走调度台
+    // ORT 图会话绑调度台线程（PerThreadContext 铁律）+ DML 同步提交不可自驱：
+    // 两条路线统一禁写手自驱，发车一律走调度台
     bool DispatchFromWriterOk() const override { return false; }
 
     bool LoadSpec(const ModelConfig& cfg, int slots, ModelSpec& out) override {
-        if (!LoadOrtLib(cfg)) return false;
-        if (!g_cu.Load(cfg.cuda_dir)) return false;
-        SetSpinFlagsOnce();
-        const OrtApi* a = g_ort;
+        dml_ = (cfg.ort_ep == "dml");
+        if (!LoadLib(cfg)) return false;
+        if (!dml_) {
+            if (!g_cu.Load(cfg.cuda_dir)) return false;
+            SetSpinFlagsOnce();
+        }
+        const OrtApi* a = api_;
         // 探测会话（临时；用于元数据枚举）——图关（枚举无需图，避免 PerThread
         // Context 约束牵连 init 线程）
         OrtSess* probe = CreateSession(cfg, slots, /*for_bank=*/false, &out);
@@ -197,33 +183,39 @@ public:
         // 零填充 3 跑（enable_cuda_graph 内部前两跑构图/捕获——捕获窗口内
         // 不容地址/形状变化；地址已钉死=满足）
         for (int r = 0; r < 3; r++) {
-            if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
-                return false;
+            if (!s->dml) {
+                if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
+                    return false;
+            }
             if (!RunOnce(s)) return false;
-            g_cu.DeviceSynchronize();
+            if (!s->dml) g_cu.DeviceSynchronize();
         }
         std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s\n", s->slots,
-                     s->graph_on ? "，CUDA Graph=开（银行会话：调度台线程绑定）" : "，CUDA Graph=关");
+                     s->dml ? "，DML=宿主绑定+同步 Run（无图无围栏）"
+                            : (s->graph_on ? "，CUDA Graph=开（银行会话：调度台线程绑定）"
+                                           : "，CUDA Graph=关"));
         return true;
     }
 
     bool ProbeGraph(void* session) override {
-        // 图地址实验的 ORT 版：绑定地址钉死后，Run 读当前设备内存值。
-        // 两图案可分辨 + 复跑稳定 + 换数据输出跟着变。
+        // 图地址实验：绑定地址钉死后，Run 读当前设备内存值。
+        // 两图案可分辨 + 复跑稳定 + 换数据输出跟着变。（dml：同一实验兜底
+        // "Run 同步"假设——异步则两图案必同读陈旧宿主数据=可分辨挂=拒绝启动）
         OrtSess* s = (OrtSess*)session;
+        const OrtApi* a = api_;
         std::vector<char> ref1, ref2, r2b;
-        // 探针自己搬 D2H（生产路径的 D2H 在 CompletionReached——探针必须显式拷
-        // 否则读到的是陈旧主机 arena）
         auto snap = [&](std::vector<char>& v) {
-            g_cu.DeviceSynchronize();
-            for (size_t j = 0; j < s->outs.size(); j++)
-                g_cu.Memcpy(s->outs[j].host, s->outs[j].dev, s->outs[j].bytes, 2);
+            if (!s->dml) {
+                g_cu.DeviceSynchronize();
+                for (size_t j = 0; j < s->outs.size(); j++)
+                    g_cu.Memcpy(s->outs[j].host, s->outs[j].dev, s->outs[j].bytes, 2);
+            }
             v.assign((const char*)s->out_h_arena,
                      (const char*)s->out_h_arena + s->out_h_bytes);
         };
-        // 跑图=H2D 整块 → RunOnce（生产路径同款：输入搬运在图外由调用方做）
         auto run_pat = [&]() {
-            g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1);
+            if (!s->dml)
+                g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1);
             RunOnce(s);
         };
         FillPattern(s, 1);
@@ -246,17 +238,22 @@ public:
     void DestroySession(void* session) override {
         OrtSess* s = (OrtSess*)session;
         if (!s) return;
-        const OrtApi* a = g_ort;
+        const OrtApi* a = api_;
         if (s->iob) a->ReleaseIoBinding(s->iob);
         for (auto& i : s->ins) if (i.val) a->ReleaseValue(i.val);
         for (auto& o : s->outs) if (o.val) a->ReleaseValue(o.val);
         if (s->sess) a->ReleaseSession(s->sess);
         if (s->env) a->ReleaseEnv(s->env);
-        if (s->cuda_mem) a->ReleaseMemoryInfo(s->cuda_mem);
-        if (s->in_h_arena) g_cu.FreeHost(s->in_h_arena);
-        if (s->in_d_arena) g_cu.Free(s->in_d_arena);
-        if (s->out_h_arena) g_cu.FreeHost(s->out_h_arena);
-        if (s->out_d_arena) g_cu.Free(s->out_d_arena);
+        if (s->bind_mem) a->ReleaseMemoryInfo(s->bind_mem);
+        if (s->dml) {
+            if (s->in_h_arena) VirtualFree(s->in_h_arena, 0, MEM_RELEASE);
+            if (s->out_h_arena) VirtualFree(s->out_h_arena, 0, MEM_RELEASE);
+        } else {
+            if (s->in_h_arena) g_cu.FreeHost(s->in_h_arena);
+            if (s->in_d_arena) g_cu.Free(s->in_d_arena);
+            if (s->out_h_arena) g_cu.FreeHost(s->out_h_arena);
+            if (s->out_d_arena) g_cu.Free(s->out_d_arena);
+        }
         delete s;
     }
 
@@ -277,27 +274,33 @@ public:
         s->seq++;
         s->last_n = n_rows;
         s->synced_for_seq = false;
-        // 前缀 H2D：同步拷贝（返回即完成——与 ORT 内部流旗标无关，零竞态；
-        // n>7/8·slots 走整块）
-        if (n_rows > (s->slots * 7) / 8) {
-            if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
-                return false;
-        } else {
-            for (size_t i = 0; i < s->ins.size(); i++)
-                if (g_cu.Memcpy(s->ins[i].dev, s->ins[i].host,
-                                (size_t)n_rows * s->ins[i].meta.row_bytes, 1))
+        if (!s->dml) {
+            // 多卡守卫：分配/拷贝作用于当前设备（会话设备）。dml 无 CUDA 面。
+            if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+            // 前缀 H2D：同步拷贝（返回即完成——与 ORT 内部流旗标无关，零竞态；
+            // n>7/8·slots 走整块）
+            if (n_rows > (s->slots * 7) / 8) {
+                if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
                     return false;
+            } else {
+                for (size_t i = 0; i < s->ins.size(); i++)
+                    if (g_cu.Memcpy(s->ins[i].dev, s->ins[i].host,
+                                    (size_t)n_rows * s->ins[i].meta.row_bytes, 1))
+                        return false;
+            }
         }
         if (!RunOnce(s)) return false;
         seq_out = s->seq;
-        return true;   // Run 返回=已入队（不等 GPU 完成——收割侧 sync）
+        return true;   // cuda：Run 返回=已入队（收割侧 sync）；dml：=已完成
     }
 
     bool CompletionReached(void* session, unsigned seq) override {
         OrtSess* s = (OrtSess*)session;
-        if (seq < s->seq) return true;             // 旧序号（早已完成）
+        if (s->dml) return true;               // 同步 Run：返回即输出就绪（probe 兜底）
+        if (seq < s->seq) return true;         // 旧序号（早已完成）
         if (s->synced_for_seq) return true;
         // 整设备同步血律（不赌 ORT 内部流序）+ 前缀 D2H
+        if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
         g_cu.DeviceSynchronize();
         int n = s->last_n;
         for (size_t j = 0; j < s->outs.size(); j++)
@@ -330,8 +333,111 @@ public:
     }
 
 private:
+    HMODULE dll_ = nullptr;
+    const OrtApi* api_ = nullptr;
+    std::string ver_ = "?";
+    std::string dll_dir_;
+    int env_seq_ = 0;
+    bool dml_ = false;
+
+    // 实例级 DLL 加载（注册表：同(基名,目录)=复用；基名冲突他目录=改名装载）
+    bool LoadLib(const ModelConfig& cfg) {
+        if (api_) return true;
+        const char* ed = getenv("FARM_ORT_DIR");
+        std::string ort_dir = !cfg.ort_dir.empty() ? cfg.ort_dir
+            : (ed && *ed ? ed
+               : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/onnxruntime/capi");
+        const char* cd = getenv("FARM_CUDA_DIR");
+        std::string cuda_dir = !cfg.cuda_dir.empty() ? cfg.cuda_dir
+            : (cd && *cd ? cd : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/torch/lib");
+        std::lock_guard<std::mutex> lk(g_ort_dll_mx);
+        // PATH 前插（每目录一次；onnxruntime 的 cudart/cublas/DML 依赖解析）
+        {
+            char old_path[8192];
+            GetEnvironmentVariableA("PATH", old_path, sizeof old_path);
+            std::string np = ort_dir + ";" + old_path;
+            if (!dml_ && std::string(old_path).find(cuda_dir) == std::string::npos)
+                np = cuda_dir + ";" + np;
+            SetEnvironmentVariableA("PATH", np.c_str());
+        }
+        std::string base = ToLower("onnxruntime.dll");
+        HMODULE h = nullptr;
+        std::string load_path;
+        for (auto& r : g_ort_dlls)
+            if (r.base == base) {
+                if (ToLower(r.dir) == ToLower(ort_dir)) { h = r.h; break; }
+                // 基名冲突（Windows 按基名去重回柄）：拷贝改名再装
+                char tmp[MAX_PATH];
+                GetTempPathA(MAX_PATH, tmp);
+                load_path = std::string(tmp) + "inferfarm_ort_"
+                    + std::to_string(g_ort_dll_seq.fetch_add(1)) + ".dll";
+                if (!CopyFileA((ort_dir + "\\onnxruntime.dll").c_str(),
+                               load_path.c_str(), FALSE)) {
+                    std::fprintf(stderr, "[ort] 基名冲突改名拷贝失败 GLE=%lu（%s → %s）\n",
+                                 GetLastError(), ort_dir.c_str(), load_path.c_str());
+                    return false;
+                }
+                std::fprintf(stderr, "[ort] 双 ORT 共存：另一 onnxruntime.dll 已驻留，"
+                             "本实例改载改名副本 %s（依赖走 PATH）\n", load_path.c_str());
+                break;
+            }
+        if (!h) {
+            if (load_path.empty()) load_path = ort_dir + "\\onnxruntime.dll";
+            h = LoadLibraryA(load_path.c_str());   // 绝对路径：绕开 exe 同目录 CPU 版
+        }
+        if (!h) {
+            std::fprintf(stderr, "[ort] LoadLibrary %s 失败 GLE=%lu\n",
+                         load_path.c_str(), GetLastError());
+            return false;
+        }
+        auto fn = (const OrtApiBase*(ORT_API_CALL*)())GetProcAddress(h, "OrtGetApiBase");
+        if (!fn) {
+            std::fprintf(stderr, "[ort] DLL 无 OrtGetApiBase\n");
+            return false;
+        }
+        const OrtApiBase* ab = fn();
+        if (ab->GetVersionString) {
+            const char* vs = ab->GetVersionString();
+            if (vs && *vs) ver_ = vs;
+        }
+        api_ = ab->GetApi(ORT_API_VERSION);
+        if (!api_) {
+            std::fprintf(stderr, "[ort] GetApi(%d) 失败（头/DLL 版本不匹配）\n", ORT_API_VERSION);
+            return false;
+        }
+        dll_ = h;
+        dll_dir_ = ort_dir;
+        bool known = false;
+        for (auto& r : g_ort_dlls)
+            if (r.h == h) known = true;
+        if (!known) g_ort_dlls.push_back({base, ort_dir, h});
+        std::fprintf(stderr, "[ort] %s 就绪%s（%s）\n", ver_.c_str(),
+                     dml_ ? "（DML 路）" : "", load_path.c_str());
+        return true;
+    }
+
     static bool RunOnce(OrtSess* s) {
-        const OrtApi* a = g_ort;
+        const OrtApi* a = s->api;
+        if (s->dml) {
+            // DML 血律（实测 2026-09-22）：iob 预绑的 CPU 输入被 EP 忽略（读到
+            // 恒零设备缓冲——probe 两图案不可分辨即此症），输出预绑却正常回传。
+            // 判决：每次 Run 前用**新鲜 CPU OrtValue** 重绑输入（python numpy
+            // 路同款），EP 据值对象走 staging 拷入；输出维持预绑。
+            for (size_t i = 0; i < s->ins.size(); i++) {
+                if (s->ins[i].val) a->ReleaseValue(s->ins[i].val);
+                OrtValue* v = nullptr;
+                if (a->CreateTensorWithDataAsOrtValue(
+                        s->bind_mem, s->ins[i].host,
+                        s->ins[i].meta.row_bytes * (size_t)s->slots,
+                        s->ins[i].meta.dims.data(), s->ins[i].meta.dims.size(),
+                        ElemToOnnx(s->ins[i].meta.et), &v)) {
+                    s->ins[i].val = nullptr;
+                    return false;
+                }
+                s->ins[i].val = v;
+                if (a->BindInput(s->iob, s->ins[i].meta.name.c_str(), v)) return false;
+            }
+        }
         OrtStatus* st = a->RunWithBinding(s->sess, nullptr, s->iob);
         if (st) {
             std::printf("[ort] 批异常（RunWithBinding）：%s\n", a->GetErrorMessage(st));
@@ -367,64 +473,104 @@ private:
     // spec_out 非空=探测会话（LoadSpec 用）：跑完元数据枚举即毁
     OrtSess* CreateSession(const ModelConfig& cfg, int slots, bool for_bank,
                               ModelSpec* spec_out) {
-        const OrtApi* a = g_ort;
+        const OrtApi* a = api_;
         if (cfg.model_path.empty()) {
             std::fprintf(stderr, "[ort] 缺 model_path（fb 烤死的 onnx）\n");
             return nullptr;
         }
+        bool dml = dml_;
         OrtSess* s = new OrtSess();
         s->slots = slots;
-        s->dll = g_ort_dll;
+        s->dll = dll_;
+        s->api = api_;
+        s->dml = dml;
+        s->dev_id = cfg.device_id;
         // 每会话独立 env（会话/图/arena 全套自闭环，互不沾染共享态）
         char env_name[32];
-        std::snprintf(env_name, sizeof env_name, "inferfarm_%d", g_ort_env_seq++);
+        std::snprintf(env_name, sizeof env_name, "inferfarm_%d", env_seq_++);
         if (a->CreateEnv(ORT_LOGGING_LEVEL_ERROR, env_name, &s->env)) { DestroySession(s); return nullptr; }
         OrtSessionOptions* opts = nullptr;
         if (a->CreateSessionOptions(&opts)) { DestroySession(s); return nullptr; }
         a->SetIntraOpNumThreads(opts, cfg.ort_threads > 0 ? cfg.ort_threads : 1);
         a->SetInterOpNumThreads(opts, 1);
         a->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL);
-        // CUDA EP（+CUDA Graph——KV 串与 python providers={"enable_cuda_graph":"1"}
-        // 同义）。图仅银行会话开（PerThreadContext 铁律：创建/回放同线程——
-        // 银行会话全生命周期在调度台线程上）。
-        OrtCUDAProviderOptionsV2* co = nullptr;
-        bool graph = for_bank && cfg.ort_cuda_graph;
-        if (a->CreateCUDAProviderOptions(&co)) { a->ReleaseSessionOptions(opts); DestroySession(s); return nullptr; }
-        const char* keys[] = {"device_id", "enable_cuda_graph"};
-        const char* vals[] = {"0", graph ? "1" : "0"};
-        OrtStatus* st = a->UpdateCUDAProviderOptions(co, keys, vals, 2);
-        if (st) {
-            std::fprintf(stderr, "[ort] CUDA provider options: %s\n", a->GetErrorMessage(st));
-            a->ReleaseStatus(st);
+        if (dml) {
+            // ---- DML EP（AMD/核显路线）：挂 DirectML，device_id=适配器序号 ----
+            OrtDmlAppendFn dml_append = (OrtDmlAppendFn)GetProcAddress(
+                dll_, "OrtSessionOptionsAppendExecutionProvider_DML");
+            if (!dml_append) {
+                std::fprintf(stderr, "[ort] 本 DLL 无 DML 导出（须 onnxruntime-directml"
+                             " 构建； ort_ep=dml 与 CUDA 构建互斥）\n");
+                a->ReleaseSessionOptions(opts);
+                DestroySession(s);
+                return nullptr;
+            }
+            char did[16];
+            std::snprintf(did, sizeof did, "%d", cfg.device_id);
+            OrtStatus* st = dml_append(opts, cfg.device_id);
+            if (st) {
+                std::fprintf(stderr, "[ort] 挂 DML EP 失败（dev=%d）: %s\n",
+                             cfg.device_id, a->GetErrorMessage(st));
+                a->ReleaseStatus(st);
+                a->ReleaseSessionOptions(opts);
+                DestroySession(s);
+                return nullptr;
+            }
+            s->graph_on = false;
+        } else {
+            // ---- CUDA EP（+CUDA Graph——KV 串与 python providers=
+            // {"enable_cuda_graph":"1"} 同义）。图仅银行会话开（PerThreadContext
+            // 铁律：创建/回放同线程——银行会话全生命周期在调度台线程上）。----
+            OrtCUDAProviderOptionsV2* co = nullptr;
+            bool graph = for_bank && cfg.ort_cuda_graph;
+            if (a->CreateCUDAProviderOptions(&co)) { a->ReleaseSessionOptions(opts); DestroySession(s); return nullptr; }
+            char did[16];
+            std::snprintf(did, sizeof did, "%d", cfg.device_id);
+            const char* keys[] = {"device_id", "enable_cuda_graph"};
+            const char* vals[] = {did, graph ? "1" : "0"};
+            OrtStatus* st = a->UpdateCUDAProviderOptions(co, keys, vals, 2);
+            if (st) {
+                std::fprintf(stderr, "[ort] CUDA provider options: %s\n", a->GetErrorMessage(st));
+                a->ReleaseStatus(st);
+                a->ReleaseCUDAProviderOptions(co);
+                a->ReleaseSessionOptions(opts);
+                DestroySession(s);
+                return nullptr;
+            }
+            st = a->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, co);
             a->ReleaseCUDAProviderOptions(co);
-            a->ReleaseSessionOptions(opts);
-            DestroySession(s);
-            return nullptr;
-        }
-        st = a->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, co);
-        a->ReleaseCUDAProviderOptions(co);
-        if (st) {
-            std::fprintf(stderr, "[ort] 挂 CUDA EP 失败: %s\n", a->GetErrorMessage(st));
-            a->ReleaseStatus(st);
-            a->ReleaseSessionOptions(opts);
-            DestroySession(s);
-            return nullptr;
+            if (st) {
+                std::fprintf(stderr, "[ort] 挂 CUDA EP 失败: %s\n", a->GetErrorMessage(st));
+                a->ReleaseStatus(st);
+                a->ReleaseSessionOptions(opts);
+                DestroySession(s);
+                return nullptr;
+            }
+            s->graph_on = graph;
         }
         wchar_t wpath[1024];
         MultiByteToWideChar(CP_UTF8, 0, cfg.model_path.c_str(), -1, wpath, 1024);
-        st = a->CreateSession(s->env, wpath, opts, &s->sess);
+        OrtStatus* stc = a->CreateSession(s->env, wpath, opts, &s->sess);
         a->ReleaseSessionOptions(opts);
-        if (st) {
-            std::fprintf(stderr, "[ort] 建会话失败: %s\n", a->GetErrorMessage(st));
-            a->ReleaseStatus(st);
+        if (stc) {
+            std::fprintf(stderr, "[ort] 建会话失败: %s\n", a->GetErrorMessage(stc));
+            a->ReleaseStatus(stc);
             DestroySession(s);
             return nullptr;
         }
-        s->graph_on = graph;
-        if (a->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &s->cuda_mem)
-            || a->CreateIoBinding(s->sess, &s->iob)) {
-            DestroySession(s);
-            return nullptr;
+        if (dml) {
+            if (a->CreateMemoryInfo("Cpu", OrtDeviceAllocator, 0, OrtMemTypeDefault,
+                                    &s->bind_mem)
+                || a->CreateIoBinding(s->sess, &s->iob)) {
+                DestroySession(s);
+                return nullptr;
+            }
+        } else {
+            if (a->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault, &s->bind_mem)
+                || a->CreateIoBinding(s->sess, &s->iob)) {
+                DestroySession(s);
+                return nullptr;
+            }
         }
         // ---- 输入元数据 ----
         size_t n_in = 0;
@@ -524,18 +670,33 @@ private:
             for (size_t d = 1; d < nd; d++) s->outs[j].meta.width *= (int)dims[d];
             if (spec_out) spec_out->outs.push_back(s->outs[j].meta);
         }
-        // ---- 输入单块 arena（256B 对齐 carve；绑设备 carve 地址，终身固定）----
+        // ---- 输入单块 arena（256B 对齐 carve；CUDA=绑设备 carve，DML=纯宿主
+        //      carve[VirtualAlloc 64K 对齐]，地址均终身固定）----
         const size_t kAlign = 256;
         size_t off = 0;
         for (size_t i = 0; i < n_in; i++)
             off = (off + s->ins[i].meta.row_bytes * (size_t)slots + kAlign - 1)
                       / kAlign * kAlign;
-        s->in_h_bytes = s->in_d_bytes = off;
-        if (g_cu.HostAlloc(&s->in_h_arena, s->in_h_bytes, 0)
-            || g_cu.Malloc(&s->in_d_arena, s->in_d_bytes)) {
-            std::fprintf(stderr, "[ort] 输入 arena(%zuB) 分配失败\n", s->in_h_bytes);
-            DestroySession(s);
-            return nullptr;
+        s->in_h_bytes = off;
+        if (dml) {
+            s->in_d_bytes = 0;
+            s->in_h_arena = VirtualAlloc(nullptr, s->in_h_bytes ? s->in_h_bytes : 1,
+                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            s->in_d_arena = s->in_h_arena;   // 宿主绑定：dev=host 同址（仅 CUDA 用区分）
+            if (!s->in_h_arena) {
+                std::fprintf(stderr, "[ort] DML 输入 arena(%zuB) 分配失败\n", s->in_h_bytes);
+                DestroySession(s);
+                return nullptr;
+            }
+        } else {
+            s->in_d_bytes = off;
+            if (g_cu.SetDevice) g_cu.SetDevice(cfg.device_id);
+            if (g_cu.HostAlloc(&s->in_h_arena, s->in_h_bytes, 0)
+                || g_cu.Malloc(&s->in_d_arena, s->in_d_bytes)) {
+                std::fprintf(stderr, "[ort] 输入 arena(%zuB) 分配失败\n", s->in_h_bytes);
+                DestroySession(s);
+                return nullptr;
+            }
         }
         off = 0;
         for (size_t i = 0; i < n_in; i++) {
@@ -545,7 +706,7 @@ private:
             s->ins[i].dev = (char*)s->in_d_arena + off;
             off += bytes;
             OrtValue* v = nullptr;
-            if (a->CreateTensorWithDataAsOrtValue(s->cuda_mem, s->ins[i].dev, bytes,
+            if (a->CreateTensorWithDataAsOrtValue(s->bind_mem, s->ins[i].dev, bytes,
                                                   s->ins[i].meta.dims.data(),
                                                   s->ins[i].meta.dims.size(),
                                                   ElemToOnnx(s->ins[i].meta.et), &v)) {
@@ -564,12 +725,25 @@ private:
             s->outs[j].bytes = (size_t)s->outs[j].meta.width * 4 * (size_t)slots;
             off = (off + s->outs[j].bytes + kAlign - 1) / kAlign * kAlign;
         }
-        s->out_h_bytes = s->out_d_bytes = off;
-        if (g_cu.HostAlloc(&s->out_h_arena, s->out_h_bytes, 0)
-            || g_cu.Malloc(&s->out_d_arena, s->out_d_bytes)) {
-            std::fprintf(stderr, "[ort] 输出 arena(%zuB) 分配失败\n", s->out_h_bytes);
-            DestroySession(s);
-            return nullptr;
+        s->out_h_bytes = off;
+        if (dml) {
+            s->out_d_bytes = 0;
+            s->out_h_arena = VirtualAlloc(nullptr, s->out_h_bytes ? s->out_h_bytes : 1,
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            s->out_d_arena = s->out_h_arena;
+            if (!s->out_h_arena) {
+                std::fprintf(stderr, "[ort] DML 输出 arena(%zuB) 分配失败\n", s->out_h_bytes);
+                DestroySession(s);
+                return nullptr;
+            }
+        } else {
+            s->out_d_bytes = off;
+            if (g_cu.HostAlloc(&s->out_h_arena, s->out_h_bytes, 0)
+                || g_cu.Malloc(&s->out_d_arena, s->out_d_bytes)) {
+                std::fprintf(stderr, "[ort] 输出 arena(%zuB) 分配失败\n", s->out_h_bytes);
+                DestroySession(s);
+                return nullptr;
+            }
         }
         off = 0;
         for (size_t j = 0; j < n_out; j++) {
@@ -578,7 +752,7 @@ private:
             s->outs[j].dev = (char*)s->out_d_arena + off;
             off += s->outs[j].bytes;
             OrtValue* v = nullptr;
-            if (a->CreateTensorWithDataAsOrtValue(s->cuda_mem, s->outs[j].dev,
+            if (a->CreateTensorWithDataAsOrtValue(s->bind_mem, s->outs[j].dev,
                                                   s->outs[j].bytes,
                                                   s->outs[j].meta.dims.data(),
                                                   s->outs[j].meta.dims.size(),
@@ -593,7 +767,7 @@ private:
             }
         }
         if (spec_out) {
-            spec_out->backend = "ort";
+            spec_out->backend = dml ? "ort-dml" : "ort";
             spec_out->slots = slots;
         }
         return s;

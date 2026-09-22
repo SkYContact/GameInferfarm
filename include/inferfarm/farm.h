@@ -26,6 +26,13 @@
 
 namespace inferfarm {
 
+// 设备组配置（多 GPU）：一组=一套后端+模型配置+银行数（如 NVIDIA 主卡 2 家 +
+// AMD 核显 1 家；或双 NVIDIA 各 N 家）。backend/device_id/ort_ep/路径全组独立。
+struct DeviceConfig {
+    ModelConfig model;
+    int banks = 2;
+};
+
 struct FarmConfig {
     std::string name = "farm";
     int chains = 8;
@@ -34,7 +41,7 @@ struct FarmConfig {
     bool alternate_first = true;  // 偶数局我方先攻
     bool fibers = true;
     int workers = 0;              // 0=物理核≈hc/2
-    int banks = 4;                // 0=inline
+    int banks = 4;                // 0=inline；多设备时被 devices 各组 banks 覆盖
     int slots = 64;
     double window_ms = 0.2;
     double window_floor = 0.2;
@@ -42,6 +49,11 @@ struct FarmConfig {
     long long max_decisions = 1000000;   // 对局决策数护栏（防适配器死循环）
     bool census = false;
     int cache_log2 = 0;          // 推理缓存：0=关（缺省零行为差）；如 16=64K 条
+    // 多设备组（判决15；空=单设备老行为=cfg.model+cfg.banks）。链 c 钉扎到
+    // 组 c%devices.size()——异构设备（如 NVIDIA+AMD）下保跨跑逐位的关键。
+    // 各组模型结构须一致（输入名/行宽、输出名/宽、slots）；权重可不同
+    // （int8/fp16 各卡一档）——钉扎保证每链恒用同组。
+    std::vector<DeviceConfig> devices;
     ModelConfig model;
 };
 
@@ -66,9 +78,12 @@ public:
     double RunLeg(AdapterFactory make, void* user);
 
     // 运行期换心（RW1 blob；仅后端支持时生效——TRT=refitter，CPU=直改，
-    // ORT=不支持返回 false）。成功后后续腿用新权重（缓存代次同步失效）。
+    // ORT=不支持返回 false）。多设备组=全组成功才算成（任一组不支持即 false，
+    // 不留半换心农场）；成功后缓存代次同步失效。
     bool RefitWeights(const char* rw1_path) {
-        if (!backend_ || !backend_->RefitWeights(rw1_path)) return false;
+        if (group_bes_.empty()) return false;
+        for (InferBackend* be : group_bes_)
+            if (!be->RefitWeights(rw1_path)) return false;
         infer_gen_++;   // 换心=旧缓存全表逻辑失效（代次门，不清表）
         return true;
     }
@@ -85,14 +100,17 @@ public:
     // 驱动环本体（对局 fiber 上；也供 inline/线程模式同构调用）
     void DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
                     int chain_id = 0, int game_id = 0);
-    // 决策一步（银行/inline 分流；返回 false=判负纪律已触发）
-    bool DriveDecision(GameAdapter* g);
+    // 决策一步（银行/inline 分流；grp=设备组（链钉扎）；返回 false=判负纪律已触发）
+    bool DriveDecision(GameAdapter* g, int grp = 0);
 
 private:
-    // 组装行字节 → 缓存键（逐输入 InputRow 全行宽；槽独占期内调用安全）
-    CacheKey128 HashSlot(int bk, int sl);
+    // 组装行字节 → 缓存键（逐输入 InputRow 全行宽；槽独占期内调用安全；
+    // grp 掺入键=缓存设备命名空间——异构组同字节行输出逐位可异，不共享条目）
+    CacheKey128 HashSlot(int bk, int sl, int grp);
     FarmConfig cfg_;
-    InferBackend* backend_ = nullptr;
+    InferBackend* backend_ = nullptr;      // =组 0 后端（inline/兼容面）
+    std::vector<InferBackend*> group_bes_; // 每设备组一个后端实例（Farm 建/毁）
+    int n_dev_ = 1;                        // 设备组数（链钉扎 c%n_dev_）
     BankScheduler bank_obj_;
     BankScheduler* bank_ = nullptr;
     InlineRunner inline_;

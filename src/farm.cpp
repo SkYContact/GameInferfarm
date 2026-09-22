@@ -24,6 +24,23 @@ static InferBackend* MakeBackend(const std::string& name) {
     return nullptr;
 }
 
+// 组间模型结构一致性（多设备契约）：同名输入同 dtype 同行宽、同名输出同宽
+// （slots 已另行核对）。结构不一致=银行行协议/适配器契约撕裂，fail fast。
+static bool SpecStructurallyEqual(const ModelSpec& a, const ModelSpec& b) {
+    if (a.ins.size() != b.ins.size() || a.outs.size() != b.outs.size()) return false;
+    for (size_t i = 0; i < a.ins.size(); i++) {
+        if (a.ins[i].name != b.ins[i].name || a.ins[i].et != b.ins[i].et
+            || a.ins[i].row_bytes != b.ins[i].row_bytes
+            || a.ins[i].dims.size() != b.ins[i].dims.size()) return false;
+        for (size_t d = 1; d < a.ins[i].dims.size(); d++)
+            if (a.ins[i].dims[d] != b.ins[i].dims[d]) return false;
+    }
+    for (size_t j = 0; j < a.outs.size(); j++)
+        if (a.outs[j].name != b.outs[j].name || a.outs[j].width != b.outs[j].width)
+            return false;
+    return true;
+}
+
 // ---------------- env 覆盖 ----------------
 static int EnvInt(const char* key, int def) {
     const char* e = getenv(key);
@@ -67,35 +84,97 @@ bool Farm::Init(FarmConfig cfg) {
                      cfg_.window_ms, cfg_.stagger_ms, cfg_.max_decisions, cfg_.cache_log2);
         return false;
     }
-    backend_ = MakeBackend(cfg_.model.backend);
-    if (!backend_) {
-        std::fprintf(stderr, "[farm] 未知后端: %s（cpu|ort|trt）\n", cfg_.model.backend.c_str());
+    // ---- 设备组展开（空=单设备老行为=cfg.model+cfg.banks）----
+    std::vector<DeviceConfig> devs = cfg_.devices;
+    if (devs.empty()) {
+        DeviceConfig d;
+        d.model = cfg_.model;
+        d.banks = cfg_.banks;
+        devs.push_back(d);
+    }
+    if (devs.size() > 8) {
+        std::fprintf(stderr, "[farm] 设备组数 %zu > 8\n", devs.size());
         return false;
     }
-    if (!backend_->LoadSpec(cfg_.model, cfg_.slots, spec_)) {
-        std::fprintf(stderr, "[farm] LoadSpec 失败（backend=%s）\n", cfg_.model.backend.c_str());
+    int total_banks = 0;
+    for (auto& d : devs) {
+        if (d.banks < 0 || d.banks > 32) {
+            std::fprintf(stderr, "[farm] 设备组 banks=%d ∉ [0,32]\n", d.banks);
+            return false;
+        }
+        total_banks += d.banks;
+    }
+    if (total_banks > 32) {
+        std::fprintf(stderr, "[farm] 跨设备组总银行数 %d > 32\n", total_banks);
         return false;
     }
-    if (spec_.slots != cfg_.slots) {
-        std::fprintf(stderr, "[farm] 模型批形状 dim0=%d ≠ slots=%d\n", spec_.slots, cfg_.slots);
-        return false;
+    // ---- 每组建后端 + LoadSpec + 组间结构核对 ----
+    group_bes_.clear();
+    for (size_t gi = 0; gi < devs.size(); gi++) {
+        InferBackend* be = MakeBackend(devs[gi].model.backend);
+        if (!be) {
+            std::fprintf(stderr, "[farm] 设备 %zu 未知后端: %s（cpu|ort|trt）\n",
+                         gi, devs[gi].model.backend.c_str());
+            for (auto* x : group_bes_) delete x;
+            return false;
+        }
+        group_bes_.push_back(be);
+        ModelSpec s;
+        if (!be->LoadSpec(devs[gi].model, cfg_.slots, s)) {
+            std::fprintf(stderr, "[farm] 设备 %zu LoadSpec 失败（backend=%s）\n",
+                         gi, devs[gi].model.backend.c_str());
+            for (auto* x : group_bes_) delete x;
+            group_bes_.clear();
+            return false;
+        }
+        if (s.slots != cfg_.slots) {
+            std::fprintf(stderr, "[farm] 设备 %zu 模型批形状 dim0=%d ≠ slots=%d\n",
+                         gi, s.slots, cfg_.slots);
+            for (auto* x : group_bes_) delete x;
+            group_bes_.clear();
+            return false;
+        }
+        if (gi == 0) {
+            spec_ = s;
+        } else if (!SpecStructurallyEqual(spec_, s)) {
+            std::fprintf(stderr, "[farm] 设备 %zu 模型结构与设备 0 不一致"
+                         "（输入名/行宽/dtype、输出名/宽须全同）\n", gi);
+            for (auto* x : group_bes_) delete x;
+            group_bes_.clear();
+            return false;
+        }
     }
     spec_ok_ = true;
-    // init 期一次性换心：在 context/图创建**之前**（权重设备内存先落定）
-    if (!cfg_.model.refit_weights.empty()
-        && !RefitWeights(cfg_.model.refit_weights.c_str())) {
-        std::fprintf(stderr, "[farm] init 期换心失败: %s\n",
-                     cfg_.model.refit_weights.c_str());
-        return false;
+    backend_ = group_bes_[0];
+    n_dev_ = (int)devs.size();
+    // init 期一次性换心：多设备组不支持（半换心农场撕裂确定性）——fail fast
+    if (!cfg_.model.refit_weights.empty()) {
+        if (n_dev_ > 1) {
+            std::fprintf(stderr, "[farm] init 期换心不支持多设备组（单组农场才可）\n");
+            return false;
+        }
+        if (!RefitWeights(cfg_.model.refit_weights.c_str())) {
+            std::fprintf(stderr, "[farm] init 期换心失败: %s\n",
+                         cfg_.model.refit_weights.c_str());
+            return false;
+        }
     }
-    if (cfg_.banks > 0) {
+    if (total_banks > 0) {
         BankConfig bc;
-        bc.banks = cfg_.banks;
+        bc.banks = total_banks;
         bc.slots = cfg_.slots;
         bc.window_ms = cfg_.window_ms;
         bc.window_floor = cfg_.window_floor;
-        bank_obj_.Bind(*backend_, &census_);
-        if (!bank_obj_.Init(bc, cfg_.model, &spec_)) {
+        bank_obj_.Bind(*backend_, &census_);   // 单组兼容面（primary=组 0）
+        std::vector<BankGroupCfg> groups;
+        for (size_t gi = 0; gi < devs.size(); gi++) {
+            BankGroupCfg g;
+            g.be = group_bes_[gi];
+            g.model = devs[gi].model;
+            g.banks = devs[gi].banks;
+            groups.push_back(g);
+        }
+        if (!bank_obj_.InitGroups(bc, groups, &spec_)) {
             std::fprintf(stderr, "[farm] 银行制启动失败\n");
             return false;
         }
@@ -114,7 +193,9 @@ void Farm::Shutdown() {
     if (timer_armed_) { timeEndPeriod(1); timer_armed_ = false; }
 #endif
     inline_.Shutdown();
-    if (backend_) { delete backend_; backend_ = nullptr; }
+    for (InferBackend* be : group_bes_) delete be;   // 含组 0（=backend_）
+    group_bes_.clear();
+    backend_ = nullptr;
     spec_ok_ = false;
 }
 
@@ -139,8 +220,10 @@ void Farm::NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fa
 // 组装行字节 → 缓存键。槽独占期内（Claim 后 Submit/Abandon 前）调用：本槽
 // 行不可能被他人触碰（游标串行发号），读的是本决策刚组装的最终字节
 // （含 Claim 清零后未写区的零——零基组装契约的一部分）。
-CacheKey128 Farm::HashSlot(int bk, int sl) {
+CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
     CacheHasher h;
+    uint32_t gn = (uint32_t)grp * 0x1B873593u;   // 设备命名空间：异构组同字节
+    h.Update(&gn, sizeof gn);                     // 行输出逐位可异，不共享条目
     for (size_t i = 0; i < spec_.ins.size(); i++) {
         size_t rb = 0;
         void* row = bank_->InputRow(bk, sl, spec_.ins[i].name.c_str(), &rb);
@@ -149,12 +232,12 @@ CacheKey128 Farm::HashSlot(int bk, int sl) {
     return h.Finalize();
 }
 
-bool Farm::DriveDecision(GameAdapter* g) {
+bool Farm::DriveDecision(GameAdapter* g, int grp) {
     if (bank_) {
         OutputDest dests[8];
         int nd = g->CollectOutputs(dests, 8);
         int bk = -1, sl = -1;
-        if (!bank_->Claim(bk, sl)) return false;
+        if (!bank_->Claim(bk, sl, grp)) return false;
         // 组装直写槽（GameAdapter 契约 1：此处无挂起点——drain 有界的前提）
         struct BankWriter : SlotWriter {
             BankScheduler* bank = nullptr;
@@ -173,7 +256,7 @@ bool Farm::DriveDecision(GameAdapter* g) {
         // 布局门：条目输出面（名字+n 逐位）与本次申报不符=视同未命中——
         // 同行字节不同申报面的适配器不共享条目，正确性无条件保住。
         if (cache_.on()) {
-            CacheKey128 key = HashSlot(bk, sl);
+            CacheKey128 key = HashSlot(bk, sl, grp);
             std::shared_ptr<const CachedResult> hit = cache_.Lookup(key, infer_gen_);
             if (hit && (int)hit->outs.size() == nd) {
                 bool layout_ok = true;
@@ -218,13 +301,14 @@ bool Farm::DriveDecision(GameAdapter* g) {
 void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
                       int chain_id, int game_id) {
     g->NewGame(seed, we_first);
+    const int grp = (int)((uint32_t)chain_id % (uint32_t)n_dev_);   // 链→组钉扎
     long long dec = 0;
     bool infer_fail = false;
     for (long long guard = 0; guard < cfg_.max_decisions; guard++) {
         if (g->IsDone()) break;
         if (!g->AdvanceToDecision()) break;
         dec++;
-        if (!DriveDecision(g)) {
+        if (!DriveDecision(g, grp)) {
             g->OnInferFail();   // 判负纪律：不静默重试（会撕裂确定性）
             infer_fail = true;
             break;
@@ -278,6 +362,21 @@ double Farm::RunLeg(AdapterFactory make, void* user) {
                 cfg_.model.backend.c_str(),
                 bank_ ? "（银行制）" : "（inline）",
                 cfg_.seed0, cfg_.fibers ? "，fiber 唤醒队列" : "，线程模式");
+    if (n_dev_ > 1) {
+        std::vector<DeviceConfig> devs = cfg_.devices.empty()
+            ? std::vector<DeviceConfig>{} : cfg_.devices;
+        if (devs.empty()) {
+            DeviceConfig d;
+            d.model = cfg_.model;
+            d.banks = cfg_.banks;
+            devs.push_back(d);
+        }
+        for (size_t gi = 0; gi < devs.size(); gi++)
+            std::printf("[%s] 设备组 %zu: %s ep=%s dev=%d ×%d 银行（链 c%%%zu 钉扎）\n",
+                        cfg_.name.c_str(), gi, devs[gi].model.backend.c_str(),
+                        devs[gi].model.ort_ep.c_str(), devs[gi].model.device_id,
+                        devs[gi].banks, devs.size());
+    }
     std::fflush(stdout);
     double sec;
     if (cfg_.fibers)

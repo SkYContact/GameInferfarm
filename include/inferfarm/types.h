@@ -61,7 +61,7 @@ struct CpuModelDecl {
     uint32_t weight_seed = 0xC0FFEEu; // 权重种子（同种子=同权重=逐位确定）
 };
 
-// 模型配置：Farm 初始化时交给后端
+// 模型配置：Farm 初始化时交给后端（多设备：每设备组一份，见 FarmConfig.devices）
 struct ModelConfig {
     std::string backend = "cpu";      // "cpu" | "ort" | "trt"
     std::string model_path;           // ort: fb 烤死的 onnx
@@ -69,10 +69,16 @@ struct ModelConfig {
     std::string ort_dir;              // ort: onnxruntime.dll 所在目录（缺省 env FARM_ORT_DIR）
     std::string cuda_dir;             // ort/trt: cudart64_12.dll 所在目录（缺省 env FARM_CUDA_DIR）
     std::string trt_dir;              // trt: nvinfer_10.dll 所在目录（缺省 env FARM_TRT_DIR）
+    int device_id = 0;                // 设备序号：trt=cudaSetDevice；ort_cuda=EP device_id；
+                                      // ort_dml=DML 适配器序号（异构双卡的关键面）
+    std::string ort_ep = "cuda";      // ort 执行提供器："cuda" | "dml"（AMD/核显路线：
+                                      // DML=宿主绑定+同步 Run，无图无 cudart）
     int ort_threads = 1;              // ort: IntraOp 线程数（纪律=1，防多局互踩）
     bool ort_cuda_graph = true;       // ort: enable_cuda_graph（仅银行会话生效——图会话
-                                      // 绑线程[PerThreadContext 铁律]，inline 会话强制关）
-    std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径）
+                                      // 绑线程[PerThreadContext 铁律]，inline 会话强制关；
+                                      // dml 恒无图）
+    std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
+                                      // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效
 };
 

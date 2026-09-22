@@ -39,21 +39,35 @@
 namespace inferfarm {
 
 struct BankConfig {
-    int banks = 4;               // N：银行家数=池容量=在飞批上限（本机最优 4）
+    int banks = 4;               // N：银行家数=池容量=在飞批上限（本机最优 4；
+                                 // 多设备组时此值被 groups 覆盖=各组银行数之和）
     int slots = 64;              // 每银行槽数（=模型批形状 dim0）
     double window_ms = 0.2;      // 攒批窗
     double window_floor = 0.2;   // 有效窗底限（ms；Windows 定时量子勘误）
 };
 
+// 设备组（多 GPU，判决15）：一组=一套后端实例+模型配置+本组银行数。链 c 钉扎
+// 到组 c%n_groups（异构设备保跨跑逐位的钥匙：每链恒用同组=同后端=同位）。
+struct BankGroupCfg {
+    InferBackend* be = nullptr;  // 组后端（Farm 建/毁；会话仍按银行隔离）
+    ModelConfig model;           // 组模型配置（backend/device_id/ort_ep/路径）
+    int banks = 2;               // 本组银行数
+};
+
 class BankScheduler {
 public:
     BankScheduler() = default;
-    void Bind(InferBackend& be, Census* cen) { be_ = &be; cen_ = cen; }
+    // 单组绑定（Farm 传入后端；多设备组形态见 InitGroups——组自带后端）
+    void Bind(InferBackend& be, Census* cen) { primary_be_ = &be; cen_ = cen; }
 
     // 建池+起调度台。**在专用调度台线程上建会话**（ORT 图会话 PerThreadContext
     // 铁律：创建/热身/回放须同线程；TRT 同规更稳）。含图地址烧死小实验门：
     // 不过=拒绝启动（字节安全性不赌）。阻塞至就绪或失败。
     bool Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSpec* spec_out);
+    // 多设备组建池：每组独立后端/模型/银行数；spec_out 仍为全局规格（Farm 已
+    // 核各组结构一致）。会话按组在调度台线程上创建。
+    bool InitGroups(const BankConfig& cfg, const std::vector<BankGroupCfg>& groups,
+                    ModelSpec* spec_out);
     // **前置条件：所有腿已返回**（无在途 FLIGHT、无挂起写手）。停机路径会
     // 唤醒挂起领槽者（弃领退出）但**不保证收割在途航班**——中途强停属误用。
     void Shutdown();
@@ -62,8 +76,12 @@ public:
 
     // ---- 写手侧（对局 fiber 或 OS 线程）----
     // 领槽（自旋+等池背压；成功即行清零=零基组装契约：未写区与"python
-    // 零垫"逐位同）。false 仅当银行未启用。
-    bool Claim(int& bank, int& slot);
+    // 零垫"逐位同）。dev=设备组号（-1→组 0；多组时 Farm 按链钉扎传入）。
+    // false 仅当银行未启用。
+    bool Claim(int& bank, int& slot, int dev = -1);
+    // 组号查询（bank→组；缓存命名空间/诊断用）
+    int GroupOf(int bank) const;
+    int n_groups() const { return n_groups_; }
     // 组装直写面：该槽该输入的行首指针（零拷贝——大数组组装期直接写这里）
     void* InputRow(int bank, int slot, const char* name, size_t* row_bytes);
     // 组装兜底拷贝：小输入从临时缓冲拷进槽行+行尾清零（YGO 的 scal/act_code
@@ -76,14 +94,15 @@ public:
     void Abandon(int bank, int slot);
 
     // inline（无银行）路径的会话/锁：Farm 用（row0 专用，整批照发=垃圾行无害）
-    InferBackend& backend() { return *be_; }
+    InferBackend& backend() { return *primary_be_; }
 
     struct Impl;   // 公有：调度台/收割自由函数引用（bank.cpp 内）
 private:
     Impl* impl_ = nullptr;
     BankConfig cfg_;
     int banks_ = 0;
-    InferBackend* be_ = nullptr;
+    int n_groups_ = 0;
+    InferBackend* primary_be_ = nullptr;   // 单组兼容（Init 老路径）
     Census* cen_;
     ModelSpec spec_;
 };

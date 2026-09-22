@@ -82,3 +82,18 @@
 - Windows 线程级 CPU 只有 CreateToolhelp32Snapshot 普查量得到（CUDA 上下文线程、
   EP 线程池）；GetThreadTimes 15.625ms 量化不可用于 µs 段——用 QueryThreadCycleTime。
 - 交替腿防热偏置；引擎/量化烤制须 GPU 空载时进行。
+
+## 多设备改造（2026-09-22）
+- **残留成员=空指针虚调用**：多组化时 BankScheduler::InputRow（公共包装）仍
+  用旧 impl_->be，而 InitGroups 从未赋它——首个组装即段错误且崩点在适配器
+  帧内（误导）。教训：删成员别留成员，让编译器逼你交出所有用点。
+- **Windows 基名去重**：同名 dll 不同目录只能驻留一颗——双 ORT 共存必须
+  拷贝改名（%TEMP%），依赖解析靠 PATH 前插（改名副本自身目录无依赖）。
+- **DML EP 的 iob 输入忽略**：预绑 CPU 输入读恒零（输出绑定却通）——每次
+  Run 前新鲜 CPU OrtValue 重绑输入即愈；probe 两图案门是此症的哨兵。
+- **pip --target 装 ORT-DML**：勿装进 q35（顶掉 onnxruntime-gpu）；
+  `pip install --target D:/ygo_data/dml_rt onnxruntime-directml`，dll 在
+  `<target>/onnxruntime/capi/`。
+- DML 设备枚举序号=DXGI 适配器序号（dev0/dev1 哪个是核显枚举定，本机
+  dev1=610M）；DML 打印的错误消息可能因系统 locale 非 utf-8 解码失败——
+  属包装层噪音，不是失败原因。

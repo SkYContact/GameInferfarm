@@ -50,6 +50,8 @@ enum { BK_POOL = 0, BK_FILL, BK_CLOSED, BK_FLIGHT };
 
 struct BankCtl {
     int id = 0;
+    int grp = 0;                          // 设备组号（多 GPU 判决15）
+    InferBackend* be = nullptr;           // 组后端（会话仍按银行隔离）
     void* sess = nullptr;                // 后端会话（地址终身固定，图一夫一妻）
     std::atomic<int> cursor{0};          // 本集会游标：fetch_add 领号（出池时归零）
     std::atomic<int> inflight{0};        // 在途写手（领号前 +1 / 行写完 -1）
@@ -63,18 +65,19 @@ struct BankCtl {
 };
 
 struct BankScheduler::Impl {
-    InferBackend* be = nullptr;
+    static const int kMax = 32;
+    static const int kMaxGrp = 8;        // 设备组上限（双卡/显卡+核显均 ≤8 绰绰）
     Census* cen = nullptr;
     BankConfig cfg;
     ModelSpec spec;
-    static const int kMax = 32;
     BankCtl banks[kMax];   // 含原子不可移动：定长数组（原版同款）
-    std::deque<int> pool;                // 空闲银行栈（mx 护）
-    std::atomic<int> fill_idx{-1};       // 当前填充银行（-1=无，领号挂起等轮转）
-    std::atomic<int> waiting{0};         // 等银行的写手数（背压观测）
+    int n_groups = 1;                     // 设备组数（池/领号/窗均按组分列）
+    std::deque<int> pool_g[kMaxGrp];      // 各组空闲银行栈（mx 护）
+    std::atomic<int> fill_idx[kMaxGrp];   // 各组当前填充银行（-1=无，领号挂起等轮转）
+    std::deque<void*> waiters_g[kMaxGrp]; // 各组挂起等槽的 fiber cookie（轮转时投回）
+    std::atomic<int> waiting{0};         // 等银行的写手数（背压观测；跨组合计）
     std::mutex mx;
     std::condition_variable cv;
-    std::deque<void*> waiters;           // 挂起等槽的 fiber cookie（轮转时投回）
     std::thread disp;
     std::atomic<bool> stop{false};
     std::atomic<bool> running{false};
@@ -100,14 +103,17 @@ struct BankScheduler::Impl {
 // ---------------- 领号（游标制）----------------
 // 无等待尝试：成功即得槽（inflight 已占，行清零由本函数完成=零基组装）。
 // 领号序=在途序（先占名额再领号）⇒ drain 归零时游标终态、行前缀连续。
-bool BankScheduler::Claim(int& bank, int& slot) {
+// dev=设备组门：只在本组的填充银行领号（链→组钉扎=异构逐位钥匙）。
+bool BankScheduler::Claim(int& bank, int& slot, int dev) {
     if (!banks_) return false;
     Impl& I = *impl_;
+    const int g = dev < 0 ? 0 : dev;
+    if (g >= Impl::kMaxGrp || g >= I.n_groups) return false;
     const int S = cfg_.slots;
     const long long ts0 = I.cen && I.cen->on ? NowNsI() : 0;
     auto try_claim = [&](int& b_out, int& s_out) -> bool {
         const long long tp0 = I.cen && I.cen->on ? NowNsI() : 0;
-        int fi = I.fill_idx.load(std::memory_order_acquire);
+        int fi = I.fill_idx[g].load(std::memory_order_acquire);
         if (fi < 0) return false;
         BankCtl& b = I.banks[(size_t)fi];
         if (b.state.load(std::memory_order_acquire) != BK_FILL) return false;  // 预检（不占名额）
@@ -126,7 +132,7 @@ bool BankScheduler::Claim(int& bank, int& slot) {
             const long long tz0 = I.cen && I.cen->on ? NowNsI() : 0;
             for (size_t i = 0; i < I.spec.ins.size(); i++) {
                 size_t rb = 0;
-                void* row = I.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
+                void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
                 if (row) memset(row, 0, rb);
             }
             if (I.cen && I.cen->on) {
@@ -158,7 +164,7 @@ bool BankScheduler::Claim(int& bank, int& slot) {
         if (void* fib = FiberCurrent()) {
             {
                 std::lock_guard<std::mutex> lk(I.mx);
-                I.waiters.push_back(fib);
+                I.waiters_g[g].push_back(fib);
             }
             I.waiting.fetch_add(1);
             if (I.cen && I.cen->on)
@@ -171,16 +177,22 @@ bool BankScheduler::Claim(int& bank, int& slot) {
             if (I.cen && I.cen->on)
                 I.cen->claim_park_ns.fetch_add(NowNsI() - tp0, std::memory_order_relaxed);
             I.cv.wait_for(lk, std::chrono::duration<double>(0.001),
-                          [&I] { return I.fill_idx.load() >= 0 || I.stop.load(); });
+                          [&I, g] { return I.fill_idx[g].load() >= 0 || I.stop.load(); });
             I.waiting.fetch_sub(1);
             if (I.stop.load()) return false;   // 停机中：弃领（判负纪律）
         }
     }
 }
 
+int BankScheduler::GroupOf(int bank) const {
+    if (!impl_ || bank < 0 || bank >= banks_) return 0;
+    return impl_->banks[(size_t)bank].grp;
+}
+
 void* BankScheduler::InputRow(int bank, int slot, const char* name, size_t* row_bytes) {
     if (!banks_ || bank < 0 || bank >= banks_ || !name) return nullptr;
-    return impl_->be->InputRow(impl_->banks[(size_t)bank].sess, name, slot, row_bytes);
+    BankCtl& b = impl_->banks[(size_t)bank];
+    return b.be->InputRow(b.sess, name, slot, row_bytes);   // 按银行取组后端
 }
 
 // ---------------- 提交与收割 ----------------
@@ -252,7 +264,7 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
     // ⚠ 仅限写手线程可发车的后端（TRT/CPU）：ORT 图会话绑调度台线程，写手
     // 线程回放=ORT 重新捕获（CUDA 900/901）→ 此类后端只 Notify，调度台
     // "满座即发"兜底（唤醒延迟 µs 级）。
-    if (I.be->DispatchFromWriterOk()
+    if (b.be->DispatchFromWriterOk()
         && prev_inf == 1 && b.cursor.load(std::memory_order_acquire) >= cfg_.slots) {
         I.self_dep.fetch_add(1);
         BankCloseAndDispatch(I, b);
@@ -292,9 +304,9 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         if (!r) continue;   // 作废槽
         for (int d = 0; d < r->n_dests; d++) {
             const OutputDest& od = r->dests[d];
-            int w = I.be->OutputWidth(b.sess, od.name);
+            int w = b.be->OutputWidth(b.sess, od.name);
             if (w <= 0 || !od.dst) continue;
-            const float* src = I.be->OutputRow(b.sess, od.name, s);
+            const float* src = b.be->OutputRow(b.sess, od.name, s);
             int cn = w < od.n ? w : od.n;
             if (src && cn > 0) memcpy(od.dst, src, sizeof(float) * (size_t)cn);
         }
@@ -313,11 +325,11 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         delete r;
     }
     I.gpu_busy_sum += NowMsD() - b.flight_t0;
-    // 还池（线性生命周期；mx 护——满座自驱路径也可能回池）
+    // 还池（线性生命周期；mx 护——满座自驱路径也可能回池；按组还）
     b.state.store(BK_POOL, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(I.mx);
-        I.pool.push_back(b.id);
+        I.pool_g[b.grp].push_back(b.id);
     }
     I.Notify();   // 池非空=可轮转，叫醒调度台/等池写手
 }
@@ -332,8 +344,8 @@ static void BankCloseAndDispatch(BankScheduler::Impl& I, BankCtl& b) {
                                          std::memory_order_acq_rel,
                                          std::memory_order_acquire))
         return;   // 已被他人关舱/发车
-    int fi = I.fill_idx.load(std::memory_order_acquire);
-    if (fi == b.id) I.fill_idx.compare_exchange_strong(fi, -1);
+    int fi = I.fill_idx[b.grp].load(std::memory_order_acquire);
+    if (fi == b.id) I.fill_idx[b.grp].compare_exchange_strong(fi, -1);
     BankDrainSubmit(I, b, false);   // 写手自驱路径（计时归自驱源）
 }
 
@@ -366,7 +378,7 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
                 std::printf("[bank] drain 长等 %.1fms: bank=%d inflight=%d cursor=%d "
                             "pool=%zu fill=%d（若持续不归零=在途计数有漏减路径）\n",
                             waited, b.id, b.inflight.load(), b.cursor.load(),
-                            I.pool.size(), I.fill_idx.load());
+                            I.pool_g[b.grp].size(), I.fill_idx[b.grp].load());
                 std::fflush(stdout);
             }
         }
@@ -378,13 +390,13 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     if (n <= 0) {   // 空舱（不可达防御）：直接回池
         b.state.store(BK_POOL, std::memory_order_release);
         std::lock_guard<std::mutex> lk(I.mx);
-        I.pool.push_back(b.id);
+        I.pool_g[b.grp].push_back(b.id);
         return;
     }
     // 发车：后端前缀 h2d（近满批整块）+ 异步发射（图回放优先）——不等回程
     double th0 = NowMsD();
     unsigned seq = 0;
-    if (!I.be->SubmitBatch(b.sess, n, seq)) {
+    if (!b.be->SubmitBatch(b.sess, n, seq)) {
         // 发射失败（不可达防御）：本批全弃答（判负纪律），银行回池
         std::printf("[bank] 批异常（发射，本批 %d 行弃答）\n", n);
         std::fflush(stdout);
@@ -398,7 +410,7 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
         }
         b.state.store(BK_POOL, std::memory_order_release);
         std::lock_guard<std::mutex> lk(I.mx);
-        I.pool.push_back(b.id);
+        I.pool_g[b.grp].push_back(b.id);
         return;
     }
     double tl1 = NowMsD();
@@ -417,17 +429,19 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     I.Notify();   // 发车后立刻叫醒调度台（收割轮询/轮转出池要尽快跟上）
 }
 
-// 出池轮转（调度台线程）：池顶出一家（游标归零=新集会）→ 投回挂起写手
-static void BankTryRotate(BankScheduler::Impl& I) {
-    if (I.fill_idx.load(std::memory_order_acquire) >= 0) return;
+// 出池轮转（调度台线程，按组）：组池顶出一家（游标归零=新集会）→ 投回该组
+// 挂起写手（组内等待——他组轮转不惊醒，免唤醒风暴）
+static void BankTryRotate(BankScheduler::Impl& I, int g) {
+    if (g < 0 || g >= I.n_groups) return;
+    if (I.fill_idx[g].load(std::memory_order_acquire) >= 0) return;
     int i = -1;
     std::deque<void*> wake;
     {
         std::lock_guard<std::mutex> lk(I.mx);
-        if (!I.pool.empty()) {
-            i = I.pool.front();
-            I.pool.pop_front();
-            wake.swap(I.waiters);
+        if (!I.pool_g[g].empty()) {
+            i = I.pool_g[g].front();
+            I.pool_g[g].pop_front();
+            wake.swap(I.waiters_g[g]);
             I.cv.notify_all();
         }
     }
@@ -435,7 +449,7 @@ static void BankTryRotate(BankScheduler::Impl& I) {
     BankCtl& b = I.banks[(size_t)i];
     b.cursor.store(0, std::memory_order_release);   // 新集会游标（图/地址一夫一妻）
     b.state.store(BK_FILL, std::memory_order_release);
-    I.fill_idx.store(i, std::memory_order_release);
+    I.fill_idx[g].store(i, std::memory_order_release);
     for (void* fib : wake) FiberPost(fib);
 }
 
@@ -448,8 +462,8 @@ static void BankLoop(BankScheduler::Impl& I) {
     if (I.cen) I.cen->tid_disp = GetCurrentThreadId();
     double window_ms = I.cfg.window_ms;
     if (window_ms < I.cfg.window_floor) window_ms = I.cfg.window_floor;
-    double window_t0 = 0;
-    bool window_open = false;
+    double window_t0[BankScheduler::Impl::kMaxGrp] = {0};
+    bool window_open[BankScheduler::Impl::kMaxGrp] = {false};
     I.stat_t0 = NowMsD();
     Census* cen = I.cen;
     for (;;) {
@@ -460,7 +474,7 @@ static void BankLoop(BankScheduler::Impl& I) {
         for (int i = 0; i < I.n_banks; i++) {
             BankCtl& b = I.banks[(size_t)i];
             if (b.state.load(std::memory_order_acquire) != BK_FLIGHT) continue;
-            if (!I.be->CompletionReached(b.sess, b.flight_seq)) {
+            if (!b.be->CompletionReached(b.sess, b.flight_seq)) {
                 if (now - b.flight_t0 > 500.0 && !b.flight_warned) {
                     b.flight_warned = true;
                     std::printf("[bank] FLIGHT 看门狗: bank=%d 已 %.0fms 未回信 seq=%u"
@@ -470,7 +484,7 @@ static void BankLoop(BankScheduler::Impl& I) {
                 }
                 continue;
             }
-            I.be->CompletionFence();
+            b.be->CompletionFence();
             b.flight_warned = false;
             if (cen && cen->on) {
                 cen->seg_poll_ns.fetch_add(NowNsI() - seg_t0, std::memory_order_relaxed);
@@ -491,42 +505,47 @@ static void BankLoop(BankScheduler::Impl& I) {
             std::deque<void*> wake;
             {
                 std::lock_guard<std::mutex> lk(I.mx);
-                wake.swap(I.waiters);
+                for (int g = 0; g < I.n_groups; g++) {
+                    std::deque<void*> wg;
+                    wg.swap(I.waiters_g[g]);
+                    wake.insert(wake.end(), wg.begin(), wg.end());
+                }
                 I.cv.notify_all();
             }
             for (void* fib : wake) FiberPost(fib);
             break;
         }
-        // ---- 出池：无填充银行 → 池顶出一家 → 投回挂起写手 ----
+        // ---- 出池：各组独立轮转（无填充银行 → 组池顶出一家 → 投回该组写手）----
         if (cen && cen->on) seg_t0 = NowNsI();
-        BankTryRotate(I);
+        for (int g = 0; g < I.n_groups; g++) BankTryRotate(I, g);
         if (cen && cen->on) cen->seg_rot_ns.fetch_add(NowNsI() - seg_t0, std::memory_order_relaxed);
         // ---- timer 发车（满座通常已被写手自驱；此处兜底：到期或观察到满座）----
-        int fi = I.fill_idx.load(std::memory_order_acquire);
-        if (fi >= 0) {
+        for (int g = 0; g < I.n_groups; g++) {
+            int fi = I.fill_idx[g].load(std::memory_order_acquire);
+            if (fi < 0) { window_open[g] = false; continue; }
             BankCtl& b = I.banks[(size_t)fi];
             int taken = b.cursor.load(std::memory_order_acquire);
             if (taken <= 0 || b.state.load(std::memory_order_acquire) != BK_FILL) {
-                window_open = false;   // 空舱/已被自驱发走：窗口重置
+                window_open[g] = false;   // 空舱/已被自驱发走：窗口重置
             } else {
-                if (!window_open) {
-                    window_open = true;
-                    window_t0 = now;
+                if (!window_open[g]) {
+                    window_open[g] = true;
+                    window_t0[g] = now;
                 }
                 bool full = taken >= I.cfg.slots;
-                bool expired = (now - window_t0) >= window_ms;
+                bool expired = (now - window_t0[g]) >= window_ms;
                 if (full || expired) {
                     // 关舱（CAS 输=写手已自驱）→ 先轮转开新窗（drain/提交不堵
                     // 下一窗，批间流水重叠）→ 再 drain+发车本舱
-                    window_open = false;
+                    window_open[g] = false;
                     const long long tc0 = cen && cen->on ? NowNsI() : 0;
                     int expected = BK_FILL;
                     if (b.state.compare_exchange_strong(expected, BK_CLOSED,
                                                         std::memory_order_acq_rel,
                                                         std::memory_order_acquire)) {
-                        int fi0 = I.fill_idx.load(std::memory_order_acquire);
-                        if (fi0 == b.id) I.fill_idx.compare_exchange_strong(fi0, -1);
-                        BankTryRotate(I);
+                        int fi0 = I.fill_idx[g].load(std::memory_order_acquire);
+                        if (fi0 == b.id) I.fill_idx[g].compare_exchange_strong(fi0, -1);
+                        BankTryRotate(I, g);
                         if (cen && cen->on)
                             cen->seg_close_ns.fetch_add(NowNsI() - tc0, std::memory_order_relaxed);
                         BankDrainSubmit(I, b, true);
@@ -535,8 +554,6 @@ static void BankLoop(BankScheduler::Impl& I) {
                     }
                 }
             }
-        } else {
-            window_open = false;
         }
         // ---- 汇报（每 300 个回信一行）----
         if ((int)I.lat.size() >= 300) {
@@ -593,15 +610,17 @@ static void BankLoop(BankScheduler::Impl& I) {
             I.self_dep.store(0);
             I.gpu_busy_sum = 0;
         }
-        // ---- 等待：事件（commit/领号/还池）cv 叫醒；窗内等窗到期；在途兜底轮询 ----
+        // ---- 等待：事件（commit/领号/还池）cv 叫醒；窗内等窗到期（取各组最近
+        //      到期）；在途兜底轮询 ----
         {
             bool any_flight = false;
             for (int i = 0; i < I.n_banks; i++)
                 if (I.banks[(size_t)i].state.load(std::memory_order_acquire) == BK_FLIGHT)
                     { any_flight = true; break; }
             double wait_ms = any_flight ? 0.1 : 2.0;
-            if (window_open) {
-                double rem = (window_t0 + window_ms) - NowMsD();
+            for (int g = 0; g < I.n_groups; g++) {
+                if (!window_open[g]) continue;
+                double rem = (window_t0[g] + window_ms) - NowMsD();
                 if (rem < 0.02) rem = 0.02;
                 if (rem < wait_ms) wait_ms = rem;
             }
@@ -619,62 +638,105 @@ static void BankLoop(BankScheduler::Impl& I) {
 
 // ---------------- init/shutdown ----------------
 bool BankScheduler::Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSpec* spec_out) {
+    BankGroupCfg g;
+    g.be = primary_be_;
+    g.model = mcfg;
+    g.banks = cfg.banks;
+    return InitGroups(cfg, std::vector<BankGroupCfg>{g}, spec_out);
+}
+
+bool BankScheduler::InitGroups(const BankConfig& cfg,
+                               const std::vector<BankGroupCfg>& groups,
+                               ModelSpec* spec_out) {
     Shutdown();
     cfg_ = cfg;
-    if (cfg.banks <= 0 || cfg.slots < 1) return false;
+    if (cfg.slots < 1) return false;
     if (!spec_out) {
         std::fprintf(stderr, "[bank] Init 需要 spec_out（Farm 预先 LoadSpec 的模型规格）\n");
         return false;
     }
+    if (groups.empty() || groups.size() > (size_t)Impl::kMaxGrp) {
+        std::fprintf(stderr, "[bank] 设备组数 %zu ∉ [1,%d]\n",
+                     groups.size(), Impl::kMaxGrp);
+        return false;
+    }
+    int total = 0;
+    for (auto& g : groups) {
+        if (g.banks < 1 || g.banks > Impl::kMax || !g.be) {
+            std::fprintf(stderr, "[bank] 组配置非法（banks=%d be=%p；界 [1,%d]）\n",
+                         g.banks, (void*)g.be, Impl::kMax);
+            return false;
+        }
+        total += g.banks;
+        if (total > Impl::kMax) {
+            std::fprintf(stderr, "[bank] 总银行数 %d > %d（跨组合计上限）\n",
+                         total, Impl::kMax);
+            return false;
+        }
+    }
     impl_ = new Impl();
     Impl& I = *impl_;
-    I.be = &backend();
     I.cen = cen_;
     I.cfg = cfg;
-    I.spec = *spec_out;   // 由 Farm 预先 LoadSpec（slots 已核）
+    I.spec = *spec_out;   // 由 Farm 预先 LoadSpec 并核各组结构一致
     *spec_out = I.spec;
-    if (cfg.banks > 32) I.cfg.banks = 32;
+    for (int g = 0; g < Impl::kMaxGrp; g++) I.fill_idx[g].store(-1);
+    I.n_groups = (int)groups.size();
     // 调度台线程上建会话（ORT 图会话 PerThreadContext 铁律：创建/热身/回放
-    // 须同线程；TRT 同规更稳）
-    I.disp = std::thread([&I, &mcfg] {
+    // 须同线程；TRT 同规更稳；跨组同线程无碍——各组会话独立）
+    I.disp = std::thread([&I, groups] {
         double tb0 = NowMsD();
         bool ok = true;
-        int n = I.cfg.banks;
-        if (n > Impl::kMax) n = Impl::kMax;
-        for (int i = 0; i < n && ok; i++) {
-            BankCtl& b = I.banks[(size_t)i];
-            b.id = i;
-            b.sess = I.be->CreateSession(mcfg, I.spec, /*for_bank=*/true);
-            if (!b.sess) { ok = false; break; }
-            if (!I.be->Warmup(b.sess)) { ok = false; break; }
-            b.cursor.store(0);
-            b.inflight.store(0);
-            b.state.store(BK_POOL);
-            b.reqs.assign((size_t)I.cfg.slots, nullptr);
+        int id = 0;
+        for (int g = 0; g < I.n_groups && ok; g++) {
+            const BankGroupCfg& gc = groups[(size_t)g];
+            for (int k = 0; k < gc.banks && ok; k++, id++) {
+                BankCtl& b = I.banks[(size_t)id];
+                b.id = id;
+                b.grp = g;
+                b.be = gc.be;
+                b.sess = b.be->CreateSession(gc.model, I.spec, /*for_bank=*/true);
+                if (!b.sess) { ok = false; break; }
+                if (!b.be->Warmup(b.sess)) { ok = false; break; }
+                b.cursor.store(0);
+                b.inflight.store(0);
+                b.state.store(BK_POOL);
+                b.reqs.assign((size_t)I.cfg.slots, nullptr);
+            }
         }
-        // 图地址烧死小实验（前两家）：任一不过=拒绝银行制启动（回不去旧路径
-        // 的字节安全性不赌）
-        for (int i = 0; ok && i < n && i < 2; i++) {
-            if (!I.be->ProbeGraph(I.banks[(size_t)i].sess)) {
-                std::fprintf(stderr, "[bank] 银行 %d 图地址小实验未过——拒绝银行制启动\n", i);
+        int built = id;
+        // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
+        // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）
+        for (int i = 0; ok && i < built; i++) {
+            if (I.banks[(size_t)i].id != 0
+                && I.banks[(size_t)i].grp == I.banks[(size_t)(i - 1)].grp)
+                continue;   // 非本组首家：跳过
+            if (!I.banks[(size_t)i].be->ProbeGraph(I.banks[(size_t)i].sess)) {
+                std::fprintf(stderr, "[bank] 银行 %d（组 %d）图地址小实验未过"
+                             "——拒绝银行制启动\n", i, I.banks[(size_t)i].grp);
                 ok = false;
             }
         }
         if (!ok) {
-            for (auto& b : I.banks)
-                if (b.sess) {
-                    I.be->DestroySession(b.sess);
-                    b.sess = nullptr;   // 防 Shutdown 二次销毁（双重释放案）
+            for (int i = 0; i < built; i++)
+                if (I.banks[(size_t)i].sess) {
+                    I.banks[(size_t)i].be->DestroySession(I.banks[(size_t)i].sess);
+                    I.banks[(size_t)i].sess = nullptr;   // 防 Shutdown 二次销毁（双重释放案）
                 }
             std::lock_guard<std::mutex> lk(I.init_mx);
             I.init_rc = -1;
             I.init_cv.notify_all();
             return;
         }
-        for (int i = 0; i < n; i++) I.pool.push_back(i);
-        I.n_banks = n;
-        std::fprintf(stderr, "[bank] 建池 %d 家耗时 %.0fms（pinned 直写槽+专属批图）\n",
-                     n, NowMsD() - tb0);
+        id = 0;
+        for (int g = 0; g < I.n_groups; g++) {
+            for (int k = 0; k < groups[(size_t)g].banks; k++, id++)
+                I.pool_g[g].push_back(id);
+        }
+        I.n_banks = built;
+        std::fprintf(stderr, "[bank] 建池 %d 家（%d 设备组）耗时 %.0fms"
+                     "（pinned 直写槽+专属批图；组池独立轮转）\n",
+                     built, I.n_groups, NowMsD() - tb0);
         {
             std::lock_guard<std::mutex> lk(I.init_mx);
             I.init_rc = 1;
@@ -692,10 +754,11 @@ bool BankScheduler::Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSp
         return false;
     }
     banks_ = I.n_banks;
-    std::printf("[bank] 零拷贝槽位银行就绪: 池 %d 家 × %d 槽，window=%.2fms"
+    n_groups_ = I.n_groups;
+    std::printf("[bank] 零拷贝槽位银行就绪: 池 %d 家（%d 组）× %d 槽，window=%.2fms"
                 "（游标领号/直写槽/满座或闹钟发车/旗标收割/还池；前缀 h2d+每家"
-                "一图；池容量=在飞上限=背压）\n",
-                banks_, cfg.slots, cfg.window_ms);
+                "一图；组池独立=链→组钉扎；池容量=在飞上限=背压）\n",
+                banks_, n_groups_, cfg.slots, cfg.window_ms);
     std::fflush(stdout);
     return true;
 }
@@ -711,12 +774,13 @@ void BankScheduler::Shutdown() {
     if (I.disp.joinable()) I.disp.join();
     for (auto& b : I.banks)
         if (b.sess) {
-            I.be->DestroySession(b.sess);
+            b.be->DestroySession(b.sess);
             b.sess = nullptr;
         }
     delete impl_;
     impl_ = nullptr;
     banks_ = 0;
+    n_groups_ = 0;
 }
 
 // ---------------- inline 模式运行器 ----------------

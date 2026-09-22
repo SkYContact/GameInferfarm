@@ -8,6 +8,7 @@
 //  G4 census：X（失踪人口）恒 0、腿末 live=0、全状态归零
 //  G5 refit：同 blob 两次换心 → 逐位同；不同 blob → 结果必变（A1/A2 的 CPU 版）
 //  G7 推理缓存：键=组装行字节+权重代次；开=关逐位同；代次门；热缓存腿全同
+//  G8a 多设备组（同构仿真）：分组=单组逐位同+重跑逐位同（真硬件=R4/gomoku --device）
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/cache.h"
@@ -345,6 +346,51 @@ int main() {
               "G7 热缓存二腿逐位同（纯命中路径）");
         CHECK(g_hot.chi > 0 && g_hot.chi * 10 >= g_hot.clo * 9,
               "G7 热缓存二腿命中率高（≥90%）");
+    }
+
+    // G8a：多设备组（同构仿真：两组同模型 cpu）——分组机器（组池/组轮转/
+    // Claim 组门/链钉扎）行为级等价：分组腿=单组腿逐位同，且重跑逐位同。
+    // （异构真硬件门=本地 R3/gomoku --device 演示；CI 无双卡=同构仿真已覆盖
+    // 分组协议面。）
+    {
+        auto dev_leg = [&](int n_groups, uint32_t seed0) {
+            FarmConfig cfg;
+            cfg.name = "g8";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = seed0;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+            if (n_groups == 2) {
+                DeviceConfig a, b;
+                a.model = cfg.model;
+                a.banks = 1;
+                b.model = cfg.model;
+                b.banks = 1;
+                cfg.devices = {a, b};
+            }
+            Farm farm;
+            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            const FarmTally& t = farm.tally();
+            LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
+                        t.decisions};
+            r.fp = t.fingerprint;
+            return r;
+        };
+        LegResult s1 = dev_leg(1, 4242);
+        LegResult p1 = dev_leg(2, 4242);
+        LegResult p2 = dev_leg(2, 4242);
+        CHECK(s1.decisions > 0 && p1.decisions == s1.decisions,
+              "G8a 分组腿完成（决策数=单组）");
+        CHECK(s1.fw == p1.fw && s1.sw == p1.sw && s1.fp == p1.fp,
+              "G8a 同构分组=单组逐位同（含指纹；组池/组门/链钉扎行为级等价）");
+        CHECK(p1.fp == p2.fp,
+              "G8a 分组腿重跑逐位同（钉扎确定性）");
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

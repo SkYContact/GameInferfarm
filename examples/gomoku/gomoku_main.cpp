@@ -3,13 +3,21 @@
 //
 //   gomoku [--backend cpu|ort|trt] [--model <fb.onnx>] [--engine <plan>]
 //          [--chains 8] [--games 16] [--banks 2] [--workers 4] [--slots 8]
-//          [--cache-log2 16] [--inline] [--threads] [--census] [--show-board]
+//          [--cache-log2 16] [--device <spec>]... [--inline] [--threads]
+//          [--census] [--show-board]
+//
+//   --device 多设备组（判决15，可重复；首个替换主设备，后续追加设备组）：
+//     spec = backend[,ep=cuda|dml][,dev=N][,banks=K][,model=路径][,engine=路径][,dir=运行时目录]
+//   例（NVIDIA 主卡 + AMD 核显，链按 c%2 钉扎到组）：
+//     gomoku --backend ort --model m.onnx --banks 2 \
+//            --device ort,ep=dml,dev=1,banks=1,model=m.onnx,dir=D:/dml_rt
 //
 // ort/trt 模型工件由 tools/bake_gomoku_mlp.py 烤制（一层 MLP，权重由种子
 // 生成——确定性）。三后端同架构；指纹只在与自身同后端双腿间可比。
 #include "gomoku_adapter.h"
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 using namespace inferfarm;
 using namespace inferfarm::gomoku;
@@ -51,6 +59,44 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--slots") && i + 1 < argc) { cfg.slots = atoi(argv[++i]); cfg.model.cpu = GomokuModelDecl(cfg.slots); }
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) cfg.seed0 = (uint32_t)strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--cache-log2") && i + 1 < argc) cfg.cache_log2 = atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--device") && i + 1 < argc) {
+            // spec = backend[,ep=..][,dev=N][,banks=K][,model=..][,engine=..][,dir=..]
+            std::string spec = argv[++i];
+            DeviceConfig d;
+            size_t pos = 0, first = spec.find(',');
+            d.model.backend = spec.substr(0, first == std::string::npos ? spec.size() : first);
+            bool have_model = false;
+            auto field = [&](const std::string& k) -> std::string {
+                std::string pat = k + "=";
+                size_t p = 0;
+                while ((p = spec.find(pat, p)) != std::string::npos) {
+                    if (p != 0 && spec[p - 1] != ',') { p += pat.size(); continue; }
+                    size_t v0 = p + pat.size(), v1 = spec.find(',', v0);
+                    return spec.substr(v0, v1 == std::string::npos ? std::string::npos : v1 - v0);
+                }
+                return "";
+            };
+            std::string v;
+            if (!(v = field("ep")).empty()) d.model.ort_ep = v;
+            if (!(v = field("dev")).empty()) d.model.device_id = atoi(v.c_str());
+            if (!(v = field("model")).empty()) { d.model.model_path = v; have_model = true; }
+            if (!(v = field("engine")).empty()) { d.model.engine_path = v; have_model = true; }
+            if (!(v = field("dir")).empty()) d.model.ort_dir = v;
+            if (!(v = field("banks")).empty()) d.banks = atoi(v.c_str());
+            else d.banks = 1;
+            if (!have_model) {
+                if (d.model.backend == "ort") d.model.model_path = cfg.model.model_path;
+                if (d.model.backend == "trt") d.model.engine_path = cfg.model.engine_path;
+            }
+            if (d.model.backend == "cpu") d.model.cpu = GomokuModelDecl(cfg.slots);
+            if (cfg.devices.empty()) {   // 首个：替换主设备
+                cfg.model = d.model;
+                cfg.banks = d.banks;
+                cfg.devices.push_back(d);   // 占位（Farm 展开时 devices 非空即走多组）
+            } else {
+                cfg.devices.push_back(d);
+            }
+        }
         else if (!std::strcmp(argv[i], "--inline")) cfg.banks = 0;
         else if (!std::strcmp(argv[i], "--threads")) cfg.fibers = false;
         else if (!std::strcmp(argv[i], "--census")) cfg.census = true;
