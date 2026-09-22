@@ -153,3 +153,8 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   两处按 slots 误乘（fb128 靠 P==slots 掩盖的陈年坑，fb1024 声明 8×实配）、
   批尾陈旧行散射污染（死行协议根治）。网格图 CPU 回落算子与 ORT 图捕获
   不兼容（--no-graph）；OneHot CUDA EP 内核 bug 绕行（Equal/Cast 替代）。
+- **SetLegShape 腿形状热调**（2026-09-22 回接方需求，清单模式真墙）：腿间改
+  chains/games/seed0 不重建银行池（Shutdown/Init=建池+热身+探针秒级开销每作业
+  付一次，恰是 refit-jobs 要消灭的）。物理面 Init 烧死不可动；population 模式
+  链数派生拒改。G12 门：热调续腿=新鲜农场同形状逐位同（含指纹）+非法拒绝。
+  回接方清单循环形态：SetLegShape(作业形) → RefitWeights(blob) → RunLeg。

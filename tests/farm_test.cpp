@@ -11,6 +11,8 @@
 //  G8a 多设备组（同构仿真）：分组=单组逐位同+重跑逐位同（真硬件=R4/gomoku --device）
 //  G9 population 路由（演化，判决16）：均匀 pop=普通单模型腿逐位同；重跑同；
 //     SetPopulation 换代必变；换代后缓存不串代（=新鲜无缓存农场逐位同）
+//  G12 腿形状热调（回接方清单需求）：同农场 SetLegShape 续腿=新鲜农场同形状
+//     逐位同；非法形状拒绝
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/cache.h"
@@ -529,6 +531,50 @@ int main() {
             unsigned long long fp2 = farm.tally().fingerprint;
             CHECK(fp1 == rt1.fp && fp2 == alt.fp,
                   "G9d 同农场连换两代=各自新鲜农场逐位同（代次失效端到端）");
+        }
+    }
+
+    // G12：腿形状热调（回接方清单需求）——同农场腿1(形状A)→SetLegShape(形状B)
+    // →腿2 == 新鲜农场(形状B)逐位同。refit 清单形态的根基：换形状不重建银行。
+    {
+        auto g12_farm = []() {
+            FarmConfig cfg;
+            cfg.name = "g12";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 4242;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+            Farm* f = new Farm();
+            if (!f->Init(cfg)) { g_fail++; return (Farm*)nullptr; }
+            return f;
+        };
+        auto leg_fp = [](Farm* f, AdapterFactory make) {
+            f->RunLeg(make, nullptr);
+            return f->tally().fingerprint;
+        };
+        Farm* a = g12_farm();
+        CHECK(a != nullptr, "G12 农场起");
+        if (a) {
+            (void)leg_fp(a, gomoku::MakeGomokuAdapter);   // 腿1：形状 A（4 链 16 局）
+            CHECK(a->SetLegShape(6, 24, 777u), "G12 SetLegShape(6,24,777) 成功");
+            unsigned long long fp_re = leg_fp(a, gomoku::MakeGomokuAdapter);
+            CHECK(!a->SetLegShape(0, 24, 1u), "G12 非法 chains 拒绝");
+            CHECK(!a->SetLegShape(6, 0, 1u), "G12 非法 games 拒绝");
+            Farm* b = g12_farm();
+            CHECK(b != nullptr, "G12 对照农场起");
+            if (b) {
+                CHECK(b->SetLegShape(6, 24, 777u), "G12 对照农场同形状热调");
+                unsigned long long fp_fresh = leg_fp(b, gomoku::MakeGomokuAdapter);
+                CHECK(fp_re == fp_fresh,
+                      "G12 热调续腿=新鲜农场同形状逐位同（含指纹）");
+                delete b;
+            }
+            delete a;
         }
     }
 

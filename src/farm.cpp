@@ -219,19 +219,11 @@ bool Farm::Init(FarmConfig cfg) {
     }
     // 链→组分配：平滑加权轮询（nginx 同款；确定性=链号函数，重跑逐位不破）。
     // 缺省全 share=1 ⇒ 两组时≡c%n_groups 老行为。share=0 ⇒ 该组不接链
-    // （备用/测试位）。
+    // （备用/测试位）。share 表存成员（SetLegShape 热调时重建分配）。
     {
-        chain_grp_.assign((size_t)cfg_.chains, 0);
-        std::vector<double> cw(devs.size(), 0.0);
-        for (int c = 0; c < cfg_.chains; c++) {
-            int best = -1;
-            for (size_t gi = 0; gi < devs.size(); gi++) {
-                cw[gi] += devs[gi].share;
-                if (best < 0 || cw[gi] > cw[(size_t)best]) best = (int)gi;
-            }
-            cw[(size_t)best] -= share_sum;
-            chain_grp_[(size_t)c] = best;
-        }
+        dev_shares_.clear();
+        for (auto& d : devs) dev_shares_.push_back(d.share);
+        BuildChainGroups();
     }
     // init 期一次性换心：多设备组不支持（半换心农场撕裂确定性）——fail fast
     if (!cfg_.model.refit_weights.empty()) {
@@ -287,9 +279,58 @@ void Farm::Shutdown() {
     spec_ok_ = false;
 }
 
+// ---------------- 链→组分配（Init 与 SetLegShape 共用）----------------
+void Farm::BuildChainGroups() {
+    double share_sum = 0;
+    for (double s : dev_shares_) share_sum += s;
+    if (share_sum <= 0 || dev_shares_.empty()) {
+        chain_grp_.assign((size_t)cfg_.chains, 0);
+        return;
+    }
+    chain_grp_.assign((size_t)cfg_.chains, 0);
+    std::vector<double> cw(dev_shares_.size(), 0.0);
+    for (int c = 0; c < cfg_.chains; c++) {
+        int best = -1;
+        for (size_t gi = 0; gi < dev_shares_.size(); gi++) {
+            cw[gi] += dev_shares_[gi];
+            if (best < 0 || cw[gi] > cw[(size_t)best]) best = (int)gi;
+        }
+        cw[(size_t)best] -= share_sum;
+        chain_grp_[(size_t)c] = best;
+    }
+}
+
+// 腿形状热调（refit 清单/多形状驱动，2026-09-22 回接方需求）：腿间改
+// chains/games/seed0 而**不重建银行池**（Shutdown/Init=建池+热身+探针的秒级
+// 开销每作业付一次，恰是清单模式要消灭的）。前置条件=腿已返回（同
+// RefitWeights 纪律）。物理面（slots/banks/devices/model/window）Init 烧死
+// 不可动——会话/arena/图地址婚姻。population 模式下 chains=P×games_each
+// 派生：拒绝改链（games 随链重置）。
+bool Farm::SetLegShape(int chains, int games, uint32_t seed0) {
+    if (!spec_ok_) return false;
+    if (cfg_.population.models > 0) {
+        if (chains != cfg_.chains) {
+            std::fprintf(stderr, "[farm] SetLegShape: population 模式链数=P×games_each"
+                         " 派生，不可改（当前 %d）\n", cfg_.chains);
+            return false;
+        }
+    } else if (chains < 1 || chains > 4096) {
+        std::fprintf(stderr, "[farm] SetLegShape: chains=%d ∉ [1,4096]\n", chains);
+        return false;
+    }
+    if (games < 1 || games > 100000000) {
+        std::fprintf(stderr, "[farm] SetLegShape: games=%d ∉ [1,1e8]\n", games);
+        return false;
+    }
+    cfg_.chains = chains;
+    cfg_.games = cfg_.population.models > 0 ? chains : games;   // population:每链 1 局
+    cfg_.seed0 = seed0;
+    BuildChainGroups();
+    return true;
+}
+
 void Farm::NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,
-                         long long fingerprint, int chain_id, int game_id) {
-    std::lock_guard<std::mutex> lk(tally_mx_);
+                         long long fingerprint, int chain_id, int game_id) {    std::lock_guard<std::mutex> lk(tally_mx_);
     if (we_first) { tally_.first_total++; if (outcome == 1) tally_.first_wins++; }
     else          { tally_.second_total++; if (outcome == 1) tally_.second_wins++; }
     tally_.games_done++;

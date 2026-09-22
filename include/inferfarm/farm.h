@@ -134,16 +134,26 @@ public:
     // 决策一步（银行/inline 分流；grp=设备组（链钉扎）；返回 false=判负纪律已触发）
     bool DriveDecision(GameAdapter* g, int grp = 0);
 
+    // 腿形状热调（回接方清单需求，2026-09-22）：腿间改 chains/games/seed0 而
+    // 不重建银行池（Shutdown/Init=建池+热身+探针秒级开销每作业付一次——恰是
+    // 清单模式要消灭的）。前置条件=腿已返回（同 RefitWeights 纪律）。物理面
+    // （slots/banks/devices/model/window）Init 烧死不可动。population 模式下
+    // 链数=P×games_each 派生不可改。
+    bool SetLegShape(int chains, int games, uint32_t seed0);
+
 private:
     // 组装行字节 → 缓存键（逐输入 InputRow 全行宽；槽独占期内调用安全；
     // grp 掺入键=缓存设备命名空间——异构组同字节行输出逐位可异，不共享条目）
     CacheKey128 HashSlot(int bk, int sl, int grp);
+    // 链→组分配重建（平滑加权轮询；Init 与 SetLegShape 共用）
+    void BuildChainGroups();
     FarmConfig cfg_;
     InferBackend* backend_ = nullptr;      // =组 0 后端（inline/兼容面）
     std::vector<InferBackend*> group_bes_; // 每设备组一个后端实例（Farm 建/毁）
     std::vector<ModelSpec> group_specs_;   // 每组模型规格（slots=组实际形状）
     int n_dev_ = 1;                        // 设备组数（链钉扎 c%n_dev_）
     std::vector<int> chain_grp_;           // 链→组（平滑加权轮询，share 配比）
+    std::vector<double> dev_shares_;       // 组 share 表（SetLegShape 重建分配用）
     BankScheduler bank_obj_;
     BankScheduler* bank_ = nullptr;
     InlineRunner inline_;
