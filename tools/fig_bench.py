@@ -20,19 +20,19 @@ colors = ["#8fa3b8", "#8fa3b8", "#5b7d99", "#5b7d99", "#c0504d"]
 
 fig, ax = plt.subplots(figsize=(8.2, 4.6), dpi=150)
 bars = ax.bar(range(5), gps, color=colors, width=0.62, zorder=3)
-ax.set_yscale("log")
-ax.set_ylim(10, 2400)
+ax.set_ylim(0, 950)
 ax.set_xticks(range(5))
 ax.set_xticklabels(labels, fontsize=9)
-ax.set_ylabel("对局吞吐（局/秒，log 轴）", fontsize=10)
+ax.set_ylabel("对局吞吐（局/秒）", fontsize=10)
 ax.set_title("同一五子棋负载、同一模型（6.9M 参数 CNN）：五种实现形态的吞吐",
              fontsize=11)
 ax.grid(axis="y", ls="--", alpha=0.4, zorder=0)
 for i, (b, g, r) in enumerate(zip(bars, gps, rel)):
-    ax.text(b.get_x() + b.get_width() / 2, g * 1.12, "%.1f" % g,
+    x = b.get_x() + b.get_width() / 2
+    ax.text(x, g + 46, "%.1f 局/s" % g,
             ha="center", fontsize=10, fontweight="bold")
-    ax.text(b.get_x() + b.get_width() / 2, g * 0.55, "%.1f×" % r,
-            ha="center", fontsize=8.5, color="white")
+    ax.text(x, g + 14, "（%.1f×）" % r,
+            ha="center", fontsize=8.5, color="#555555")
 fig.tight_layout()
 fig.savefig(os.path.join(OUT, "bench_ladder.png"), bbox_inches="tight")
 plt.close(fig)
