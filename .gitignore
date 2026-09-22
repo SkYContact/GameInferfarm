@@ -11,3 +11,7 @@ out/
 __pycache__/
 .vs/
 .vscode/
+
+!models/*.onnx
+bench_data/
+*.pt

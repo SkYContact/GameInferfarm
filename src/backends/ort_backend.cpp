@@ -169,6 +169,10 @@ class OrtBackend : public InferBackend {
 public:
     const char* Name() const override { return "ort"; }
 
+    // ORT 图会话绑调度台线程（PerThreadContext 铁律）：写手线程回放=触发
+    // ORT 重新捕获（CUDA 900/901）——满座自驱禁用，发车一律走调度台
+    bool DispatchFromWriterOk() const override { return false; }
+
     bool LoadSpec(const ModelConfig& cfg, int slots, ModelSpec& out) override {
         if (!LoadOrtLib(cfg)) return false;
         if (!g_cu.Load(cfg.cuda_dir)) return false;

@@ -53,6 +53,13 @@ public:
 
     // 换心（RW1 blob；TRT=refitter，CPU=直接改权重）。失败=false。
     virtual bool RefitWeights(const char* rw1_path) = 0;
+
+    // 写手线程能否就地发车（满座自驱）：ORT 图会话=PerThreadContext 铁律
+    // （创建/热身/回放须同线程=调度台线程），写手线程回放会触发 ORT 侧
+    // 重新捕获（CUDA failure 900/901，2026-09-22 五子棋 CNN chains=64 实测）
+    // → false：满座不自驱，Notify 调度台发车。TRT 图回放线程无关、CPU 无图
+    // → true（默认）。
+    virtual bool DispatchFromWriterOk() const { return true; }
 };
 
 } // namespace inferfarm

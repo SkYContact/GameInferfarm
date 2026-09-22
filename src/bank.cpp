@@ -249,7 +249,11 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
     // 满座自驱快路径（满了直接发，最后完笔者就地发车）："满=人人写完"由构造
     // 成立（+1 先于领号 ⇒ 满座时全部领号者已完工或在途；我是最后一个完工者
     // ⇒ 游标满 && 在途归零 ⇒ 不等 timer 不经他人手，自己发车。CAS 输=他人已关舱。
-    if (prev_inf == 1 && b.cursor.load(std::memory_order_acquire) >= cfg_.slots) {
+    // ⚠ 仅限写手线程可发车的后端（TRT/CPU）：ORT 图会话绑调度台线程，写手
+    // 线程回放=ORT 重新捕获（CUDA 900/901）→ 此类后端只 Notify，调度台
+    // "满座即发"兜底（唤醒延迟 µs 级）。
+    if (I.be->DispatchFromWriterOk()
+        && prev_inf == 1 && b.cursor.load(std::memory_order_acquire) >= cfg_.slots) {
         I.self_dep.fetch_add(1);
         BankCloseAndDispatch(I, b);
     }

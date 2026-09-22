@@ -35,6 +35,19 @@
 - **聚合掺混只能用身份不能用序**：完成序在并发两腿间不同（已入坑），本轮
   再确认：掺链号+局号。
 
+## 后端能力位教训（2026-09-22 五子棋 CNN 基准首跑抓出 P0）
+- **满座自驱发车 × ORT 图会话 = 线程违规**：写手 fiber 就地
+  BankCloseAndDispatch → ORT 图会话在非创建线程回放 → ORT 内部触发**重新
+  捕获**（`CUDA failure 900: operation not permitted when stream is
+  capturing` + `901: previous error during capture`）→ 整批弃答 → 判负纪律
+  连坐（chains=64 实测推理故障局 160-272/320，且故障数逐跑不同=指纹不可
+  复现）。**低负载（chains=16）timer 发车为主不触发**——高压才显形，静态
+  评审看不见，只有高压基准能抓。修复：`DispatchFromWriterOk()` 能力位
+  （ORT=false 满座只 Notify，调度台"满座即发"兜底 µs 级；TRT 图回放线程
+  无关/CPU 无图=true）。教训：**"后端线程亲和"必须是后端声明的显式能力，
+  协议层不得默认全体后端同权**；修后银行/inline/复跑三者指纹在 CNN 上
+  逐位同（分歧源就是故障批，此前的"conv kernel 数值差"假说不成立）。
+
 ## 测量纪律
 - **解释前先测量**：吞吐读数 ≥48 局/链才饱和；A/B 交替 ≥4 腿防热偏置（±10% 波动带）。
 - **行为门必须同 games+同 chains+种子对齐**（种子宇宙=games×chains 拆分；
