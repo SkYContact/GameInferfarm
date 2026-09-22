@@ -143,6 +143,9 @@ struct OrtSess {
     bool dml = false;
     int dev_id = 0;
     bool pop_dirty = false;   // population 面脏旗（cuda：下次 SubmitBatch 全量 H2D）
+    bool pop_mode = false;    // population 路由模式（cfg.population_input 命中）
+    std::vector<int> mid_like;   // 路由键输入下标（1-D i64 非 population——批尾
+                                 // 毒化目标；路由图约定：i64 标量列=mid）
     int slots = 64;
     // 完成协议（整设备同步血律）：Submit 后首个 CompletionReached 做一次
     // device sync + 前缀 D2H，随后同 seq 恒 true（dml：Run 同步=恒真）
@@ -297,6 +300,17 @@ public:
         s->seq++;
         s->last_n = n_rows;
         s->synced_for_seq = false;
+        // 批尾毒化（路由模式死行协议，判决16）：未领槽位 [n, slots) 的路由键
+        // 置 -1（0xFF）——陈旧 mid 参与图内散射会破坏 (p,j) 唯一性（溢出/碰撞
+        // 经 ScatterND 原子写污染新鲜行=活性非确定性）。图侧 v2.2 把 -1 路由
+        // 到专属死块，毒行输出不被收割。dml 直读宿主=写完即生效。
+        if (s->pop_mode && n_rows < s->slots) {
+            for (int mi : s->mid_like) {
+                OrtIn& m = s->ins[(size_t)mi];
+                memset((char*)m.host + (size_t)n_rows * m.meta.row_bytes, 0xFF,
+                       (size_t)(s->slots - n_rows) * m.meta.row_bytes);
+            }
+        }
         if (!s->dml) {
             // 多卡守卫：分配/拷贝作用于当前设备（会话设备）。dml 无 CUDA 面。
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
@@ -323,6 +337,15 @@ public:
                                     (size_t)n_rows * s->ins[i].meta.row_bytes, 1))
                         return false;
                 }
+                // 前缀路径补充：毒化后的路由键尾段同步到设备（整块路径全量拷贝已含）
+                if (s->pop_mode && n_rows < s->slots)
+                    for (int mi : s->mid_like) {
+                        OrtIn& m = s->ins[(size_t)mi];
+                        if (g_cu.Memcpy((char*)m.dev + (size_t)n_rows * m.meta.row_bytes,
+                                        (char*)m.host + (size_t)n_rows * m.meta.row_bytes,
+                                        (size_t)(s->slots - n_rows) * m.meta.row_bytes, 1))
+                            return false;
+                    }
             }
             if (!RunOnce(s)) return false;
         } else {
@@ -482,10 +505,12 @@ private:
             // 路同款），EP 据值对象走 staging 拷入；输出维持预绑。
             for (size_t i = 0; i < s->ins.size(); i++) {
                 if (s->ins[i].val) a->ReleaseValue(s->ins[i].val);
+                size_t bytes = s->ins[i].meta.population
+                    ? s->ins[i].meta.row_bytes * (size_t)s->ins[i].meta.dims[0]
+                    : s->ins[i].meta.row_bytes * (size_t)s->slots;   // DML 重绑同口径
                 OrtValue* v = nullptr;
                 if (a->CreateTensorWithDataAsOrtValue(
-                        s->bind_mem, s->ins[i].host,
-                        s->ins[i].meta.row_bytes * (size_t)s->slots,
+                        s->bind_mem, s->ins[i].host, bytes,
                         s->ins[i].meta.dims.data(), s->ins[i].meta.dims.size(),
                         ElemToOnnx(s->ins[i].meta.et), &v)) {
                     s->ins[i].val = nullptr;
@@ -508,7 +533,11 @@ private:
     static void FillPattern(OrtSess* s, int seed) {
         for (size_t i = 0; i < s->ins.size(); i++) {
             OrtIn& oi = s->ins[i];
-            size_t n = oi.meta.row_bytes * (size_t)s->slots / oi.meta.esize;
+            // population 面=总量按 dim0（P≠slots；同族坑第二处——按 slots 会写爆堆）
+            size_t n = (oi.meta.population
+                            ? oi.meta.row_bytes * (size_t)oi.meta.dims[0]
+                            : oi.meta.row_bytes * (size_t)s->slots)
+                       / oi.meta.esize;
             if (oi.meta.et == DTYPE_F32) {
                 float* p = (float*)oi.host;
                 for (size_t e = 0; e < n; e++)
@@ -769,7 +798,11 @@ private:
         }
         off = 0;
         for (size_t i = 0; i < n_in; i++) {
-            size_t bytes = s->ins[i].meta.row_bytes * (size_t)slots;
+            // 绑定量=元数据口径：population 面总量=row_bytes×P（dim0=P≠slots！
+            // 曾按 slots 统一乘→fb128 靠 P==slots 侥幸、fb1024 声明 8×实配→越界 700）
+            size_t bytes = s->ins[i].meta.population
+                ? s->ins[i].meta.row_bytes * (size_t)s->ins[i].meta.dims[0]
+                : s->ins[i].meta.row_bytes * (size_t)slots;
             off = (off + kAlign - 1) / kAlign * kAlign;
             s->ins[i].host = (char*)s->in_h_arena + off;
             s->ins[i].dev = (char*)s->in_d_arena + off;
@@ -839,6 +872,14 @@ private:
             spec_out->backend = dml ? "ort-dml" : "ort";
             spec_out->slots = slots;
         }
+        // 路由键识别（population 模式）：1-D i64 非 population 输入=mid 类
+        if (!cfg.population_input.empty())
+            for (size_t i = 0; i < n_in; i++) {
+                if (s->ins[i].meta.population) s->pop_mode = true;
+                else if (s->ins[i].meta.et == DTYPE_I64
+                         && s->ins[i].meta.dims.size() == 1)
+                    s->mid_like.push_back((int)i);
+            }
         if (dml) {
             // 专属发射线程（队头阻塞解药）：银行单飞（线性生命周期）⇒ 在飞
             // 作业 ≤1，投递槽单变量即够。失败仍记完成（loud print——银行无

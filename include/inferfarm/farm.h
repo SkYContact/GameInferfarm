@@ -26,6 +26,16 @@
 
 namespace inferfarm {
 
+// 多权重模式（population 路由的一等负载面，判决16）：这不是"演化功能"——
+// 演化/权重评测/批量测试都是本模式的乘客。框架只管：模型数×每模型局数=链数、
+// 链 c → 模型 c%P（映射+SetModelId 喂适配器）、按 Outcome() 契约逐模型计数
+// （与全局胜负统计同一泛型层）。**结算语义与框架无关**：适应度/模型对比/
+// 通过率等解释归驱动侧读 tally 自行定义。
+struct PopulationConfig {
+    int models = 0;        // P（0=关=普通单权重负载）；须与路由图 pop 面容量一致
+    int games_each = 8;    // 每模型局数（链数=P×games_each，每链 1 局全并发）
+};
+
 // 设备组配置（多 GPU）：一组=一套后端+模型配置+银行数（如 NVIDIA 主卡 2 家 +
 // AMD 核显 1 家；或双 NVIDIA 各 N 家）。backend/device_id/ort_ep/路径全组独立。
 struct DeviceConfig {
@@ -54,6 +64,7 @@ struct FarmConfig {
     long long max_decisions = 1000000;   // 对局决策数护栏（防适配器死循环）
     bool census = false;
     int cache_log2 = 0;          // 推理缓存：0=关（缺省零行为差）；如 16=64K 条
+    PopulationConfig population;   // 多权重路由负载（models>0=启用；与 population_input 家族对齐）
     // 多设备组（判决15；空=单设备老行为=cfg.model+cfg.banks）。链 c 钉扎到
     // 组 c%devices.size()——异构设备（如 NVIDIA+AMD）下保跨跑逐位的关键。
     // 各组模型结构须一致（输入名/行宽、输出名/宽、slots）；权重可不同
@@ -69,6 +80,8 @@ struct FarmTally {
     long long decisions = 0;
     unsigned long long fingerprint = 0;   // 逐局指纹 XOR（顺序无关；逐位门用）
     unsigned long long cache_lookups = 0, cache_hits = 0;   // 推理缓存（开后才有数）
+    // 演化模式按个体收账（适应度）：链 c → 个体 c%P（演化模式才非空）
+    std::vector<int> model_wins, model_games;
 };
 
 class Farm {

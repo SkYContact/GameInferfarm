@@ -28,6 +28,7 @@ struct OthelloAdapter : GameAdapter {
     int decisions;          // 我方决策计数（对拍口径）
     int64_t mid_ = 0;       // population 路由个体号（演化，判决16；非路由模型
                             // 无 "mid" 输入→AssembleInto 探测不到即跳过）
+    void SetModelId(int64_t m) override { mid_ = m; }   // 框架演化模式直喂
 
     static inline uint8_t last_board[kCells] = {0};
 

@@ -89,6 +89,30 @@ bool Farm::Init(FarmConfig cfg) {
     if (cfg_.model.population_input.empty() && cfg_.model.backend == "cpu"
         && cfg_.model.cpu.pop_p > 0)
         cfg_.model.population_input = "pop";
+    // 多权重模式（判决16）：models>0 = 一等多权重负载——链数=P×每模型局数
+    // （每链 1 局全并发，喂网格满度）、链 c→模型 c%P（DriveGame 喂 SetModelId）
+    if (cfg_.population.models > 0) {
+        if (cfg_.population.models > 1000000
+            || cfg_.population.games_each < 1 || cfg_.population.games_each > 1000000) {
+            std::fprintf(stderr, "[farm] population 配置非法（models=%d games_each=%d）\n",
+                         cfg_.population.models, cfg_.population.games_each);
+            return false;
+        }
+        if (cfg_.model.population_input.empty()) {
+            std::fprintf(stderr, "[farm] population 模式（多权重）须 population_input（路由图）"
+                         "或 cpu 后端 pop_p>0\n");
+            return false;
+        }
+        long long chains = (long long)cfg_.population.models
+                           * cfg_.population.games_each;
+        if (chains > 4096) {
+            std::fprintf(stderr, "[farm] population models×games_each=%lld > 4096（链上限；"
+                         "减小每模型局数或分波）\n", chains);
+            return false;
+        }
+        cfg_.chains = (int)chains;
+        cfg_.games = (int)chains;   // 每链 1 局（全并发=网格满度的前提）
+    }
     // ---- 设备组展开（空=单设备老行为=cfg.model+cfg.banks）----
     std::vector<DeviceConfig> devs = cfg_.devices;
     if (devs.empty()) {
@@ -271,6 +295,15 @@ void Farm::NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fa
     tally_.games_done++;
     tally_.decisions += dec;
     if (infer_fail) tally_.infer_fails++;
+    if (cfg_.population.models > 0) {   // 多权重按模型计数（结算语义归驱动）
+        int mid = (int)((uint32_t)chain_id % (uint32_t)cfg_.population.models);
+        if ((int)tally_.model_games.size() <= mid) {
+            tally_.model_games.resize((size_t)mid + 1, 0);
+            tally_.model_wins.resize((size_t)mid + 1, 0);
+        }
+        tally_.model_games[(size_t)mid]++;
+        if (outcome == 1) tally_.model_wins[(size_t)mid]++;
+    }
     unsigned long long fp = (unsigned long long)fingerprint;
     // 位混淆 + 掺局身份（链/局号——完成序无关！并发下两腿完成序可不同）：
     // 防同结局成对抵消（偶数局全同 XOR=0 的教训），同时保 XOR 顺序无关性
@@ -366,6 +399,9 @@ bool Farm::DriveDecision(GameAdapter* g, int grp) {
 void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
                       int chain_id, int game_id) {
     g->NewGame(seed, we_first);
+    if (cfg_.population.models > 0)   // 链→模型映射（框架喂，适配器免工厂闭包）
+        g->SetModelId((int64_t)((uint32_t)chain_id
+                                % (uint32_t)cfg_.population.models));
     const int grp = chain_grp_.empty() ? 0
         : chain_grp_[(size_t)((uint32_t)chain_id % (uint32_t)chain_grp_.size())];
                                           // 链→组（加权轮询表；表长=chains）
@@ -476,6 +512,21 @@ double Farm::RunLeg(AdapterFactory make, void* user) {
         std::printf("[%s] 缓存: 查 %llu 命中 %llu (%.1f%%)\n", cfg_.name.c_str(),
                     t.cache_lookups, t.cache_hits,
                     t.cache_lookups ? t.cache_hits * 100.0 / t.cache_lookups : 0.0);
+    if (cfg_.population.models > 0 && !t.model_games.empty()) {
+        int bw = -1, bp_ = -1;
+        for (size_t i = 0; i < t.model_games.size(); i++) {
+            if (t.model_games[i] <= 0) continue;
+            if (bw < 0 || t.model_wins[i] > t.model_wins[(size_t)bw]) bw = (int)i;
+            if (bp_ < 0 || t.model_wins[i] < t.model_wins[(size_t)bp_]) bp_ = (int)i;
+        }
+        if (bw >= 0)
+            std::printf("[%s] 多权重: %d 模型 × %d 局；按模型战绩（Outcome 契约计数，"
+                        "语义归驱动） 最好 #%d %d/%d 最差 #%d %d/%d\n",
+                        cfg_.name.c_str(), cfg_.population.models,
+                        cfg_.population.games_each, bw, t.model_wins[(size_t)bw],
+                        t.model_games[(size_t)bw], bp_, t.model_wins[(size_t)bp_],
+                        t.model_games[(size_t)bp_]);
+    }
     std::printf("[%s] 全链结束: %d 局用时 %.2fs（%.2f 局/秒）\n",
                 cfg_.name.c_str(), total, sec, sec > 0 ? total / sec : 0.0);
     std::fflush(stdout);

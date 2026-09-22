@@ -56,6 +56,11 @@ public:
 
     // 链寿命 TLS 帧（fiber 模式切换点装卸）；无跨让出 TLS 的游戏返回 nullptr。
     virtual ITlsFrame* TlsFrame() = 0;
+
+    // population 路由（演化，判决16）：框架在 NewGame 后按链→个体映射喂入
+    // 本局的模型号（路由图 mid 列的来源）。适配器可在 AssembleInto 里把它写进
+    // "mid" 输入。非演化负载不调用。缺省=忽略（适配器自管 mid 亦兼容）。
+    virtual void SetModelId(int64_t /*mid*/) {}
 };
 
 // 适配器工厂：为链 chain 造一个适配器（链内串行复用；腿末 delete）

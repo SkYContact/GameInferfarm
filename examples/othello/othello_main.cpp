@@ -16,16 +16,9 @@
 #include <string>
 #include <vector>
 
+
 using namespace inferfarm;
 using namespace inferfarm::othello;
-
-// 路由工厂：链 c → 个体 c%P（mid_ 由适配器在组装时写入行）
-struct PopCtx { int P; };
-static GameAdapter* MakeRoutedAdapter(int chain, void* p) {
-    OthelloAdapter* a = new OthelloAdapter();
-    a->mid_ = chain % ((PopCtx*)p)->P;
-    return a;
-}
 
 int main(int argc, char** argv) {
     FarmConfig cfg;
@@ -42,7 +35,7 @@ int main(int argc, char** argv) {
     cfg.model.backend = "ort";
     cfg.model.cpu = OthelloModelDecl(cfg.slots);
     bool show_board = false;
-    int pop_p = 0, gens = 1;
+    int pop_p = 0, gens = 1, games_each = 8;
     std::string pop_file;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
@@ -96,6 +89,7 @@ int main(int argc, char** argv) {
                 if (d.model.backend == "trt") d.model.engine_path = cfg.model.engine_path;
             }
             d.model.population_input = cfg.model.population_input;   // 路由模式组继承
+            d.model.ort_cuda_graph = cfg.model.ort_cuda_graph;       // 图开关组继承
             if (d.model.backend == "cpu") d.model.cpu = OthelloModelDecl(cfg.slots);
             if (cfg.devices.empty()) {
                 cfg.model = d.model;
@@ -109,6 +103,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--population") && i + 1 < argc) pop_p = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--gens") && i + 1 < argc) gens = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--pop-file") && i + 1 < argc) pop_file = argv[++i];
+        else if (!std::strcmp(argv[i], "--no-graph")) cfg.model.ort_cuda_graph = false;
+        else if (!std::strcmp(argv[i], "--games-each") && i + 1 < argc) games_each = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--threads")) cfg.fibers = false;
         else if (!std::strcmp(argv[i], "--census")) cfg.census = true;
         else if (!std::strcmp(argv[i], "--show-board")) show_board = true;
@@ -119,11 +115,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (pop_p > 0) {
-        // ES 代际模式（population 路由）：路由图 + 链=个体、每个体 8 局缺省
+        // ES 代际模式（多权重路由公民权）：框架管链→模型映射+按模型计数
         cfg.model.population_input = "pop";
         for (auto& d : cfg.devices) d.model.population_input = "pop";   // 已解析组同步
-        if (cfg.chains == 64) cfg.chains = pop_p;
-        if (cfg.games == 1280) cfg.games = pop_p * 8;
+        cfg.population.models = pop_p;
+        cfg.population.games_each = games_each;   // --games-each（缺省 8）
     }
     Farm farm;
     if (!farm.Init(cfg)) return 1;
@@ -152,7 +148,6 @@ int main(int argc, char** argv) {
             fclose(f);
             file_base = pop_file_buf.data();
         }
-        PopCtx pctx{pop_p};
         std::vector<float> pop((size_t)pop_p * flat_w);
         double gen_total = 0;
         for (int g = 0; g < gens; g++) {
@@ -173,7 +168,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "[othello] SetPopulation 失败\n");
                 return 1;
             }
-            double sec = farm.RunLeg(MakeRoutedAdapter, &pctx);
+            double sec = farm.RunLeg(MakeOthelloAdapter, nullptr);
             const FarmTally& t = farm.tally();
             gen_total += sec;
             std::printf("[es] 代 %d/%d: %d 局 / %.3fs（%d 个体×%d 局；累计 %.3fs）"

@@ -146,3 +146,10 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   othello ES 模式缺省链=个体/局=8×P。
 - 负载 B 侧：SetPopulation=毫秒级换心原语（21MB/代 H2D ~1ms），锚点对手
   =适配器侧后续（对手行走推理的 adapter 改造，spike 侧工作）。
+- **网格路由终局（2026-09-22 深夜）**：v2.2 图（死路由块+越界同行+权重补行）
+  + 后端批尾毒化 → 活性非确定性根治（同配置×3/跨银行数/跨图型指纹全同
+  36a139d97396ec2d 系）。终版代频 **0.115-0.138s/代（torch 1.07s 的 8×，
+  2 银行最优）**；45 门 ALL PASS。途中三雷：population 绑定量/探针 FillPattern
+  两处按 slots 误乘（fb128 靠 P==slots 掩盖的陈年坑，fb1024 声明 8×实配）、
+  批尾陈旧行散射污染（死行协议根治）。网格图 CPU 回落算子与 ORT 图捕获
+  不兼容（--no-graph）；OneHot CUDA EP 内核 bug 绕行（Equal/Cast 替代）。
