@@ -1,0 +1,19 @@
+# CI：无 GPU 环境跑确定性门（G1-G6 + RW1 负路径）；真模型门 R1/R2 无工件自动 SKIP
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CMake)
+        run: cmake -S . -B build
+      - name: Build (Release)
+        run: cmake --build build --config Release
+      - name: Determinism gates (G1-G6)
+        run: build/Release/farm_test.exe
+      - name: Real-model gates (SKIP without artifacts)
+        run: build/Release/gomoku_backend_test.exe

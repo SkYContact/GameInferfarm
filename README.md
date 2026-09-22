@@ -1,4 +1,4 @@
-# inferfarm · 推理农场
+# GameInferfarm · 推理农场
 
 **通用 C++ 游戏决策推理框架**——把"大量同构游戏并发推进 + 神经网络批量决策"做成游戏无关的库。
 写一个 `GameAdapter` 接入你的游戏，剩下的并发、攒批、GPU 提交、取证全部交给农场。
@@ -99,7 +99,7 @@ int main() {
 ## 快速开始
 
 ```bash
-git clone <本仓库> && cd inferfarm
+git clone https://github.com/SkYContact/GameInferfarm.git && cd GameInferfarm
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # 或任意支持的生成器
 cmake --build build --config Release
 
@@ -157,6 +157,10 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
   fiber_pool.cpp 的 Switch 族）。C++17，CMake ≥3.16。
 - 路线：ORT/TRT 真模型实测基准、低负载混合发车（单局场景银行税的解药）、
   POSIX 纤程、更多游戏范例。
+
+## 命名说明
+
+仓库名 **GameInferfarm**；C++ 命名空间/目标名为短名 `inferfarm`
 
 ## 许可
 

@@ -1,4 +1,4 @@
-# inferfarm
+# GameInferfarm
 
 **A general-purpose C++ inference framework for game-playing agents** — it takes
 "run a huge number of homogeneous games concurrently, batch every neural-net
@@ -104,7 +104,7 @@ installs/uninstalls it at every fiber switch.
 ## Quick start
 
 ```bash
-git clone <this repo> && cd inferfarm
+git clone https://github.com/SkYContact/GameInferfarm.git && cd GameInferfarm
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # or any supported generator
 cmake --build build --config Release
 
@@ -169,6 +169,10 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
 - Roadmap: ORT/TRT real-model benchmarks, hybrid low-load dispatch (the cure
   for the banking tax in single-game scenarios), POSIX fibers, more game
   samples.
+
+## Naming
+
+The repository is **GameInferfarm**; the C++ namespace/target keeps the short name `inferfarm`.
 
 ## License
 
