@@ -102,7 +102,7 @@ void Farm::Shutdown() {
 }
 
 void Farm::NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,
-                         long long fingerprint) {
+                         long long fingerprint, int chain_id, int game_id) {
     std::lock_guard<std::mutex> lk(tally_mx_);
     if (we_first) { tally_.first_total++; if (outcome == 1) tally_.first_wins++; }
     else          { tally_.second_total++; if (outcome == 1) tally_.second_wins++; }
@@ -110,7 +110,11 @@ void Farm::NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fa
     tally_.decisions += dec;
     if (infer_fail) tally_.infer_fails++;
     unsigned long long fp = (unsigned long long)fingerprint;
-    fp = fp * 0x9E3779B97F4A7C15ull + 0x9E3779B9u;   // 位混淆防平局抵消
+    // 位混淆 + 掺局身份（链/局号——完成序无关！并发下两腿完成序可不同）：
+    // 防同结局成对抵消（偶数局全同 XOR=0 的教训），同时保 XOR 顺序无关性
+    fp = (fp + (unsigned long long)(uint32_t)chain_id * 0xD1B54A32D192ED03ull
+             + (unsigned long long)(uint32_t)game_id * 0xC2B2AE3D27D4EB4Full)
+         * 0x9E3779B97F4A7C15ull;
     tally_.fingerprint ^= fp;
 }
 
@@ -138,7 +142,8 @@ bool Farm::DriveDecision(GameAdapter* g) {
     return inline_.Run(g);
 }
 
-void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first) {
+void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
+                      int chain_id, int game_id) {
     g->NewGame(seed, we_first);
     long long dec = 0;
     bool infer_fail = false;
@@ -154,7 +159,7 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first) {
         g->ApplyResult();
     }
     NoteGameDone(g->WeAreFirst(), g->Outcome(), dec, infer_fail,
-                 infer_fail ? -1 : g->GameFingerprint());
+                 infer_fail ? -1 : g->GameFingerprint(), chain_id, game_id);
 }
 
 // ---------------- 腿 ----------------
@@ -173,7 +178,7 @@ static void FarmGameMain(int chain, int game, void* p) {
     uint64_t seed = (uint64_t)(c->seed0 + (uint64_t)((uint64_t)chain * (uint64_t)c->per + (uint64_t)game));
     bool we_first = ((uint32_t)game % 2 == 0);   // 逐局交替（偶数局我方先攻）
     GameAdapter* g = c->adapters[(size_t)chain];
-    c->farm->DriveGame(g, seed, we_first);
+    c->farm->DriveGame(g, seed, we_first, chain, game);
 }
 
 static ITlsFrame* FarmFrameFactory(int chain, void* p) {

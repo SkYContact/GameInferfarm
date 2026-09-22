@@ -75,7 +75,8 @@ public:
     void Shutdown();
 
     // 驱动环本体（对局 fiber 上；也供 inline/线程模式同构调用）
-    void DriveGame(GameAdapter* g, uint64_t seed, bool we_first);
+    void DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
+                    int chain_id = 0, int game_id = 0);
     // 决策一步（银行/inline 分流；返回 false=判负纪律已触发）
     bool DriveDecision(GameAdapter* g);
 
@@ -93,7 +94,7 @@ private:
     FarmTally tally_;
     std::mutex tally_mx_;
     void NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,
-                      long long fingerprint);
+                      long long fingerprint, int chain_id, int game_id);
     friend struct FarmGameCtx;
 };
 
