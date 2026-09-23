@@ -5,6 +5,14 @@
 **通用 C++ 游戏决策推理框架**——把"大量同构游戏并发推进 + 神经网络批量决策"做成游戏无关的库。
 写一个 `GameAdapter` 接入你的游戏，剩下的并发、攒批、GPU 提交、取证全部交给农场。
 
+面向自博弈（self-play）训练、强化学习评估、演化算法种群评估、对局数据生成这类
+高吞吐负载的**批量推理层**：实测谱系 python 串行 → 本框架 116×（五子棋公开基准，
+[docs/benchmark.md](docs/benchmark.md)）；支持 NVIDIA（ONNX Runtime CUDA / TensorRT）
+与 AMD（DirectML）异构多卡混跑；确定性门常驻 CI。
+
+关键词：自博弈加速 · self-play batched inference · 游戏AI 高吞吐 · RL 评估对局
+生成 · 演化种群评估 · CUDA Graph · 零拷贝攒批 · fiber 调度
+
 ```
 [English version](README.en.md)
 ```

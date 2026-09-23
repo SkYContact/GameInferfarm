@@ -6,6 +6,16 @@ decision" and turns it into a game-agnostic library. Implement one
 `GameAdapter` for your game; the farm handles concurrency, batching, GPU
 submission and instrumentation.
 
+The batched-inference layer for self-play training, RL evaluation, evolutionary
+population evaluation and game-data generation: measured **116× over a naive
+python loop** on the public Gomoku benchmark ([docs/benchmark.md](docs/benchmark.md));
+NVIDIA (ONNX Runtime CUDA / TensorRT) **and AMD (DirectML)** devices, including
+mixed-vendor multi-GPU; bitwise determinism gates enforced in CI.
+
+Keywords: self-play acceleration, batched neural network inference, game AI
+throughput, RL rollout generation, evolutionary search, CUDA Graph, fiber
+scheduler.
+
 ```
 [中文版（主文档）](README.md)
 ```
