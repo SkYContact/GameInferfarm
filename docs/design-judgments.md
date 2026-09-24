@@ -142,7 +142,8 @@ n>7/8·slots 走整块，否则逐输入前缀。第 n..slots 行图照读显存
   YGO D3 fb64 512 局同种子胜局完全一致 195/512）；吞吐 gomoku dep
   0.18-0.25→0.11-0.14ms/批、gpu_flight 81→98-101%；**YGO 128 链 512 局
   交替 A/B 三轮：sync 106.9/98.8 vs fence 121.5/128.0 局/s=+21% 稳定**
-  （腿形状定律注意：A/B 已同形状配对）。**运行时契约**：模型须先跑
+  （腿形状定律注意：A/B 已同形状配对；共享 GPU 时段测得——两侧污染对称
+  故方向可信，幅度独占复测后才入正账，e25f398 测量纪律）。**运行时契约**：模型须先跑
   patch_fence.py（流指针走 ticket 握手：host 建会话前领票→kernel 按当前
   票号登记流→Warmup 认领+烟雾 record/query 验证，认领失败=回落同步）；
   本机须 FARM_CUDART_DLL=cudart64_13.dll（wheel=cu13 构建）+PATH 含

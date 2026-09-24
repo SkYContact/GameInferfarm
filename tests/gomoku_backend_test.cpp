@@ -259,6 +259,9 @@ int main() {
     // 模式腿 == sync 基线（R1 ort.fp）逐位——上次 =2 用户流方案就是挂在
     // 这类跨通道对拍上（3 跑 3 指纹）。env 每会话读取（CreateSession 处），
     // 同进程 _putenv 切档。工件缺席=SKIP。
+    // ⚠ 运行面：本门相对路径取工件，须在仓根且 fb8/fb8_fence 两件在场才跑
+    // （从 build/Release 等目录跑=SKIP；CI 无工件恒 SKIP——fence 语义的回归
+    // 保护靠本地仓根跑，CI 绿不覆盖本门）。
     {
         const char* kFence = "models/gomoku_mlp.fb8_fence.onnx";
         if (!have_ort) {
@@ -268,10 +271,17 @@ int main() {
                         "--out %s）\n", kFence, kOnnx, kFence);
         } else {
             _putenv_s("FARM_ORT_ASYNC", "3");
+            long long f0 = OrtFenceEngagedTotal();
             R f1 = Leg("ort", kFence, nullptr, 2);
             R f2 = Leg("ort", kFence, nullptr, 2);
+            // 空过防线：fence 静默回落同步也会逐位同——真启用断言靠此计数
+            //（每腿 2 银行 × 2 腿 = 4 会话，Warmup 烟雾通过才计）
+            long long f_bank = OrtFenceEngagedTotal() - f0;
+            CHECK(f_bank == 4, "R6 fence 真启用=4 会话（静默回落=此门红）");
             R fi = Leg("ort", kFence, nullptr, 0);
             _putenv_s("FARM_ORT_ASYNC", "0");
+            CHECK(OrtFenceEngagedTotal() - f0 == f_bank,
+                  "R6 inline 腿不误登记（armed 票号握手）");
             CHECK(f1.games == 32, "R6 fence 银行腿完成（32 局）");
             CHECK(f1.fp == f2.fp, "R6 fence 复跑逐位同");
             CHECK(f1.fp == fi.fp, "R6 fence 银行 vs inline 逐位一致（含指纹）");

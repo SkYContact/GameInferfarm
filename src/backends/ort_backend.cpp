@@ -161,12 +161,28 @@ struct FenceKernelData {
 };
 
 static std::mutex g_fence_mx;
-static uint64_t g_fence_cur_ticket = 0;
+static uint64_t g_fence_armed_ticket = 0;   // 当前武装票号（0=无主）。仅 fence
+                                            // 会话的 CreateSession 窗口内非零：
+                                            // probe/inline 等其他会话对 patched
+                                            // 模型也会实例化 fence kernel，武装
+                                            // 窗口外的 kernel 拿到 0=不登记（堵
+                                            // "他人登记进我票号"的污染/泄漏）
 static std::unordered_map<uint64_t, std::vector<void*>> g_fence_streams;
+static std::atomic<long long> g_fence_engaged{0};   // 累计真启用会话数（Warmup
+                                                    // 烟雾通过才 ++；静默回落不
+                                                    // 计——R6 门据此断言"真启用"）
 
-static uint64_t FenceTicketBegin() {
+static uint64_t FenceTicketArm() {
     std::lock_guard<std::mutex> lk(g_fence_mx);
-    return ++g_fence_cur_ticket;
+    return ++g_fence_armed_ticket;
+}
+static void FenceTicketDisarm() {
+    std::lock_guard<std::mutex> lk(g_fence_mx);
+    g_fence_armed_ticket = 0;
+}
+static void FenceTicketDrop(uint64_t t) {
+    std::lock_guard<std::mutex> lk(g_fence_mx);
+    g_fence_streams.erase(t);   // 未认领条目回收（warmup 失败路径的微泄漏）
 }
 static void* FenceTicketClaim(uint64_t t) {
     std::lock_guard<std::mutex> lk(g_fence_mx);
@@ -184,7 +200,7 @@ static OrtStatusPtr FenceCreateKernel(const OrtCustomOp*, const OrtApi* api,
     k->api = api;
     {
         std::lock_guard<std::mutex> lk(g_fence_mx);
-        k->ticket = g_fence_cur_ticket;
+        k->ticket = g_fence_armed_ticket;   // 窗口外=0（无主，Compute 不登记）
     }
     *kernel = k;
     return nullptr;
@@ -194,6 +210,8 @@ static void FenceKernelDestroy(void* kernel) {
 }
 static OrtStatusPtr FenceCompute(void* kernel, OrtKernelContext* context) {
     FenceKernelData* k = (FenceKernelData*)kernel;
+    if (k->ticket == 0) return nullptr;   // 无主 kernel（probe/inline 对 patched
+                                          // 模型）——静默不登记
     // 诊断开关（FARM_ORT_FENCE_DBG=1）：流归属/捕获态一击定位
     static const bool dbg = [] {
         const char* e = getenv("FARM_ORT_FENCE_DBG");
@@ -408,6 +426,8 @@ public:
                 s->fence = false;
                 s->fence_stream = nullptr;
                 if (s->ro) { api_->ReleaseRunOptions(s->ro); s->ro = nullptr; }
+            } else {
+                g_fence_engaged.fetch_add(1, std::memory_order_relaxed);
             }
         }
         std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s%s%s\n", s->slots,
@@ -481,6 +501,7 @@ public:
         if (s->sess) a->ReleaseSession(s->sess);
         if (s->domain) a->ReleaseCustomOpDomain(s->domain);   // 头文件契约：
         // 域须在所有用它的会话释放之后再删——放 ReleaseSession 后
+        FenceTicketDrop(s->fence_ticket);   // 未认领流条目回收（ticket 0=无操作）
         if (s->env && !SharedEnv()) a->ReleaseEnv(s->env);   // 共享 env=进程寿命，不释放
         if (s->bind_mem) a->ReleaseMemoryInfo(s->bind_mem);
         if (s->dml) {
@@ -965,8 +986,10 @@ private:
         }
         wchar_t wpath[1024];
         MultiByteToWideChar(CP_UTF8, 0, cfg.model_path.c_str(), -1, wpath, 1024);
-        if (s->fence) s->fence_ticket = FenceTicketBegin();
+        if (s->fence) s->fence_ticket = FenceTicketArm();
         OrtStatus* stc = a->CreateSession(s->env, wpath, opts, &s->sess);
+        if (s->fence) FenceTicketDisarm();   // 武装窗口=CreateSession 一段；
+                                             // 窗口外其他会话的 kernel 一律无主
         a->ReleaseSessionOptions(opts);
         if (stc) {
             std::fprintf(stderr, "[ort] 建会话失败: %s\n", a->GetErrorMessage(stc));
@@ -1256,5 +1279,9 @@ private:
 };
 
 InferBackend* CreateOrtBackend() { return new OrtBackend(); }
+
+long long OrtFenceEngagedTotal() {
+    return g_fence_engaged.load(std::memory_order_relaxed);
+}
 
 } // namespace inferfarm
