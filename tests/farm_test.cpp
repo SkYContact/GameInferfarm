@@ -19,14 +19,20 @@
 //  G14 Farm 代际重建逐位门（清单模式契约，2026-09-24 接入方提案）：同进程
 //     建→跑→销毁 ×3 代同种子逐位同，代间搀异构形态腿弄脏静态；缓存开变体
 //     另验（此前该契约只有 YGO --ort-jobs 侧对拍）
+//  G15 绑核（FARM_WORKER_AFFINITY/FARM_SCHED_AFFINITY，2026-09-24）：解析器
+//     规格 + 绑核腿指纹逐位同（调度落位不改算术）+ pinned 探针防空过 + 越
+//     界核号软失败
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
+#include "inferfarm/affinity.h"
 #include "inferfarm/backend.h"
 #include "inferfarm/backend_factory.h"
 #include "inferfarm/cache.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace inferfarm;
@@ -708,6 +714,62 @@ int main() {
         LegResult c1 = RunOne(2, true, 4, 20260924u, false, 16);
         CHECK(c1.fp == c0.fp && c1.decisions == c0.decisions,
               "G14a 缓存开代际重建逐位同");
+    }
+
+    // ---------------- G15：绑核（FARM_WORKER_AFFINITY/FARM_SCHED_AFFINITY）----------------
+    // 契约：绑核只改调度落位，不改任何算术与收割顺序——同种子腿指纹逐位同
+    // （判决 17 spin 同款论证：是必然不是侥幸）；"真绑上"断言走 pinned 探针
+    // （防"解析了没绑上"的空过——R6 空过防线教训同源）；越界核号=软失败
+    // 不绑、结果照常（性能旋钮不正确性旋钮）。
+    {
+        // ① 解析器规格：单点+区间+trim+保序；空=不绑；垃圾段跳过
+        std::vector<int> v = ParseCpuList("0, 2-4,10");
+        CHECK(v.size() == 5 && v[0] == 0 && v[1] == 2 && v[3] == 4 && v[4] == 10,
+              "G15 解析器：单点+区间+trim+去重保序");
+        CHECK(ParseCpuList(nullptr).empty() && ParseCpuList("").empty()
+                  && ParseCpuList("  ").empty(),
+              "G15 解析器：空串=不绑");
+        int hc = (int)std::thread::hardware_concurrency();
+        // 真门（教训：垃圾段曾把 "-1" 吃成区间 [-1,1] 造出假元素，掩护了
+        // phys 枚举恒空的空过——现在负核号被拒，本列表=纯 phys 枚举结果）
+        std::vector<int> phys = ParseCpuList("x, -1, 5-3, phys");
+        bool phys_ok = !phys.empty() && phys.size() <= (size_t)hc;
+        for (size_t k = 0; k < phys.size() && phys_ok; k++)
+            if (phys[k] < 0 || phys[k] >= hc) phys_ok = false;
+        for (size_t k = 0; k + 1 < phys.size() && phys_ok; k++)
+            if (phys[k] >= phys[k + 1]) phys_ok = false;   // 保序递增且互异
+        CHECK(phys_ok, "G15 解析器：垃圾段全拒 + phys=真枚举（非空+界内+互异）");
+
+        // ② 工人绑核腿：全部工人挤核 0（极端配置=最强可观测），指纹必须不动
+        int p0 = AffinityPinnedCount();
+        _putenv("FARM_WORKER_AFFINITY=0");
+        LegResult w1 = RunOne(2, true, 4, 4242);
+        CHECK(w1.fp == bank1.fp && w1.decisions == bank1.decisions,
+              "G15 工人绑核腿指纹==默认腿（调度落位不改算术）");
+        CHECK(AffinityPinnedCount() - p0 >= 4, "G15 工人真绑上（pinned≥K，防空过）");
+
+        // ③ 调度台绑核腿：4 工人+1 调度台全上核 0，指纹照常
+        _putenv("FARM_SCHED_AFFINITY=0");
+        int p1 = AffinityPinnedCount();
+        LegResult s1 = RunOne(2, true, 4, 4242);
+        CHECK(s1.fp == bank1.fp, "G15 调度台绑核腿指纹==默认腿");
+        CHECK(AffinityPinnedCount() - p1 >= 5, "G15 调度台真绑上（pinned≥K+1）");
+
+        // ④ 线程模式链线程同旋钮（G3 形状：每链一线程）
+        LegResult t1 = RunOne(2, false, 6, 4242);
+        CHECK(t1.fp == bank1.fp, "G15 线程模式绑核腿指纹==默认腿（链线程同旋钮）");
+
+        // ⑤ 越界核号=软失败不绑，结果照常（清 sched：本门只考 worker 面，
+        // 不然调度台照常绑上会把 pinned 探针抬高=门自身假红）
+        _putenv("FARM_SCHED_AFFINITY=");
+        _putenv("FARM_WORKER_AFFINITY=9999");
+        int p2 = AffinityPinnedCount();
+        LegResult o1 = RunOne(2, true, 4, 4242);
+        CHECK(o1.fp == bank1.fp && AffinityPinnedCount() == p2,
+              "G15 越界核号软失败：不绑+指纹照常");
+
+        _putenv("FARM_WORKER_AFFINITY=");
+        _putenv("FARM_SCHED_AFFINITY=");
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

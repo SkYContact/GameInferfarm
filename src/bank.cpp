@@ -1,12 +1,14 @@
 // bank.cpp — 零拷贝槽位银行制实现（ai_infer.cpp 银行段的游戏无关抽取，
 // 2026-09-22。协议/并发结构与 YGO 产线逐句同源；GPU 面改经 InferBackend。）
 #include "inferfarm/bank.h"
+#include "inferfarm/affinity.h"
 #include "inferfarm/fiber_pool.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -119,6 +121,9 @@ struct BankScheduler::Impl {
     std::mutex mx;
     std::condition_variable cv;
     std::thread disp;
+    std::vector<int> sched_aff;          // FARM_SCHED_AFFINITY 解析（Init 填、
+                                         // disp 线程开头消费——spin=1 自旋核
+                                         // 钉扎防迁移，判决17/18）
     void* notify_sem = nullptr;          // WMO 通知信号量（spin=2；Notify 释放，
                                          // 调度台 WMO 消费；Shutdown 兜底唤醒）
     std::atomic<bool> stop{false};
@@ -906,6 +911,11 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     I.cen = cen_;
     I.cfg = cfg;
     I.spin = cfg.spin;
+    I.sched_aff = ParseCpuList(std::getenv("FARM_SCHED_AFFINITY"));
+    if (!I.sched_aff.empty()) {
+        std::printf("[bank] 调度台绑核 %d 项\n", (int)I.sched_aff.size());
+        std::fflush(stdout);
+    }
 #ifdef _WIN32
     I.notify_sem = CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
 #endif
@@ -916,6 +926,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     // 调度台线程上建会话（ORT 图会话 PerThreadContext 铁律：创建/热身/回放
     // 须同线程；TRT 同规更稳；跨组同线程无碍——各组会话独立）
     I.disp = std::thread([&I, groups, spec_out] {
+        if (!I.sched_aff.empty()) PinThread(I.sched_aff, 0, "sched");
         double tb0 = NowMsD();
         bool ok = true;
         int id = 0;
@@ -939,10 +950,13 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 if (g == 0 && gc.spec.ins.empty()) {
                     // 探测砍除通道（能力位 ProbeFreeSpec）：首个真实银行会话
                     // 顺带产出组 0 spec——省一次建探测会话即毁（YGO 清单模式
-                    // ≈0.1s×56 腿/代）
+                    // ≈0.1s×56 腿/代）。spec_out 只挂 k==0 首家：spec_out 的
+                    // IO 枚举是追加式，banks>1 时第二家再传=同组 IO 重复入表
+                    // （CNN 6 组形状首爆：组 0 spec 4 ins 2 outs，2026-09-24）
                     b.sess = b.be->CreateSessionWithSpec(gc.model, gslots,
                                                          /*for_bank=*/true,
-                                                         &g0_harvest);
+                                                         k == 0 ? &g0_harvest
+                                                                : nullptr);
                     if (!b.sess) { ok = false; break; }
                     if (g0_harvest.slots != gslots) {
                         std::fprintf(stderr, "[bank] 组 0 模型批形状 dim0=%d ≠ %d"

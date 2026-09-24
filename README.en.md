@@ -187,7 +187,13 @@ framework via a renamed copy). TRT `device_id>0` guards are in place
 
 `FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
 `FARM_STAGGER_MS` `FARM_CENSUS` `FARM_CACHE_LOG2` `FARM_ORT_DIR`
-`FARM_CUDA_DIR` `FARM_TRT_DIR`
+`FARM_CUDA_DIR` `FARM_TRT_DIR` `FARM_BANK_SPIN` `FARM_ORT_ASYNC`
+`FARM_WORKER_AFFINITY` `FARM_SCHED_AFFINITY`
+
+CPU pinning (opt-in, judgment 18): `FARM_WORKER_AFFINITY` /
+`FARM_SCHED_AFFINITY`, spec `"0,2-7,phys"` (`phys` = one representative
+logical core per physical core; default off = zero behavior change). Red
+line: never pin the dispatcher onto a worker core (measured -94%).
 
 ## Layout
 

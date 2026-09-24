@@ -14,6 +14,9 @@
 //                             量子 1-1.3ms；纯自旋忙时独烧调度台核）
 //    FARM_STAGGER_MS          点火错峰（10ms 甜点）
 //    FARM_CENSUS=1            取证层（~5% 税，仅取证开）
+//    FARM_WORKER_AFFINITY     工人绑核列表 "0,2-7,phys"（affinity.h；phys=
+//                             物理核代表号——判决2 的机器面；空=不绑）
+//    FARM_SCHED_AFFINITY      调度台绑核列表（spin=1 自旋核钉扎防迁移）
 //    FARM_CACHE_LOG2          推理缓存表容 log2（0=关；如 16=64K 条）——
 //                             键=组装行字节哈希+权重代次（KataGo NNCache
 //                             思想吸收，判决13；有重复状态的游戏红利大）

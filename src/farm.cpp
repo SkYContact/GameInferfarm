@@ -292,6 +292,29 @@ bool Farm::Init(FarmConfig cfg) {
                 std::fprintf(stderr, "[farm] 探测砍除通道后置校验失败"
                              "（dim0=%d hint=%d）——关农场\n",
                              spec_.slots, cfg_.slots);
+                // 真因定位（bad 三选一：slots 恒打印相同时也可能组间结构差；
+                // 逐组打印首个结构差面的输入名/行宽/dims 深）
+                for (size_t gi = 1; gi < group_specs_.size(); gi++) {
+                    const ModelSpec& a = spec_;
+                    const ModelSpec& b = group_specs_[gi];
+                    if (SpecStructurallyEqual(a, b)) continue;
+                    std::fprintf(stderr, "[farm]   组 %zu 结构差:\n", gi);
+                    std::fprintf(stderr, "[farm]     a(组0会话) ins:");
+                    for (auto& m : a.ins)
+                        std::fprintf(stderr, " [%s rb=%zu d=%zu]",
+                                     m.name.c_str(), m.row_bytes, m.dims.size());
+                    std::fprintf(stderr, " outs:");
+                    for (auto& m : a.outs)
+                        std::fprintf(stderr, " [%s w=%zu]", m.name.c_str(), m.width);
+                    std::fprintf(stderr, "\n[farm]     b(LoadSpec) ins:");
+                    for (auto& m : b.ins)
+                        std::fprintf(stderr, " [%s rb=%zu d=%zu]",
+                                     m.name.c_str(), m.row_bytes, m.dims.size());
+                    std::fprintf(stderr, " outs:");
+                    for (auto& m : b.outs)
+                        std::fprintf(stderr, " [%s w=%zu]", m.name.c_str(), m.width);
+                    std::fprintf(stderr, "\n");
+                }
                 bank_obj_.Shutdown();
                 bank_ = nullptr;
                 Shutdown();

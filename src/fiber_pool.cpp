@@ -5,10 +5,12 @@
 // Windows Fibers：ConvertThreadToFiberEx/CreateFiberEx/SwitchToFiber。
 // 栈=PE 默认（与 std::thread 同源）。纤程切换本身 ns 级（实测口径）。
 #include "inferfarm/fiber_pool.h"
+#include "inferfarm/affinity.h"
 #include "inferfarm/census.h"
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -59,6 +61,8 @@ struct FiberPoolState {
     FiberGameFn game_fn = nullptr;
     FiberFrameFn frame_fn = nullptr;
     Census* cen = nullptr;
+    std::vector<int> worker_aff;        // FARM_WORKER_AFFINITY 解析（RunLeg 开头
+                                        // 刷新；工人线程内只读——绑核 id 模分配）
 };
 static FiberPoolState g_fps;
 static thread_local FiTask* t_fi_task = nullptr;   // 本工人当前局（等待侧桥取 cookie）
@@ -169,6 +173,8 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
 
 static void FiWorkerLoop(int wid, Census* cen) {
     FiWorker& w = g_fps.fiw[(size_t)wid];
+    if (!g_fps.worker_aff.empty())
+        PinThread(g_fps.worker_aff, wid, "worker");
     if (cen && cen->on && cen->tids_worker_n < Census::kMaxWorkers)
         cen->tids_worker[cen->tids_worker_n++] = GetCurrentThreadId();
     w.main_fib = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
@@ -234,6 +240,12 @@ void FiberPool::Configure(int workers, Census* census) {
 double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
                          FiberFrameFn frame_fn, void* user, double stagger_ms) {
     const int K = workers_;
+    g_fps.worker_aff = ParseCpuList(std::getenv("FARM_WORKER_AFFINITY"));
+    if (!g_fps.worker_aff.empty()) {
+        std::printf("[fiber] 工人绑核 %d 项（K=%d 模分配）\n",
+                    (int)g_fps.worker_aff.size(), K);
+        std::fflush(stdout);
+    }
     auto t0 = std::chrono::steady_clock::now();
     g_fps.fiw.clear();                   // FiWorker 含 mutex/cv：deque 原地构造免移动
     for (int w = 0; w < K; w++) g_fps.fiw.emplace_back();
@@ -297,6 +309,10 @@ struct ThreadLegCtx {
 };
 
 static void ThreadChainMain(ThreadLegCtx c) {
+    // 线程模式同享 FARM_WORKER_AFFINITY（与 fiber 工人同一旋钮；链号=线程
+    // 身份 id，模分配语义一致。每链解析：µs 级，与 fiber 路的动态刷新同语义）
+    const std::vector<int> aff = ParseCpuList(std::getenv("FARM_WORKER_AFFINITY"));
+    if (!aff.empty()) PinThread(aff, c.chain, "chain");
     ITlsFrame* frame = c.frame_fn ? c.frame_fn(c.chain, c.user) : nullptr;
     if (frame) frame->Install();   // 链寿命=线程寿命（所有权=调用方，不 delete）
     for (int gi = 0; gi < c.per; gi++)

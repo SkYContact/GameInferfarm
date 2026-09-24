@@ -45,6 +45,7 @@ if (INFERFARM_WITH_TRT)
 endif()
 
 add_library(inferfarm STATIC
+    src/affinity.cpp
     src/fiber_pool.cpp
     src/census.cpp
     src/bank.cpp

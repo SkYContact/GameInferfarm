@@ -170,3 +170,23 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   行位置变化下逐位同。至此 G13/R5 家族在 cpu/ort/trt 三后端全部实证，
   "batch invariance"从声明变成三后端被守住的契约。
 - 真模型可选门矩阵现状：R1/R2/R3/R5 全绿；R4（cuda+dml 异构）待双卡环境。
+
+## 绑核落地与判决 18（2026-09-24）
+- 接入方需求：worker 支持绑核。新增 include/inferfarm/affinity.h +
+  src/affinity.cpp（ParseCpuList/PinThread/pinned 探针）；接入点三处：
+  fiber 工人（FiWorkerLoop 头）、调度台（disp 线程头）、线程模式链线程；
+  env=FARM_WORKER_AFFINITY/FARM_SCHED_AFFINITY，值 "0,2-7,phys"。
+- G15 门（farm_test 61→70 ok）：解析器规格/空串/垃圾段全拒/phys 真枚举
+  +绑核腿指纹逐位同+pinned 探针防空过+越界软失败。
+- 途中四案（全部当轮修复，坑目录有档）：①越界移位 UB 绕过范围检查；
+  ②G15 门 sched env 残留假红；③phys 门被 "-1" 区间假元素空过成假绿
+  （phys 枚举因 SDK sizeof(EX)=80>实记录 48 恒空——python ctypes 逐字
+  节核布局后手动偏移读修复）；④探测砍除 spec_out 追加式枚举 ×banks>1
+  =组 0 spec IO 重复入表（CNN 6 组形状首爆=多组盲区，只挂首银行修复，
+  修复后 CNN 512 局腿 85.5% 胜率吻合训练记录 85.9%）。
+- 判决 18 数字（fb8 fence 4096 局 / CNN 6 组 w14 4096 局，独占，指纹
+  全同）：MLP 闲形状工人钉 phys +3.5% 弱正；调度台与工人同核 -94%
+  崩盘（红线）；CNN 满载工人钉 -27%、+调度台钉空核=持平。绑核=opt-in
+  工具非默认。
+- A1 spin=2 独占复测（4096 局 ×4 交替）：中位 -15% vs spin=1——从
+  "判死拆码"改判"留档省核选项"，默认仍 spin=1（判决 17 追记）。
