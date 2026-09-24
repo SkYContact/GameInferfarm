@@ -370,7 +370,9 @@ struct OrtSess {
     unsigned dep_cnt = 0;
     // P1-5 批拷贝 scratch（FARM_H2D_BATCH=1 且符号在）：稀疏批多输入 H2D
     // 合并为一次 cudaMemcpyBatchAsync（dep=宿主提交税∝提交次数）
-    bool h2d_batch = false;
+    bool h2d_async = false;   // fence H2D 异步入流（FARM_H2D_ASYNC=1 opt-in；
+                              // 缺省阻塞 memcpy=YGO 实测正解，见判决17 补记）
+    bool h2d_batch = false;   // 依赖 h2d_async（批 API 只有异步形态）
     std::vector<void*> hb_dst, hb_src;
     std::vector<size_t> hb_sizes, hb_attridx;
     void* stream = nullptr;
@@ -489,7 +491,7 @@ public:
                             : (s->graph_on ? "，CUDA Graph=开（银行会话：调度台线程绑定）"
                                            : "，CUDA Graph=关"),
                      s->async ? "，零围栏=开（用户流+事件收割）" : "",
-                     s->fence ? "，fence 桥接=开（图尾事件章+同步锚）" : "");
+                     s->fence ? "，fence 桥接=开（H2D 同步锚+信号量完成通知）" : "");
         return true;
     }
 
@@ -609,11 +611,11 @@ public:
             auto h2d = [&](void* dst, const void* src, size_t bytes) {
                 if (s->async)
                     return g_cu.MemcpyAsync(dst, src, bytes, 1, s->stream) == 0;
-                if (s->fence)
-                    // fence v4（P1 下一刀，2026-09-24 接入方定案）：H2D 异步
-                    // 入 EP 流——与 replay/D2H/hostfunc 同流序=正确性锚（数据
-                    // 先于内核、宿主改写先于异步拷贝全由流序保证），dep 里
-                    // 剔除"WDDM 同步拷贝等完成"的固定税
+                if (s->fence && s->h2d_async)
+                    // fence 异步 H2D（FARM_H2D_ASYNC=1 opt-in）：与 replay/D2H
+                    // 同流序保证正确性。**YGO fb64 实测回归 -17%**（PCIe 传输
+                    // 与图回放在同流上串行化；旧同步 memcpy 的 PCIe DMA 与
+                    // GPU 计算隐藏并行）——缺省=阻塞 memcpy 同步锚
                     return g_cu.MemcpyAsync(dst, src, bytes, 1, s->fence_stream) == 0;
                 return g_cu.Memcpy(dst, src, bytes, 1) == nullptr;
             };
@@ -1087,7 +1089,15 @@ private:
                 } else {
                     s->fence = false;
                 }
-                s->h2d_batch = s->fence
+                // H2D 异步入流（FARM_H2D_ASYNC=1）：**YGO fb64 实测回归 -17%**
+                // （PCIe 与图回放同流串行化；旧同步 memcpy 的 PCIe DMA 与 GPU
+                // 计算隐藏并行）——缺省阻塞 memcpy=同步锚正解，开关留档复测
+                s->h2d_async = s->fence
+                    && [] {
+                           const char* e = getenv("FARM_H2D_ASYNC");
+                           return e && *e && atoi(e) == 1;
+                       }();
+                s->h2d_batch = s->fence && s->h2d_async
                     && [] {
                            const char* e = getenv("FARM_H2D_BATCH");
                            return e && *e && atoi(e) == 1;
@@ -1095,7 +1105,9 @@ private:
                     && g_cu.MemcpyBatchAsync != nullptr;   // 符号缺席=回退逐输入
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3：fence 桥接启用"
                              "（H2D 同步锚+信号量完成通知）%s\n",
-                             s->h2d_batch ? "+批拷贝 H2D（FARM_H2D_BATCH=1）" : "");
+                             s->h2d_async ? "+H2D 异步（FARM_H2D_ASYNC=1，YGO 实测"
+                                           "回归档）"
+                                          : "");
             } else if (for_bank && AsyncEnvMode() == 1) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：实测判死（图=捕获不落"
                              "用户流 900；eager=逐位不确定 3 跑 3 指纹）——本会话"
