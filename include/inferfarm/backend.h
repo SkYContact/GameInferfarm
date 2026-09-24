@@ -82,6 +82,14 @@ public:
         (void)cfg; (void)slots; (void)for_bank; (void)spec_out;
         return nullptr;
     }
+
+    // 完成等待句柄（可选能力）：返回可被 WaitForMultipleObjects 等待的 OS
+    // 句柄（fence 桥接=完成信号量，每批恰一次释放），调度台据此做通知驱动
+    // 等待（零轮询零量子）；nullptr=仅支持轮询。
+    virtual void* CompletionWaitHandle(void* session) {
+        (void)session;
+        return nullptr;
+    }
 };
 
 } // namespace inferfarm

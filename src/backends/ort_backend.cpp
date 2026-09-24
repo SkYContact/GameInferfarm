@@ -205,6 +205,21 @@ struct HbAttr {
 };
 static_assert(sizeof(HbAttr) == 24, "cudaMemcpyAttributes 布局漂移");
 
+// fence 完成回调（cudaLaunchHostFunc；CUDA 回调线程执行）：只发 OS 信号量
+// ——回调内禁调 CUDA API（官方契约），ReleaseSemaphore 足够
+// fence 完成回调（cudaLaunchHostFunc；CUDA 回调线程执行）：置 done 旗标 +
+// 发 OS 信号量（唤醒 WMO 中的调度台）。回调内禁调 CUDA API（官方契约），
+// 两者皆合法；ctx=FenceCbCtx（会话销毁前必无未执行回调——收割先于销毁）
+struct FenceCbCtx {
+    void* sem = nullptr;
+    std::atomic<bool>* done = nullptr;
+};
+static void __stdcall FenceReleaseCb(void* p) {
+    FenceCbCtx* c = (FenceCbCtx*)p;
+    c->done->store(true, std::memory_order_release);
+    ReleaseSemaphore((HANDLE)c->sem, 1, nullptr);
+}
+
 static OrtStatusPtr FenceCreateKernel(const OrtCustomOp*, const OrtApi* api,
                                       const OrtKernelInfo*, void** kernel) {
     FenceKernelData* k = new FenceKernelData();
@@ -338,12 +353,17 @@ struct OrtSess {
     // 探测会话恒同步（LoadSpec 语义依赖同步 Run）。
     bool async = false;
     // fence 桥接（FARM_ORT_ASYNC=3）：fence kernel 是流探针（Compute 只登记
-    // ORT 内部流）；host 在 Run 提交后用该流做 D2H MemcpyAsync+EventRecord
-    // （图外常规异步操作）。确定性锚=H2D 同步 memcpy；收割=纯 EventQuery。
+    // ORT 内部流）；host 在 Run 提交后用该流做 D2H MemcpyAsync，再排
+    // LaunchHostFunc 让 CUDA 回调线程 ReleaseSemaphore——**完成=通知驱动**
+    // （零轮询零量子；调度台 WaitForMultipleObjects 直等信号量）。
+    // 确定性锚=H2D 同步 memcpy；银行单飞 ⇒ 信号量计数∈{0,1} 精确映射本批。
     // 认领在 Warmup（首跑 Compute 必已登记；CreateSession 后 kernel 未跑过）。
     bool fence = false;
     uint64_t fence_ticket = 0;
     void* fence_stream = nullptr;   // 认领自注册表的 ORT EP 统一流
+    void* fence_sem = nullptr;      // 完成信号量（Windows HANDLE；每批恰一次释放）
+    FenceCbCtx fence_cb_ctx{};      // 回调 ctx（sem + done 旗标指针）
+    std::atomic<bool> flight_done{false};   // 本批完成旗标（回调置位；CompletionReached 读）
     OrtCustomOpDomain* domain = nullptr;   // fence 域（ReleaseSession 后释放）
     // dep 三段分解累计（P1 仪器；调度台单线程写，打印即清零）
     unsigned long long dep_h2d_ns = 0, dep_run_ns = 0, dep_d2h_ns = 0;
@@ -394,6 +414,11 @@ public:
                                 bool for_bank, ModelSpec* spec_out) override {
         return CreateSession(cfg, slots, for_bank, spec_out);
     }
+    // 完成等待句柄（fence=v3 完成信号量；调度台 WMO 直等=通知驱动零轮询）
+    void* CompletionWaitHandle(void* session) override {
+        OrtSess* s = (OrtSess*)session;
+        return (s && s->fence) ? s->fence_sem : nullptr;
+    }
 
     bool Warmup(void* session) override {
         OrtSess* s = (OrtSess*)session;
@@ -436,15 +461,17 @@ public:
             if (!s->dml) g_cu.DeviceSynchronize();
         }
         // fence 认领+烟雾（FARM_ORT_ASYNC=3）：首跑 Compute 必已登记 ORT 流——
-        // 此刻持票认领，record→sync→query 验证整链（流指针合法+事件真盖章）。
-        // 失败（模型未打补丁/EP 回落 CPU）=回落同步，不等看门狗
+        // 此刻持票认领；烟雾=LaunchHostFunc 入流→等信号量（回调线程释放，
+        // 100ms 超时）验证整链。失败（模型未打补丁/EP 回落 CPU）=回落同步
         if (s->fence) {
             s->fence_stream = FenceTicketClaim(s->fence_ticket);
-            bool ok = s->fence_stream && g_cu.EventRecord && g_cu.EventQuery;
-            if (ok) ok = g_cu.EventRecord(s->event, s->fence_stream) == 0;
+            bool ok = s->fence_stream && g_cu.LaunchHostFunc && s->fence_sem;
+            if (ok)
+                ok = g_cu.LaunchHostFunc(s->fence_stream, &FenceReleaseCb,
+                                         &s->fence_cb_ctx) == 0;
             if (ok) {
+                ok = WaitForSingleObject(s->fence_sem, 100) == WAIT_OBJECT_0;
                 g_cu.DeviceSynchronize();
-                ok = g_cu.EventQuery(s->event) == 0;
             }
             if (!ok) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3 fence 认领/烟雾失败"
@@ -521,6 +548,7 @@ public:
         if (s->iob) a->ReleaseIoBinding(s->iob);
         if (s->ro) a->ReleaseRunOptions(s->ro);
         if (s->event && g_cu.EventDestroy) g_cu.EventDestroy(s->event);
+        if (s->fence_sem) CloseHandle(s->fence_sem);   // fence 完成信号量（Win32）
         // （=2 用户流与 fence 桥接的事件均 host 自建——此处统一销毁）
         if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
         for (auto& i : s->ins) if (i.val) a->ReleaseValue(i.val);
@@ -668,16 +696,20 @@ public:
             const long long dep_t2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             if (s->fence) {
-                // fence 桥接 v2：replay/eager 内核已提交到 ORT EP 统一流——D2H
-                // 前缀异步挂同流（流序=图内核之后 ⇒ 读到本批输出）+ 事件盖章。
-                // 图外常规异步操作，零捕获语义参与（v1 捕获窗内 record 判死）。
+                // fence 桥接 v3：replay/eager 内核已提交到 ORT EP 统一流——D2H
+                // 前缀异步挂同流，再排 LaunchHostFunc：流到达 D2H 之后时由
+                // CUDA 回调线程置完成旗标+ReleaseSemaphore（调度台 WMO 直等
+                // 信号量；零轮询零量子）。图外常规异步，零捕获语义参与。
+                s->flight_done.store(false, std::memory_order_relaxed);
                 for (size_t j = 0; j < s->outs.size(); j++)
                     if (g_cu.MemcpyAsync(s->outs[j].host, s->outs[j].dev,
                                          (size_t)s->last_n
                                              * (size_t)s->outs[j].meta.width * 4,
                                          2, s->fence_stream))
                         return false;
-                if (g_cu.EventRecord(s->event, s->fence_stream)) return false;
+                if (g_cu.LaunchHostFunc(s->fence_stream, &FenceReleaseCb,
+                                        &s->fence_cb_ctx))
+                    return false;
             }
             // P1 dep 三段分解（H2D/Run/D2H+盖章；接入方 1.4ms 黑盒定位仪器）
             {
@@ -727,11 +759,14 @@ public:
         if (seq < s->seq) return true;         // 旧序号（早已完成）
         if (s->synced_for_seq) return true;
         if (s->fence) {
-            // fence 桥接 v2：事件在 D2H 之后同流盖章——ready=前缀输出已驻留
-            // host arena（pinned 完成可见性）。纯查询，µs 级。
-            if (!g_cu.EventQuery || g_cu.EventQuery(s->event) != 0) return false;
-            s->synced_for_seq = true;
-            return true;
+            // fence 桥接 v3：done 旗标由 CUDA 回调线程置位（acquire 读见
+            // release 写 ⇒ 前缀输出已驻留 host arena）。WMO 唤醒消费信号量、
+            // 这里只读旗标——消费与状态分离，无计数竞态。
+            if (s->flight_done.load(std::memory_order_acquire)) {
+                s->synced_for_seq = true;
+                return true;
+            }
+            return false;
         }
         if (s->async) {
             // 零围栏：事件在 D2H 之后入流——查询完成=前缀输出已驻留 host
@@ -1039,12 +1074,21 @@ private:
                 // 事件族符号缺席=回落同步。
                 if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
                 s->fence = true;
-                s->h2d_batch = [] {
-                    const char* e = getenv("FARM_H2D_BATCH");
-                    return e && *e && atoi(e) == 1;
-                }() && g_cu.MemcpyBatchAsync != nullptr;   // 符号缺席=回退逐输入
+                s->fence_sem = CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
+                if (s->fence_sem) {
+                    s->fence_cb_ctx.sem = s->fence_sem;
+                    s->fence_cb_ctx.done = &s->flight_done;
+                } else {
+                    s->fence = false;
+                }
+                s->h2d_batch = s->fence
+                    && [] {
+                           const char* e = getenv("FARM_H2D_BATCH");
+                           return e && *e && atoi(e) == 1;
+                       }()
+                    && g_cu.MemcpyBatchAsync != nullptr;   // 符号缺席=回退逐输入
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3：fence 桥接启用"
-                             "（H2D 同步锚+图尾事件章）%s\n",
+                             "（H2D 同步锚+信号量完成通知）%s\n",
                              s->h2d_batch ? "+批拷贝 H2D（FARM_H2D_BATCH=1）" : "");
             } else if (for_bank && AsyncEnvMode() == 1) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：实测判死（图=捕获不落"
@@ -1116,12 +1160,15 @@ private:
         // fence 模式共用——fence 的事件在 Warmup 认领流后建）。失败=回落同步
         // （会话已建成，流无害留存）。
         if (s->async || s->fence) {
+            // RO（关 EP 同步）对 =2/=3 都必须；事件仅 =2 用户流通道用（=3 完成走
+            // fence 信号量，不再需要 CUDA 事件）
             if (a->CreateRunOptions(&s->ro)
                 || a->AddRunConfigEntry(s->ro,
                                         "disable_synchronize_execution_providers",
                                         "1")
-                || !g_cu.EventCreateWithFlags
-                || g_cu.EventCreateWithFlags(&s->event, 0x02)) {
+                || (s->async
+                    && (!g_cu.EventCreateWithFlags
+                        || g_cu.EventCreateWithFlags(&s->event, 0x02)))) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：RunOptions/Event 失败"
                              "——本会话回落同步路径\n");
                 if (s->ro) { a->ReleaseRunOptions(s->ro); s->ro = nullptr; }

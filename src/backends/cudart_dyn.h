@@ -47,6 +47,9 @@ struct Cudart {
     //                        numAttrs, stream)
     int (*MemcpyBatchAsync)(void* const*, const void* const*, const size_t*,
                             size_t, void*, size_t*, size_t, void*) = nullptr;
+    // 宿主函数入流（CUDA 10+；P1 决策延迟链通知驱动，可选符号）：流到达该点
+    // 时宿主回调执行（CUDA 回调线程）——回调内禁调 CUDA API，只发 OS 信号量
+    int (*LaunchHostFunc)(void*, void (*)(void*), void*) = nullptr;
 
     bool ok = false;
 
@@ -97,6 +100,7 @@ struct Cudart {
         MemcpyBatchAsync = (int (*)(void* const*, const void* const*, const size_t*,
                                     size_t, void*, size_t*, size_t, void*))
             g("cudaMemcpyBatchAsync");
+        LaunchHostFunc = (int (*)(void*, void (*)(void*), void*))g("cudaLaunchHostFunc");
         StreamIsCapturing = (int (*)(void*, int*))g("cudaStreamIsCapturing");
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
             || !StreamCreate || !StreamDestroy || !MemcpyAsync) {

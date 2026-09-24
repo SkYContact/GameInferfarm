@@ -119,6 +119,8 @@ struct BankScheduler::Impl {
     std::mutex mx;
     std::condition_variable cv;
     std::thread disp;
+    void* notify_sem = nullptr;          // WMO 通知信号量（spin=2；Notify 释放，
+                                         // 调度台 WMO 消费；Shutdown 兜底唤醒）
     std::atomic<bool> stop{false};
     std::atomic<bool> running{false};
     // init 握手（会话建在调度台线程上：ORT 图会话 PerThreadContext 铁律）
@@ -143,6 +145,9 @@ struct BankScheduler::Impl {
     void Notify() {
         std::lock_guard<std::mutex> lk(mx);
         cv.notify_all();
+#ifdef _WIN32
+        if (notify_sem) ReleaseSemaphore((HANDLE)notify_sem, 1, nullptr);   // spin=2 WMO 唤醒
+#endif
     }
 };
 
@@ -763,12 +768,21 @@ static void BankLoop(BankScheduler::Impl& I) {
             for (int i = 0; i < I.n_banks; i++)
                 if (I.banks[(size_t)i].state.load(std::memory_order_acquire) == BK_FLIGHT)
                     { any_flight = true; break; }
-            // ---- 等待策略（P1 决策延迟链改造，2026-09-24 接入方诊断）----
-            // spin 模式（FARM_BANK_SPIN=1）：有在飞或有填充银行时**不进 cv**——
+            // ---- 等待策略三模式（P1 决策延迟链 v3，2026-09-24 接入方诊断）----
             // cv.wait_for(0.1ms) 在 Windows 实为 1-1.3ms 定时器量子（判决3），
             // 每决策吃两次（完成检出+下批发车处理）= srv-lat 决策延迟链主项。
-            // 纯轮询=ScheduleSpin 式躲量子：调度台核心独烧（opt-in，专核语义）
-            // 换每决策省 2×量子。全闲才 cv 长等（不烧空核）。
+            //   0=关：原路（忙 0.1 / 闲 2ms 的 cv——量子税在）
+            //   1=纯自旋：busy 期不进 cv 纯轮询——延迟最优（实测 11.5×），
+            //     忙时独烧调度台核（opt-in 代价）
+            //   2=通知驱动（省核+同快）：WMO 等 [提交通知信号量 + 各在飞银行
+            //     完成信号量]——提交/完成谁来叫醒谁，零轮询零量子零烧核；
+            //     检出=回调延迟+唤醒（µs 级）。有轮询型在飞行（非 fence 后端）
+            //     → cv 0.1 回退（量子税同原路）
+            // 全闲一律回 cv 长等（不烧空核）。stop 有信号量唤醒+循环顶判断。
+            // **混合等待（EMA 预测 deadline+余量）判死拆除（判决17 全账）**：
+            // ①cv 睡眠段量子封底≈1ms ≥ fb 形状在飞时长；②EMA 把检测延迟吸进
+            // 预测=自毒正反馈（实测 5.5ms 劣于原路）；③余量段 SwitchToThread
+            // 把量子让给被服务的工人=饿死。勿再提案此族。
             bool has_fill = false;
             for (int g = 0; g < I.n_groups; g++)
                 if (I.fill_idx[g].load(std::memory_order_acquire) >= 0)
@@ -784,20 +798,6 @@ static void BankLoop(BankScheduler::Impl& I) {
                     cen->seg_iter_n.fetch_add(1, std::memory_order_relaxed);
                 }
             };
-            // ---- 等待策略（P1 决策延迟链，2026-09-24 接入方诊断+外部建议）----
-            // cv.wait_for(0.1ms) 在 Windows 实为 1-1.3ms 定时器量子（判决3），
-            // 每决策吃两次=决策延迟链主项。两模式：
-            //   0=关：原路（忙 0.1 / 闲 2ms 的 cv——量子税在）
-            //   1=纯自旋：busy 期不进 cv 纯轮询——延迟最优（实测 11.5×），
-            //     忙时独烧调度台核（opt-in 代价）
-            // 全闲一律回 cv 长等（不烧空核）。stop 由循环顶部判（自旋迭代快
-            // =停机延迟反而更低）。
-            // **混合等待（EMA 预测 deadline+余量）判死拆除（判决17 全账）**：
-            // ①cv 睡眠段量子封底≈1ms ≥ fb 形状在飞时长——省核版拿不到延迟；
-            // ②EMA 把检测延迟吸进预测=自毒正反馈（实测 srv-lat 5.5ms 劣于
-            //   原路）；③余量段 SwitchToThread 把量子让给被服务的工人=饿死。
-            // 真零量子零烧核的路=通知驱动（cudaLaunchHostFunc→信号量唤醒，
-            // 不睡不自旋）——路标。**勿用 SwitchToThread 当轮询节拍**（同案）。
             if (!I.spin || !busy) {
                 double wait_ms = any_flight ? 0.1 : 2.0;
                 for (int g = 0; g < I.n_groups; g++) {
@@ -807,8 +807,45 @@ static void BankLoop(BankScheduler::Impl& I) {
                     if (rem < wait_ms) wait_ms = rem;
                 }
                 cv_long_wait(wait_ms);
-            } else {
+            } else if (I.spin == 1) {
                 SpinPause();   // 纯轮询：量子彻底不沾，忙时独烧调度台核
+            } else {
+#ifdef _WIN32
+                // 通知驱动（spin=2）：WMO 等 [通知信号量 + 各在飞银行完成
+                // 信号量]——谁好了叫醒谁；银行 ≤32（kMax）+通知 1 ≤ 64 句柄限
+                HANDLE handles[2 + 32];
+                DWORD nh = 0;
+                bool all_waitable = true;
+                for (int i = 0; i < I.n_banks; i++) {
+                    BankCtl& b = I.banks[(size_t)i];
+                    if (b.state.load(std::memory_order_acquire) != BK_FLIGHT)
+                        continue;
+                    void* h = b.be->CompletionWaitHandle(b.sess);
+                    if (!h) { all_waitable = false; break; }   // 轮询型在飞行→cv 回退
+                    handles[(size_t)nh++] = (HANDLE)h;
+                }
+                if (I.notify_sem) handles[(size_t)nh++] = (HANDLE)I.notify_sem;
+                if (all_waitable && nh >= 2) {
+                    double timeout_ms = 2000.0;   // 兜底（stop 有信号量、窗有超时）
+                    for (int g = 0; g < I.n_groups; g++) {
+                        if (!window_open[g]) continue;
+                        double remw = (window_t0[g] + window_ms) - NowMsD();
+                        if (remw < 0.02) remw = 0.02;
+                        timeout_ms = (std::min)(timeout_ms, remw);
+                    }
+                    const long long tw0 = cen && cen->on ? NowNsI() : 0;
+                    WaitForMultipleObjects(nh, handles, FALSE, (DWORD)timeout_ms);
+                    if (cen && cen->on) {
+                        cen->seg_wait_ns.fetch_add(NowNsI() - tw0, std::memory_order_relaxed);
+                        cen->seg_iter_ns.fetch_add(NowNsI() - it0, std::memory_order_relaxed);
+                        cen->seg_iter_n.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    cv_long_wait(0.1);   // 混合农场有轮询型在飞行 → 原量子路
+                }
+#else
+                SpinPause();   // 非 Windows：纯轮询回退（fence 通道暂未上 POSIX）
+#endif
             }
         }
     }
@@ -869,6 +906,9 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     I.cen = cen_;
     I.cfg = cfg;
     I.spin = cfg.spin;
+#ifdef _WIN32
+    I.notify_sem = CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
+#endif
     I.spec = *spec_out;   // 由 Farm 预先 LoadSpec 并核各组结构一致
     *spec_out = I.spec;
     for (int g = 0; g < Impl::kMaxGrp; g++) I.fill_idx[g].store(-1);
@@ -1009,12 +1049,14 @@ void BankScheduler::Shutdown() {
         I.stop.store(true);
         I.cv.notify_all();
     }
+    if (I.notify_sem) ReleaseSemaphore(I.notify_sem, 1, nullptr);   // 唤醒 WMO
     if (I.disp.joinable()) I.disp.join();
     for (auto& b : I.banks)
         if (b.sess) {
             b.be->DestroySession(b.sess);
             b.sess = nullptr;
         }
+    if (I.notify_sem) { CloseHandle(I.notify_sem); I.notify_sem = nullptr; }
     delete impl_;
     impl_ = nullptr;
     banks_ = 0;
