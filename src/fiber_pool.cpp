@@ -6,6 +6,7 @@
 // 栈=PE 默认（与 std::thread 同源）。纤程切换本身 ns 级（实测口径）。
 #include "inferfarm/fiber_pool.h"
 #include "inferfarm/census.h"
+#include <cassert>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -34,6 +35,8 @@ struct FiTask {                         // 一局一 fiber
     int worker = 0;                     // 亲和工人（点火定终身，不迁移）
     void* sched = nullptr;              // 工人主 fiber（让出的回归目标）
     bool finished = false;              // fiber 体收尾置位（工人侧收卷判据）
+    bool queued = false;                // debug：已在就绪队列（投递-挂起不变量：
+                                        // 双重投递断言；w.mx 内读写=无竞争）
     uint64_t ts_post = 0;               // census：投递时刻（µs；w.mx 护送建立
                                         // happens-before，取走侧读）
 };
@@ -58,6 +61,7 @@ struct FiberPoolState {
 };
 static FiberPoolState g_fps;
 static thread_local FiTask* t_fi_task = nullptr;   // 本工人当前局（等待侧桥取 cookie）
+static thread_local int t_nosuspend = 0;           // 契约 1 断言计数（ScopedNoSuspend）
 
 // ---------------- 等待侧桥（银行层/任何等待点调用）----------------
 void* FiberCurrent() { return t_fi_task; }
@@ -66,13 +70,16 @@ void FiberSuspend() {
     // 让出：Switch 回本工人调度器（恢复点=FiberPost 投递后工人再切入；
     // 恢复即结果就绪——收割侧先拷输出后投递）
     if (!t_fi_task) return;   // 线程腿误调=无操作（防御）
+    assert(t_nosuspend == 0);   // 契约 1：advance/assemble 作用域内挂起=适配器违约
     if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnSuspend();
     SwitchToFiber(t_fi_task->sched);
     // 恢复点：工人取走时已把状态翻回 RUNNING（见工人循环取走处）
 }
 
 void FiberPost(void* cookie) {
-    // 收割侧投递：该局 fiber 进其所属工人的就绪队列+唤醒（唤醒队列本体）
+    // 收割侧投递：该局 fiber 进其所属工人的就绪队列+唤醒（唤醒队列本体）。
+    // 投递-挂起不变量见 fiber_pool.h——此处断言防双重投递（目标尚未被取走
+    // 时二次 Post=它会恢复两次=逻辑错）。
     FiTask* t = (FiTask*)cookie;
     if (g_fps.cen && g_fps.cen->on) {
         g_fps.cen->OnPost(t->ts_post);   // WAIT→READY + 投递时刻
@@ -81,10 +88,16 @@ void FiberPost(void* cookie) {
     FiWorker& w = g_fps.fiw[(size_t)t->worker];
     {
         std::lock_guard<std::mutex> lk(w.mx);
+        assert(!t->queued);   // debug：同一 fiber 不得在队列中挂两条
+        t->queued = true;
         w.ready.push_back(t);
     }
     w.cv.notify_one();
 }
+
+// ---------------- 契约 1 机器校验（作用域内挂起=断言）----------------
+ScopedNoSuspend::ScopedNoSuspend() { ++t_nosuspend; }
+ScopedNoSuspend::~ScopedNoSuspend() { --t_nosuspend; }
 
 // ---------------- fiber 体与点火 ----------------
 static void FiSpawnGame(FiChain* ch, int gi, int wid);
@@ -174,6 +187,7 @@ static void FiWorkerLoop(int wid, Census* cen) {
             if (w.ready.empty()) break;   // stop 且队列空：收工
             t = w.ready.front();
             w.ready.pop_front();
+            t->queued = false;   // debug 旗标：出队（FiberPost 断言的另一半）
         }
         const uint64_t t_run0 = con ? Census::NowUs() : 0;
         if (con) {

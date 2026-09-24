@@ -9,16 +9,37 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
-#include <intrin.h>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
 namespace inferfarm {
+
+// 自旋等待原语（x86=PAUSE 指令；其余平台退化为让出——收口 POSIX 编译面，
+// 语义不变：完成旗标轮询的读侧减速）
+static inline void SpinPause() {
+#if defined(_MSC_VER)
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+// 自旋/诊断节拍（原 4000/0x3FFFF 魔法数命名；来源=本机扫描：短自旋覆盖
+// 调度台 µs 级还池的绝大多数，溢出才走挂起路径）
+static constexpr int kClaimSpins = 4000;        // Claim 短自旋上限
+static constexpr long long kDrainDiagMask = 0x3FFFF;   // drain 长等诊断打印分频
+static constexpr int kInlineSpinBeforeYield = 4000;    // inline 完成等待转让出
 
 static double NowMsD() {
     return std::chrono::duration<double, std::milli>(
@@ -38,10 +59,12 @@ struct BankDone {
 };
 
 struct BankReq {
+    // 输出申报上限（与 BankScheduler::kMaxOutputDests 一致；超过=失败完成）
+    static constexpr int kMaxDests = BankScheduler::kMaxOutputDests;
     int bank = 0, slot = 0;
     void* fiber = nullptr;               // Fiber cookie（fiber 腿）
     BankDone* ldone = nullptr;           // 线程腿等待块（栈上，收割侧回填）
-    OutputDest dests[8];                 // 输出投递目的地（收割侧拷贝）
+    OutputDest dests[kMaxDests];         // 输出投递目的地（收割侧拷贝）
     int n_dests = 0;
     double t0 = 0;
 };
@@ -60,7 +83,14 @@ struct BankCtl {
     std::atomic<int> inflight{0};        // 在途写手（领号前 +1 / 行写完 -1）
     std::atomic<int> state{BK_POOL};
     std::vector<BankReq*> reqs;          // 槽→req（commit 前登记；null=作废槽）
-    // 在途航班（单发=线性生命周期）
+    std::vector<BankReq> req_pool;       // 槽→req 对象池（与 reqs 一一对应；init
+                                         // 期一次分配——req 与槽一一独占：领号
+                                         // 串行发号+银行线性生命周期 ⇒ 同槽同时
+                                         // 至多一个活 req，无需堆分配）
+    // 在途航班（单发=线性生命周期）。非原子字段，同步边=state：
+    // 写侧（发车者）先写 flight_* 再 state.store(FLIGHT, release)；
+    // 读侧（收割）state.load(FLIGHT, acquire) 后读——release/acquire 配对。
+    // 发射失败分支不复位：字段仅在 FLIGHT 态被读，回池后下批发车前重写。
     unsigned flight_seq = 0;
     int flight_n = 0;
     double flight_t0 = 0;
@@ -130,7 +160,7 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
         b_out = fi;
         s_out = v;
         // 全行清零（零基契约）：未写区与"零垫基线"逐位同——适配器的清零类
-        // 组装（bc71_clear_zone 式高水位清零）依赖"行起点为零"。
+        // 组装（高水位清零式）依赖"行起点为零"。
         {
             const long long tz0 = I.cen && I.cen->on ? NowNsI() : 0;
             for (size_t i = 0; i < I.spec.ins.size(); i++) {
@@ -149,18 +179,23 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
                                   // notify_all 风暴——高行速时调度台被叫醒风暴拖垮）
         return true;
     };
-    for (int spin = 0; spin < 4000; spin++) {   // 先短自旋：调度台通常 µs 级还池
+    for (int spin = 0; spin < kClaimSpins; spin++) {   // 先短自旋：调度台通常 µs 级还池
         if (try_claim(bank, slot)) {
             if (I.cen && I.cen->on)
                 I.cen->claim_spin_ns.fetch_add(NowNsI() - ts0, std::memory_order_relaxed);
             return true;
         }
-        _mm_pause();
+        SpinPause();
     }
     if (I.cen && I.cen->on)
         I.cen->claim_spin_ns.fetch_add(NowNsI() - ts0, std::memory_order_relaxed);
     // 池空背压：fiber 腿登记 cookie（还池/轮转时 FiberPost 投回）；线程腿 cv 等。
     // 等银行数入 waiting（[bank] 行 waiting 列=背压观测）。
+    // ⚠ 投递-挂起不变量（FiberPost 契约，fiber_pool.h）：登记→FiberSuspend 之间
+    // 若调度台已把本 fiber 投回（BankTryRotate 的 wake swap 发生在此窗口），
+    // 投递只是把 cookie 挂进就绪队列——本 fiber 随后的 FiberSuspend 被该记录
+    // 唤醒=恰好一次恢复，不存在双重调度。前提=登记后无条件挂起（中途 return
+    // =工人重复切入已收卷 fiber=UAF——两条登记点[此处/waiters 池]均满足）。
     for (;;) {
         const long long tp0 = I.cen && I.cen->on ? NowNsI() : 0;
         if (try_claim(bank, slot)) return true;
@@ -206,13 +241,16 @@ bool BankScheduler::SetPopulation(int bank, const char* pop_input, const void* h
 }
 
 // ---------------- 提交与收割 ----------------
+// 失败完成：fiber 腿 SwitchToFiber 全序免锁；线程腿 fail/done 同锁内置位
+// （等待方锁内读——不依赖跨锁程序顺序）
 static void BankFailComplete(BankReq* r) {
-    r->ldone->fail = true;
     if (r->fiber) {
+        r->ldone->fail = true;
         FiberPost(r->fiber);
     } else {
         {
             std::lock_guard<std::mutex> lk2(r->ldone->mx);
+            r->ldone->fail = true;
             r->ldone->done = true;
         }
         r->ldone->cv.notify_one();
@@ -236,15 +274,24 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
         I.Notify();
         return false;
     }
+    if (n_dests > BankReq::kMaxDests) {
+        // 申报超额：失败完成（判负纪律）。静默截断=把缺失输出当有效结果——
+        // 绝不。占额照减（本槽视为完工；reqs 槽位未登记，发车按作废槽跳过）。
+        std::fprintf(stderr, "[bank] SubmitWait n_dests=%d > 容量 %d ——本前向失败"
+                     "（适配器申报违约；占额已代减，勿再 Abandon 本槽）\n",
+                     n_dests, BankReq::kMaxDests);
+        std::fflush(stderr);
+        b.inflight.fetch_sub(1, std::memory_order_acq_rel);
+        I.Notify();
+        return false;
+    }
     const long long ts0 = I.cen && I.cen->on ? NowNsI() : 0;
-    BankReq* r = new BankReq();
+    BankReq* r = &b.req_pool[(size_t)slot];   // 槽独占对象池（init 期一次分配）
+    *r = BankReq{};
     r->bank = bank;
     r->slot = slot;
-    if (n_dests > 8)
-        std::fprintf(stderr, "[bank] SubmitWait n_dests=%d 超容量 8——截断"
-                     "（OutputDest 上限=BankReq::dests[8]）\n", n_dests);
-    for (int i = 0; i < n_dests && i < 8; i++) r->dests[i] = dests[i];
-    r->n_dests = n_dests < 8 ? n_dests : 8;
+    for (int i = 0; i < n_dests; i++) r->dests[i] = dests[i];
+    r->n_dests = n_dests;
     r->t0 = NowMsD();
     BankDone done;
     r->ldone = &done;
@@ -259,8 +306,8 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
         b.inflight.fetch_sub(1, std::memory_order_acq_rel);
         done.fail = true;   // 等待者=调用者本人且仍在运行——直接置败，绝不
                             // FiberPost 自己（会把在跑的 fiber 投进就绪队列
-                            // =双重调度/UAF；投递只留给真正挂起的写手）
-        delete r;
+                            // 而本 fiber 不再挂起=工人重复切入已收卷 fiber
+                            // =UAF；投递只留给真正挂起的写手）
         return false;
     }
     b.reqs[(size_t)slot] = r;                               // 登记（先于完工信号）
@@ -307,6 +354,9 @@ void BankScheduler::Abandon(int bank, int slot) {
 // 收割：完成旗标到（=输出已驻留主机）→ 逐 req 拷输出+回投 → 还池。
 // **拷贝承重**：还池先于游戏恢复（新批可能立即复用槽行/输出 arena），
 // 适配器不得直读银行内存——dests 缓冲收割侧回填。
+// ldone 生命周期=SubmitWait 栈对象：本函数先回填后投递，协议保证 SubmitWait
+// 未返回前回填完成（加超时/取消路径须先改本协议——bank.h Shutdown 前置条件）。
+// req 对象=银行槽池所有（req_pool），此处只摘链不回收。
 static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
     for (int s = 0; s < b.flight_n; s++) {
         BankReq* r = b.reqs[(size_t)s];
@@ -317,22 +367,23 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
             int w = b.be->OutputWidth(b.sess, od.name);
             if (w <= 0 || !od.dst) continue;
             const float* src = b.be->OutputRow(b.sess, od.name, s);
-            int cn = w < od.n ? w : od.n;
+            int cn = w < od.n ? w : od.n;   // od.n=调用方申报的 dst 容量（负值/空
+                                            // 指针此行跳过——min(模型行宽, 容量)）
             if (src && cn > 0) memcpy(od.dst, src, sizeof(float) * (size_t)cn);
         }
-        r->ldone->fail = false;
         if (r->fiber) {
+            r->ldone->fail = false;   // fiber 腿：SwitchToFiber 全序免锁
             FiberPost(r->fiber);
         } else {
             {
                 std::lock_guard<std::mutex> lk2(r->ldone->mx);
+                r->ldone->fail = false;
                 r->ldone->done = true;
             }
             r->ldone->cv.notify_one();
         }
         if (I.cen) I.cen->OnPipeDone(1);   // W 拆账：回信出账
         I.lat.push_back(NowMsD() - r->t0);
-        delete r;
     }
     I.gpu_busy_sum += NowMsD() - b.flight_t0;
     // 还池（线性生命周期；mx 护——满座自驱路径也可能回池；按组还）
@@ -382,7 +433,7 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     double drain_t0 = NowMsD();
     for (long long spins = 0;; spins++) {
         if (b.inflight.load(std::memory_order_acquire) == 0) break;
-        if ((spins & 0x3FFFF) == 0x3FFFF) {   // 低频诊断（~每 5ms 一次）
+        if ((spins & kDrainDiagMask) == kDrainDiagMask) {   // 低频诊断（~每 5ms 一次）
             double waited = NowMsD() - drain_t0;
             if (waited > 2.0) {
                 std::printf("[bank] drain 长等 %.1fms: bank=%d inflight=%d cursor=%d "
@@ -392,7 +443,7 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
                 std::fflush(stdout);
             }
         }
-        _mm_pause();
+        SpinPause();
     }
     I.drain_us.fetch_add((long long)((NowMsD() - drain_t0) * 1000.0));
     int n = b.cursor.load(std::memory_order_acquire);
@@ -416,7 +467,6 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
             if (!r) continue;
             BankFailComplete(r);
             if (I.cen) I.cen->OnPipeDone(1);
-            delete r;
         }
         b.state.store(BK_POOL, std::memory_order_release);
         std::lock_guard<std::mutex> lk(I.mx);
@@ -466,10 +516,16 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
 // ---------------- 调度台 ----------------
 // 事件驱动+短轮询（在途时 200µs 兜底叫醒——完成旗标无中断，只轻轮询）。
 static void BankLoop(BankScheduler::Impl& I) {
+#ifdef _WIN32
     if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
         std::fprintf(stderr, "[bank] 调度台 SetThreadPriority 失败 GLE=%lu（继续，"
                      "仅性能层面影响）\n", GetLastError());
     if (I.cen) I.cen->tid_disp = GetCurrentThreadId();
+#else
+    // POSIX：调度台优先级提升收口为 no-op（性能面，非正确性；tid 表=Windows
+    // 普查通道，非 Windows 记 0）
+    if (I.cen) I.cen->tid_disp = 0;
+#endif
     double window_ms = I.cfg.window_ms;
     if (window_ms < I.cfg.window_floor) window_ms = I.cfg.window_floor;
     double window_t0[BankScheduler::Impl::kMaxGrp] = {0};
@@ -652,6 +708,9 @@ bool BankScheduler::Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSp
     g.be = primary_be_;
     g.model = mcfg;
     g.banks = cfg.banks;
+    if (spec_out) g.spec = *spec_out;   // 便捷路径同组规格（组 slots=0=统一形状；
+                                        // 缺此行会被 InitGroups 的 spec.slots
+                                        // ≠cfg.slots 校验拒绝——旧坑）
     return InitGroups(cfg, std::vector<BankGroupCfg>{g}, spec_out);
 }
 
@@ -725,6 +784,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 b.inflight.store(0);
                 b.state.store(BK_POOL);
                 b.reqs.assign((size_t)gslots, nullptr);
+                b.req_pool.resize((size_t)gslots);   // 槽独占 req 对象池（一次分配）
             }
         }
         int built = id;
@@ -853,12 +913,24 @@ bool InlineRunner::Run(GameAdapter* g) {
         void* row = s_->be->InputRow(s_->sess, s_->spec->ins[i].name.c_str(), 0, &rb);
         if (row) memset(row, 0, rb);
     }
-    OutputDest dests[8];
-    int nd = g->CollectOutputs(dests, 8);
+    OutputDest dests[BankScheduler::kMaxOutputDests];
+    int nd = g->CollectOutputs(dests, BankScheduler::kMaxOutputDests);
+    if (nd > BankScheduler::kMaxOutputDests) {
+        // 适配器违约（契约=返回条数 ≤cap）：截断而非越界读，判负交上层
+        std::fprintf(stderr, "[inline] CollectOutputs 返回 %d > cap %d——截断"
+                     "（适配器违约）\n", nd, BankScheduler::kMaxOutputDests);
+        nd = BankScheduler::kMaxOutputDests;
+    }
     g->AssembleInto(s_->writer);
     unsigned seq = 0;
     if (!s_->be->SubmitBatch(s_->sess, s_->spec->slots, seq)) return false;
-    while (!s_->be->CompletionReached(s_->sess, seq)) _mm_pause();
+    long long spins = 0;
+    while (!s_->be->CompletionReached(s_->sess, seq)) {
+        // 短自旋+溢出让出：完成旗标轮询语义不变（结果与让出无关），inline
+        // 模式不再烧满一个核
+        if (++spins <= kInlineSpinBeforeYield) SpinPause();
+        else std::this_thread::yield();
+    }
     s_->be->CompletionFence();
     for (int d = 0; d < nd; d++) {
         int w = s_->be->OutputWidth(s_->sess, dests[d].name);

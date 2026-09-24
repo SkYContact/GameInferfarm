@@ -373,11 +373,18 @@ CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
 
 bool Farm::DriveDecision(GameAdapter* g, int grp) {
     if (bank_) {
-        OutputDest dests[8];
-        int nd = g->CollectOutputs(dests, 8);
+        OutputDest dests[BankScheduler::kMaxOutputDests];
+        int nd = g->CollectOutputs(dests, BankScheduler::kMaxOutputDests);
+        if (nd > BankScheduler::kMaxOutputDests) {
+            // 适配器违约（契约=返回条数 ≤cap）：截断防越界读，失败交判负纪律
+            std::fprintf(stderr, "[farm] CollectOutputs 返回 %d > cap %d——截断"
+                         "（适配器违约）\n", nd, BankScheduler::kMaxOutputDests);
+            nd = BankScheduler::kMaxOutputDests;
+        }
         int bk = -1, sl = -1;
         if (!bank_->Claim(bk, sl, grp)) return false;
-        // 组装直写槽（GameAdapter 契约 1：此处无挂起点——drain 有界的前提）
+        // 组装直写槽（GameAdapter 契约 1：此处无挂起点——drain 有界的前提；
+        // ScopedNoSuspend=debug 断言把契约变成机器校验）
         struct BankWriter : SlotWriter {
             BankScheduler* bank = nullptr;
             int b = 0, s = 0;
@@ -388,7 +395,10 @@ bool Farm::DriveDecision(GameAdapter* g, int grp) {
         w.bank = bank_;
         w.b = bk;
         w.s = sl;
-        g->AssembleInto(w);
+        {
+            ScopedNoSuspend ns;
+            g->AssembleInto(w);
+        }
         // 推理缓存（判决13）：键=本槽全输入行字节+权重代次。命中=Abandon
         // 弃槽（协议原生路径：作废槽+完工照减+发车跳过）+逐字节回放 dests；
         // 未命中=正常 SubmitWait，收割后从 dests 采录（n 全宽重放语义）。
@@ -450,7 +460,10 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
     bool infer_fail = false;
     for (long long guard = 0; guard < cfg_.max_decisions; guard++) {
         if (g->IsDone()) break;
-        if (!g->AdvanceToDecision()) break;
+        {   // 契约 1（advance 无挂起点）的机器校验作用域
+            ScopedNoSuspend ns;
+            if (!g->AdvanceToDecision()) break;
+        }
         dec++;
         if (!DriveDecision(g, grp)) {
             g->OnInferFail();   // 判负纪律：不静默重试（会撕裂确定性）

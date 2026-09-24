@@ -61,6 +61,10 @@ struct BankGroupCfg {
 
 class BankScheduler {
 public:
+    // 输出申报上限（=SubmitWait/CollectOutputs 的 dests 容量；超过=本前向
+    // 失败完成，绝不静默截断——截断=把缺失输出当有效结果）
+    static constexpr int kMaxOutputDests = 8;
+
     BankScheduler() = default;
     // 单组绑定（Farm 传入后端；多设备组形态见 InitGroups——组自带后端）
     void Bind(InferBackend& be, Census* cen) { primary_be_ = &be; cen_ = cen; }
@@ -93,7 +97,9 @@ public:
     // 组装兜底拷贝：小输入从临时缓冲拷进槽行+行尾清零（YGO 的 scal/act_code
     // 后补路径；dst=Row(name)；rb<bytes 时补零）。
     // 提交+等待：登记 dests → inflight--（完工信号）→ 满座自驱判定 →
-    // fiber 让出/cv 等 → 恢复即输出已拷进 dests。false=本前向判负纪律。
+    // fiber 让出/cv 等 → 恢复即输出已拷进 dests。false=本前向判负纪律
+    // （含 n_dests>kMaxOutputDests 超额申报：失败完成，占额已代减——调用方
+    // 此后不得再 Abandon 本槽，与协议防御分支同约定）。
     // ⚠ 组装与提交之间不得有挂起点（drain 有界的前提）。
     bool SubmitWait(int bank, int slot, const OutputDest* dests, int n_dests);
     // 弃槽（异常路径）：作废槽（发车跳过）+完工照减（drain 不堵）
@@ -116,6 +122,38 @@ private:
     InferBackend* primary_be_ = nullptr;   // 单组兼容（Init 老路径）
     Census* cen_;
     ModelSpec spec_;
+};
+
+// 槽守卫：把"Claim 成功后必须恰好走一次 SubmitWait 或 Abandon"从纪律变成
+// 类型（armed 析构=自动 Abandon，完工照减——防"领槽后中途 return/异常 →
+// inflight 漏减 → close-drain 永堵"）。用法：
+//   BankSlotGuard guard(*bank, bk, sl);            // Claim 成功后立即构造
+//   ... 组装/缓存查询（此处抛出/提前返回也安全）...
+//   bool ok = bank->SubmitWait(bk, sl, dests, n);  // 失败也安全（占额已代减）
+//   guard.release();                               // 提交或显式 Abandon 后解除
+// ⚠ 提交/弃槽完成后必须 release()——二次 Abandon 会把 inflight 减成负数。
+class BankSlotGuard {
+public:
+    BankSlotGuard() = default;
+    BankSlotGuard(BankScheduler& bank, int bk, int sl)
+        : bank_(&bank), bk_(bk), sl_(sl), armed_(true) {}
+    BankSlotGuard(BankSlotGuard&& o) noexcept
+        : bank_(o.bank_), bk_(o.bk_), sl_(o.sl_), armed_(o.armed_) {
+        o.armed_ = false;
+    }
+    BankSlotGuard(const BankSlotGuard&) = delete;
+    BankSlotGuard& operator=(const BankSlotGuard&) = delete;
+    BankSlotGuard& operator=(BankSlotGuard&&) = delete;
+    ~BankSlotGuard() {
+        if (armed_ && bank_) bank_->Abandon(bk_, sl_);
+    }
+    void release() { armed_ = false; }
+    bool armed() const { return armed_; }
+
+private:
+    BankScheduler* bank_ = nullptr;
+    int bk_ = -1, sl_ = -1;
+    bool armed_ = false;
 };
 
 // inline 模式运行器：单会话+互斥，整批照发（fb 行，垃圾行无害），读 row0。

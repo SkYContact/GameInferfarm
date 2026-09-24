@@ -27,9 +27,30 @@ class Census;
 //   Current(): 当前在对局 fiber 上 → 返回其 cookie；否则 nullptr（线程腿）。
 //   Suspend(): 对局 fiber 内让出（Switch 回所属工人调度器）。
 //   Post():    收割侧投递——该局 fiber 进其所属工人的就绪队列+唤醒。
+//
+// ⚠ Post 投递-挂起不变量（并发正确性的承重前提，2026-09-24 审计定案）：
+// Post 允许投递**仍在运行**的 fiber（登记→挂起窗口内被投回=合法路径，如
+// Claim 等池登记后调度台先轮转）——投递只是把 cookie 挂进就绪队列；该
+// fiber 随后**恰一次** Suspend 时被该记录唤醒=恰好一次恢复，不存在双重
+// 调度。对应义务：**Post 之后目标 fiber 必须恰好挂起一次**（登记后中途
+// return/跑完收卷=工人重复切入已收卷 fiber=UAF）。SubmitWait 的协议防御
+// 分支"绝不 FiberPost 自己"正是这条义务的执行点。debug 构建对双重投递
+// 加断言（queued 旗标）。
 void* FiberCurrent();
 void FiberSuspend();
 void FiberPost(void* cookie);
+
+// 契约 1 的机器校验（GameAdapter："advance 与 assemble 无挂起点"）：
+// 作用域内任何 FiberSuspend=debug 断言失败（框架在 AdvanceToDecision/
+// AssembleInto 调用点包裹）。Release 构建=计数器照走、断言编译出局（两次
+// thread_local 自增/决策，ns 级）——"高质量契约文档"升级为"机器校验契约"。
+class ScopedNoSuspend {
+public:
+    ScopedNoSuspend();
+    ~ScopedNoSuspend();
+    ScopedNoSuspend(const ScopedNoSuspend&) = delete;
+    ScopedNoSuspend& operator=(const ScopedNoSuspend&) = delete;
+};
 
 // 局主体：运行一局（内部可任意 FiberSuspend）；返回时局已收卷。
 // 参数：chain=链号，game=链内局号，user=RunLeg 传入的原样指针。
