@@ -158,3 +158,15 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   付一次，恰是 refit-jobs 要消灭的）。物理面 Init 烧死不可动；population 模式
   链数派生拒改。G12 门：热调续腿=新鲜农场同形状逐位同（含指纹）+非法拒绝。
   回接方清单循环形态：SetLegShape(作业形) → RefitWeights(blob) → RunLeg。
+
+## 真模型门矩阵补全（2026-09-24）
+- 烤制 `models/gomoku_mlp.fb8.trt`（tensorrt 10.16.1 python 包，TF32 关，
+  引擎 0.3MB；本地工件不入库——TRT engine 机器相关，缺失=门自动 SKIP）。
+- **R2 trt**：银行腿+复跑+银行 vs inline 三重逐位全绿（银行 515 / inline
+  647 局/s，共享 GPU 时段读数仅供参考）。
+- **R3 跨后端**：ort vs trt 指纹逐位一致 `a3535388ff95061c`——与本账本
+  早前记录跨日跨会话复现（fp32+TF32 关的强性质第三次成立）。
+- **R5 批次/位置不变性门**：ort 与 trt 双后端全绿——批大小 n=1/3/满与
+  行位置变化下逐位同。至此 G13/R5 家族在 cpu/ort/trt 三后端全部实证，
+  "batch invariance"从声明变成三后端被守住的契约。
+- 真模型可选门矩阵现状：R1/R2/R3/R5 全绿；R4（cuda+dml 异构）待双卡环境。
