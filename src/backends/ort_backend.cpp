@@ -609,6 +609,12 @@ public:
             auto h2d = [&](void* dst, const void* src, size_t bytes) {
                 if (s->async)
                     return g_cu.MemcpyAsync(dst, src, bytes, 1, s->stream) == 0;
+                if (s->fence)
+                    // fence v4（P1 下一刀，2026-09-24 接入方定案）：H2D 异步
+                    // 入 EP 流——与 replay/D2H/hostfunc 同流序=正确性锚（数据
+                    // 先于内核、宿主改写先于异步拷贝全由流序保证），dep 里
+                    // 剔除"WDDM 同步拷贝等完成"的固定税
+                    return g_cu.MemcpyAsync(dst, src, bytes, 1, s->fence_stream) == 0;
                 return g_cu.Memcpy(dst, src, bytes, 1) == nullptr;
             };
             // population 脏旗（演化路由，判决16）：代际换权重后的单次全量 H2D

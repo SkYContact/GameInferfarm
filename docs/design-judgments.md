@@ -329,3 +329,11 @@ srv-lat 5.5ms 稳定劣化）；③余量段 SwitchToThread 把量子让给被�
 检出≈回调延迟）——但需重构调度台等待面为多对象等待（Windows 语义），
 挂路标。现存格局：FARM_BANK_SPIN=1（推荐，独烧一核买 11.5× srv-lat）
 / 0（缺省）。**勿再提案 EMA/余量/SwitchToThread 族——三死因已实测。**
+
+**fence v4：H2D 异步入 EP 流（同日，接入方"下一刀"定案兑现）**：h2d 由
+阻塞 cudaMemcpy 改 MemcpyAsync 入 EP 统一流——同流序 H2D→replay→D2H→
+hostfunc=正确性锚（宿主改写先于异步拷贝由流序+收割序保证）。dep 三段
+实测：h2d 0.03→0.014ms、总 dep≈0.055ms/批——正中接入方预测（~0.05）。
+R6 全绿含跨通道逐位主门。banks 流数轴顺带实测（slots=8）：banks 4≈2
+（流数 4→2 无损失）、banks=1 掉 30%（重叠不足）——fb8 形状 2 流即饱和；
+YGO fb64 形状的流数/HAGS 扫描待配套工件。
