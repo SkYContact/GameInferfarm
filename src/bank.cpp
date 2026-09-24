@@ -120,6 +120,10 @@ struct BankScheduler::Impl {
     int init_rc = 0;                     // 0=进行中 1=ok -1=fail
     // 统计（收割/打印=调度台独占；发车计数=原子（写手自驱/调度台双源））
     std::vector<double> lat;
+    std::vector<int> bsz;                // 批大小样本（发车侧记；分布=稀释定律
+                                         // 的测量面：p10 深度稀批即到达率绑定）
+    std::vector<double> fl_ms;           // 每批在飞时长样本（发车→收割；围栏税
+                                         // 与批延迟的分布面，均值 gpu_flight 之外）
     double stat_t0 = 0, gpu_busy_sum = 0;
     std::atomic<long long> dep_us{0};
     std::atomic<long long> drain_us{0};
@@ -386,6 +390,10 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         I.lat.push_back(NowMsD() - r->t0);
     }
     I.gpu_busy_sum += NowMsD() - b.flight_t0;
+    // 批大小/在飞时长样本：记在收割侧（BankHarvest 恒在调度台线程=与 lat 同源
+    // 独占；勿移到发车侧——BankDrainSubmit 有写手自驱路径，plain vector 会竞争）
+    I.bsz.push_back(b.flight_n);
+    I.fl_ms.push_back(NowMsD() - b.flight_t0);
     // 还池（线性生命周期；mx 护——满座自驱路径也可能回池；按组还）
     b.state.store(BK_POOL, std::memory_order_release);
     {
@@ -624,6 +632,14 @@ static void BankLoop(BankScheduler::Impl& I) {
         // ---- 汇报（每 300 个回信一行）----
         if ((int)I.lat.size() >= 300) {
             std::sort(I.lat.begin(), I.lat.end());
+            std::sort(I.bsz.begin(), I.bsz.end());
+            std::sort(I.fl_ms.begin(), I.fl_ms.end());
+            auto pct = [](const std::vector<int>& v, double p) -> double {
+                return v.empty() ? 0.0 : (double)v[(size_t)(p * (double)(v.size() - 1))];
+            };
+            auto pctd = [](const std::vector<double>& v, double p) -> double {
+                return v.empty() ? 0.0 : v[(size_t)(p * (double)(v.size() - 1))];
+            };
             double wall = NowMsD() - I.stat_t0;
             long long nb = I.batches.load();
             std::printf("[bank] srv-lat p50=%.1fms p90=%.1fms rows/batch=%.1f cycle=%.2fms "
@@ -639,6 +655,12 @@ static void BankLoop(BankScheduler::Impl& I) {
                         I.waiting.load(),
                         (int)I.self_dep.load(),
                         nb);
+            std::printf("[bank] 批分布: bsz p10/p50/p90=%.0f/%.0f/%.0f（slots=%d）"
+                        " flw p50/p90=%.2f/%.2fms n=%zu\n",
+                        pct(I.bsz, 0.10), pct(I.bsz, 0.50), pct(I.bsz, 0.90),
+                        I.cfg.slots,
+                        pctd(I.fl_ms, 0.50), pctd(I.fl_ms, 0.90),
+                        I.bsz.size());
             std::fflush(stdout);
             if (cen && cen->on && nb > 0) {
                 double d = (double)nb;
@@ -668,6 +690,8 @@ static void BankLoop(BankScheduler::Impl& I) {
                     ctr->store(0, std::memory_order_relaxed);
             }
             I.lat.clear();
+            I.bsz.clear();
+            I.fl_ms.clear();
             I.stat_t0 = NowMsD();
             I.dep_us.store(0);
             I.drain_us.store(0);
