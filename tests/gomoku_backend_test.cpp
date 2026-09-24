@@ -14,9 +14,13 @@
 //   R6 fence 桥接门（FARM_ORT_ASYNC=3，2026-09-24）：patch_fence.py 补丁模型
 //      fence 模式 == sync 基线逐位（跨通道主门）+ 复跑 + 银行 vs inline
 //      （工件缺席=SKIP）
+//   R7 trt refit 真引擎换心（B5，2026-09-24）：refittable 引擎 + RW1 全零
+//      换心必变 + 复采逐位同 + 二次 refit 幂等 + 名单外假名负路径（引擎
+//      不可 refit=SKIP——旧工件需重烤）
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
+// （--trt 自带 BuilderFlag.REFIT=refittable；RW1 导出器 tools/refit_mlp_rw1.py）
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/backend.h"
 #include "inferfarm/backend_factory.h"
@@ -293,6 +297,110 @@ int main() {
                         "（sync 银行 %.0f 局/s）\n",
                         f1.games / f1.sec, fi.games / f1.sec,
                         ort.games / ort.sec);
+        }
+    }
+    // ---------------- R7：trt refit 真引擎换心（B5，2026-09-24）----------------
+    // refittable 引擎（bake 端 BuilderFlag.REFIT；kREFIT_NONE=SKIP——未重烤
+    // 的旧工件兼容）+ C++ 内构 RW1（名单权威=onnx initializer：fc1.weight/
+    // fc1.bias/fc2.weight/fc2.bias，值全零）：
+    //   ① 已知输入采 policy 行0 → ref0
+    //   ② RefitWeights(rw1) → 同输入 ref1 ≠ ref0（换心必变，G5 异 blob TRT 版）
+    //   ③ 复采 ref1b == ref1（逐位确定）
+    //   ④ 同 blob 二次 refit → ref1c == ref1（refit 幂等）
+    //   ⑤ 全名单外假名 RW1 → 引擎不动（ref2 == ref1；负路径）
+    // 名单对齐实证：真名 4 项全中（名单外跳过 0）+ missing 拒绝语义由后端
+    // ApplyRefitWeights 把守（仓根 tools/refit_mlp_rw1.py 同名单）。R5 同款
+    // backend 级采样；前置=腿可用（trt.games != 0=后端在）。
+    if (have_trt && trt.games != 0) {
+        InferBackend* be = CreateTrtBackend();
+        ModelConfig mc;
+        mc.backend = "trt";
+        mc.engine_path = kTrt;
+        ModelSpec spec;
+        if (!be || !be->LoadSpec(mc, 8, spec)) {
+            std::printf("SKIP R7: LoadSpec 失败\n");
+            delete be;
+        } else {
+            void* sess = be->CreateSession(mc, spec, /*for_bank=*/true);
+            if (!sess || !be->Warmup(sess)) {
+                std::printf("SKIP R7: 会话/热身不可用\n");
+                if (sess) be->DestroySession(sess);
+                delete be;
+            } else {
+                auto biteq7 = [](const std::vector<float>& a,
+                                 const std::vector<float>& b) {
+                    return a.size() == b.size()
+                        && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+                };
+                auto sample0 = [&]() -> std::vector<float> {
+                    for (size_t i = 0; i < spec.ins.size(); i++) {
+                        size_t rb = 0;
+                        void* row = be->InputRow(sess, spec.ins[i].name.c_str(), 0, &rb);
+                        uint32_t x = 0x1234567u * (uint32_t)(i + 7);
+                        float* f = (float*)row;
+                        for (size_t j = 0; j < rb / sizeof(float); j++) {
+                            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                            f[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                        }
+                    }
+                    unsigned seq = 0;
+                    if (!be->SubmitBatch(sess, 1, seq)) return {};
+                    while (!be->CompletionReached(sess, seq)) {}
+                    be->CompletionFence();
+                    const float* p = be->OutputRow(sess, "policy", 0);
+                    return std::vector<float>(p, p + (size_t)spec.outs[0].width);
+                };
+                auto write_rw1 = [](const char* path, const char* const* names,
+                                    size_t n_names, float fill) {
+                    std::vector<char> b;
+                    auto put32 = [&](uint32_t v) {
+                        for (int i = 0; i < 4; i++) b.push_back((char)(v >> (8 * i)));
+                    };
+                    auto put16 = [&](uint16_t v) {
+                        for (int i = 0; i < 2; i++) b.push_back((char)(v >> (8 * i)));
+                    };
+                    b.insert(b.end(), {'R', 'W', '1', '\0'});
+                    put32(1);
+                    put32((uint32_t)n_names);
+                    static const int kDims[4][2] = {{64, 450}, {64, 1}, {225, 64}, {225, 1}};
+                    for (size_t k = 0; k < n_names && k < 4; k++) {
+                        std::string nm = names[k];
+                        put16((uint16_t)nm.size());
+                        b.insert(b.end(), nm.begin(), nm.end());
+                        b.push_back((char)2);   // f32
+                        int n_el = kDims[k][0] * kDims[k][1];
+                        put32((uint32_t)n_el);
+                        for (int e = 0; e < n_el; e++) put32(0);
+                    }
+                    FILE* f = fopen(path, "wb");
+                    if (f) { fwrite(b.data(), 1, b.size(), f); fclose(f); }
+                    return f != nullptr;
+                };
+                std::vector<float> ref0 = sample0();
+                CHECK(!ref0.empty(), "R7 换心前基线采样");
+                static const char* kNames[4] = {"fc1.weight", "fc1.bias",
+                                                "fc2.weight", "fc2.bias"};
+                const char* kRw1 = "gomoku_r7_refit.rw1";
+                bool w1 = write_rw1(kRw1, kNames, 4, 0.0f);
+                bool refit1 = w1 && be->RefitWeights(kRw1);
+                std::vector<float> ref1 = refit1 ? sample0() : std::vector<float>{};
+                CHECK(refit1 && !ref1.empty() && !biteq7(ref0, ref1),
+                      "R7 换心必变（refittable 真引擎+名单对齐 4 项全中）");
+                std::vector<float> ref1b = sample0();
+                CHECK(biteq7(ref1, ref1b), "R7 换心后复采逐位同");
+                bool refit2 = be->RefitWeights(kRw1);
+                std::vector<float> ref1c = refit2 ? sample0() : std::vector<float>{};
+                CHECK(refit2 && biteq7(ref1, ref1c), "R7 同 blob 二次 refit 幂等");
+                static const char* kFake[2] = {"nope.weight", "also_fake.bias"};
+                bool w3 = write_rw1(kRw1, kFake, 2, 0.0f);
+                bool refit3 = w3 && be->RefitWeights(kRw1);
+                std::vector<float> ref2 = refit3 ? sample0() : std::vector<float>{};
+                CHECK(refit3 && biteq7(ref1, ref2),
+                      "R7 名单外假名=引擎不动（负路径）");
+                std::remove(kRw1);
+                be->DestroySession(sess);
+                delete be;
+            }
         }
     }
     if (!have_ort && !have_trt) {

@@ -75,7 +75,7 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
 - ~~框架正式命名待定~~ 已定：GameInferfarm（仓）/ inferfarm（命名空间）。
 - ~~YGO 适配器回接待做~~ 已回接（产线现役 ai_core 即参考实现，演化回接走
   population 路由+SetLegShape 清单形态）。
-- TRT refit 真引擎换心冒烟（RW1 名单对齐 torch 权重名）待做。
+~~- TRT refit 真引擎换心冒烟~~ 已清账（见 B5 段，2026-09-24）。
 
 ## KataGo 调研与吸收（2026-09-22）
 - 调研动机：KataGo 是固定游戏（围棋），inferfarm 是任意游戏——但推理服务的
@@ -190,3 +190,40 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   工具非默认。
 - A1 spin=2 独占复测（4096 局 ×4 交替）：中位 -15% vs spin=1——从
   "判死拆码"改判"留档省核选项"，默认仍 spin=1（判决 17 追记）。
+
+## B4 banks×slots 二维重扫（2026-09-24 晚，fb16/fb32 工件烤制后）
+- 工件：bake_gomoku_mlp.py --slots 16/32（权重与 fb8 sha 一致=同种子，
+  仅批维钉死不同；模型不入库）。
+- 矩阵（同步契约 spin=1，128 链 4096 局，九腿指纹全同 0a7be41d93eeda56
+  ——同权重跨批形逐位同=R5 批次不变性再证）：
+  | slots\banks | 1 | 2 | 4 |
+  |---|---|---|---|
+  | 8 | 923 | **12346** | 1352 |
+  | 16 | 1103 | **2146** | 1515 |
+  | 32 | 2036 | **4166** | 3001 |
+- 判决：banks=2 全档最优（fence v4 的"fb8 2 流饱和"结论在 fb16/32 推
+  广成立）；**同步契约对 banks 远比 fence 敏感**（banks=1 掉 51-93% vs
+  fence 契约的 -30%——整设备同步税在无第二流重叠时全额裸露）；
+  banks=4 反降（同步 Run 调度台串行提交下银行数=窗碎片化+轮转税，无
+  并行收益）。slots↑ 恒增（批密满 rows/batch 8.0/16.0/32.0），但绝对
+  值仍低于 fence fb8 档（fence 桥接=吞吐王者不变）。
+
+## B5 TRT refit 真引擎换心冒烟（2026-09-24 晚，未决项清账）
+- 根因：bake_gomoku_mlp.py 烤引擎从未设 refittable 旗标（kREFIT_NONE，
+  createInferRefitter 拒建）——"真引擎冒烟"一直无从谈起。
+- 修：烤制端 config.set_flag(BuilderFlag.REFIT)（legacy 模式=引擎自带权重
+  运行端名单式重供，配 ApplyRefitWeights 现有逻辑；STRIP_PLAN+REFIT_
+  IDENTIFIERS 需全量重供不采用）。重烤 fb8.trt（0.4MB，4 refittable 权重
+  =onnx initializer 名单 fc1.weight/fc1.bias/fc2.weight/fc2.bias）。
+- 名单权威链：TRT python get_all_weights()=onnx initializer 同 4 项（legacy
+  REFIT 引擎现值不可读——getNamedWeights internal error，值一律以 onnx 侧
+  为准）；导出器 tools/refit_mlp_rw1.py（--scale 扰动因子）。
+- 冒烟三连（仓根腿）：原引擎指纹 502013814d87ca76 → 换心（scale=0.5）4 项
+  全中 29ms、指纹必变 8776d14b497cb876 → 复跑逐位同。29ms=毫秒级热换兑现
+  （演化场景选 TRT 的判决 12 依据落地）；已捕获图换心后照常跑（无 900）。
+- **R7 门**（gomoku_backend_test，trt 腿可用才跑）：换心必变/复采逐位同/
+  同 blob 二次 refit 幂等/名单外假名=引擎不动（负路径），全绿；旧工件
+  （不可 refit）=SKIP。
+- 新坑：FARM_CUDART_DLL 是全局 env——ORT fence 契约（cudart64_13）与 TRT
+  cu12 构建（cudart64_12）冲突，两后端混用的进程不能同设（本门 R2 曾被
+  此 env 打成 SKIP）。

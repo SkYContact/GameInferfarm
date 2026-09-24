@@ -102,12 +102,17 @@ def main():
                 raise SystemExit("ONNX 解析失败")
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)
+        # refittable（B5 真引擎换心冒烟，2026-09-24）：legacy REFIT 模式=引擎
+        # 自带权重、运行端 set 变更项即可（配 trt_backend ApplyRefitWeights 的
+        # 名单式重供；STRIP_PLAN+REFIT_IDENTIFIERS 模式则要求全量重供，不采用）。
+        # 不开此旗标 = kREFIT_NONE，createInferRefitter 拒建（实测）。
+        config.set_flag(trt.BuilderFlag.REFIT)
         plan = builder.build_serialized_network(network, config)
         if plan is None:
             raise SystemExit("engine 构建失败")
         with open(args.trt, "wb") as f:
             f.write(plan)
-        print("[bake] trt engine → %s（%.1f MB）"
+        print("[bake] trt engine → %s（%.1f MB，refittable）"
               % (args.trt, os.path.getsize(args.trt) / 1e6))
 
 
