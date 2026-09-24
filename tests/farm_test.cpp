@@ -13,8 +13,13 @@
 //     SetPopulation 换代必变；换代后缓存不串代（=新鲜无缓存农场逐位同）
 //  G12 腿形状热调（回接方清单需求）：同农场 SetLegShape 续腿=新鲜农场同形状
 //     逐位同；非法形状拒绝
+//  G13 批次/位置不变性门（后端契约级，行独立的直接机器校验）：同一行内容
+//     在批大小 n=1..满 与行位置 0..满 变化下输出逐位同（G1 是游戏负载的
+//     间接版；本门直接枚举。ort/trt 同协议=R5/gomoku_backend_test）
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
+#include "inferfarm/backend.h"
+#include "inferfarm/backend_factory.h"
 #include "inferfarm/cache.h"
 #include <cstdio>
 #include <cstring>
@@ -576,6 +581,104 @@ int main() {
             }
             delete a;
         }
+    }
+
+    // ---------------- G13：批次/位置不变性门（后端契约级）----------------
+    // 行独立契约的直接机器校验（Thinking Machines "batch invariance" 语境，
+    // 2026-09-24 调研吸收）：同一行内容在 批大小变化（n=1..满）与 行位置变化
+    // （同内容换槽）下输出逐位同。cpu 后端进 CI；ort/trt 同协议=R5。
+    {
+        InferBackend* be = CreateCpuBackend();
+        ModelConfig mcfg;
+        mcfg.backend = "cpu";
+        mcfg.cpu.slots = 8;
+        mcfg.cpu.poly_k = 32;
+        mcfg.cpu.hidden = 16;
+        mcfg.cpu.ins.push_back({"in", DTYPE_F32, {32}});
+        mcfg.cpu.outs.push_back({"out", 16});
+        ModelSpec spec;
+        CHECK(be && be->LoadSpec(mcfg, mcfg.cpu.slots, spec) && spec.slots == 8,
+              "G13 cpu 后端起（slots=8）");
+        if (be && spec.slots == 8) {
+            void* sess = be->CreateSession(mcfg, spec, /*for_bank=*/true);
+            bool warm = sess && be->Warmup(sess);
+            CHECK(warm, "G13 会话建+热身");
+            if (warm) {
+                // 内容 k = 种子 k 的确定性逐位模式（每槽内容互异）
+                const int S = spec.slots;
+                const size_t RB = 32 * sizeof(float);
+                std::vector<std::vector<char>> content((size_t)S);
+                for (int k = 0; k < S; k++) {
+                    content[(size_t)k].resize(RB);
+                    uint32_t x = 0x9E3779B9u * (uint32_t)(k + 1);
+                    for (size_t i = 0; i < RB / sizeof(float); i++) {
+                        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                        float v = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                        std::memcpy(content[(size_t)k].data() + i * sizeof(float),
+                                    &v, sizeof(float));
+                    }
+                }
+                auto run = [&](const std::vector<int>& slot_content, int slot_read,
+                               std::vector<float>& out) -> bool {
+                    for (size_t r = 0; r < slot_content.size(); r++) {
+                        size_t rb = 0;
+                        void* row = be->InputRow(sess, "in", (int)r, &rb);
+                        if (!row || rb != RB) return false;
+                        std::memcpy(row, content[(size_t)slot_content[r]].data(), RB);
+                    }
+                    unsigned seq = 0;
+                    if (!be->SubmitBatch(sess, (int)slot_content.size(), seq))
+                        return false;
+                    while (!be->CompletionReached(sess, seq)) {}
+                    be->CompletionFence();
+                    int w = be->OutputWidth(sess, "out");
+                    const float* src = w > 0 ? be->OutputRow(sess, "out", slot_read)
+                                             : nullptr;
+                    if (!src) return false;
+                    out.assign(src, src + w);
+                    return true;
+                };
+                auto biteq = [](const std::vector<float>& a,
+                                const std::vector<float>& b) {
+                    return a.size() == b.size()
+                        && std::memcmp(a.data(), b.data(),
+                                       a.size() * sizeof(float)) == 0;
+                };
+                // 基线：满批，槽 r ← 内容 r
+                std::vector<std::vector<float>> ref((size_t)S);
+                std::vector<int> full;
+                for (int r = 0; r < S; r++) full.push_back(r);
+                bool base = true;
+                for (int r = 0; r < S; r++)
+                    base = run(full, r, ref[(size_t)r]) && base;
+                CHECK(base, "G13 满批基线（8 行逐槽采输出）");
+                // 批大小变化：n=1 / n=3（前缀行数变，目标行输出必须逐位同）
+                std::vector<float> got;
+                bool ok = run({0}, 0, got) && biteq(got, ref[0]);
+                CHECK(ok, "G13a 批大小不变性：n=1 行0 == 满批行0（逐位）");
+                ok = run({0, 1, 2}, 2, got) && biteq(got, ref[2]);
+                CHECK(ok, "G13b 批大小不变性：n=3 行2 == 满批行2（逐位）");
+                // 行位置变化：内容 0 放到槽 p（槽 0..p-1 填其他内容），n=p+1
+                ok = true;
+                for (int p : {1, S / 2, S - 1}) {
+                    std::vector<int> pc;
+                    for (int i = 0; i < p; i++) pc.push_back(i + 1);   // 干扰内容
+                    pc.push_back(0);                                   // 内容0→槽p
+                    std::vector<float> g;
+                    ok = run(pc, p, g) && biteq(g, ref[0]) && ok;
+                }
+                CHECK(ok, "G13c 行位置不变性：内容0@槽{1,4,7} == 满批行0（逐位）");
+                // 会话内复跑稳定性：满批再来一遍全逐位同
+                ok = true;
+                for (int r = 0; r < S; r++) {
+                    std::vector<float> g;
+                    ok = run(full, r, g) && biteq(g, ref[(size_t)r]) && ok;
+                }
+                CHECK(ok, "G13d 会话内满批复跑逐位同");
+            }
+            if (sess) be->DestroySession(sess);
+        }
+        delete be;
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

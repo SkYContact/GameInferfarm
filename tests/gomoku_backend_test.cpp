@@ -8,13 +8,20 @@
 //   R4 异构双设备（判决15）：ort/cuda 主卡 + ort/dml 第二卡（如 AMD 核显），
 //      腿完成 + 复跑逐位同（链→组钉扎的跨厂商确定性）。环境
 //      FARM_DML_DIR=onnxruntime-directml 的 capi 目录（缺席=SKIP）
+//   R5 批次/位置不变性门（G13 的真后端版，2026-09-24）：同一行内容在批大小
+//      n=1..满 与行位置变化下输出逐位同——GPU 归约策略随 shape 变化的直接
+//      检验。ort/trt 各一（工件/后端缺席=SKIP）
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
 #include "../examples/gomoku/gomoku_adapter.h"
+#include "inferfarm/backend.h"
+#include "inferfarm/backend_factory.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 using namespace inferfarm;
 using namespace inferfarm::gomoku;
@@ -137,6 +144,112 @@ int main() {
         }
     } else {
         std::printf("SKIP R4: 无 FARM_DML_DIR（onnxruntime-directml 的 capi 目录）\n");
+    }
+    // ---------------- R5：批次/位置不变性门（G13 真后端版）----------------
+    {
+        auto r5 = [&](const char* tag, InferBackend* be, const ModelConfig& mcfg,
+                      int hint) {
+            if (!be) { std::printf("SKIP R5 %s: 后端不可用\n", tag); return; }
+            ModelSpec spec;
+            if (!be->LoadSpec(mcfg, hint, spec) || spec.slots < 2) {
+                std::printf("SKIP R5 %s: LoadSpec 失败（工件缺席或形状不符）\n", tag);
+                delete be;
+                return;
+            }
+            void* sess = be->CreateSession(mcfg, spec, /*for_bank=*/true);
+            if (!sess || !be->Warmup(sess)) {
+                std::printf("SKIP R5 %s: 会话/热身不可用（运行时缺席）\n", tag);
+                if (sess) be->DestroySession(sess);
+                delete be;
+                return;
+            }
+            const int S = spec.slots;
+            auto run = [&](const std::vector<int>& slot_seed, int slot_read,
+                           std::vector<float>& out) -> bool {
+                auto fill = [&](int slot, int content_seed) -> bool {
+                    for (size_t i = 0; i < spec.ins.size(); i++) {
+                        if (spec.ins[i].population) continue;
+                        size_t rb = 0;
+                        void* row = be->InputRow(
+                            sess, spec.ins[i].name.c_str(), slot, &rb);
+                        if (!row) return false;
+                        if (spec.ins[i].et == DTYPE_F32) {
+                            uint32_t x = 0x9E3779B9u * (uint32_t)(content_seed + 1);
+                            float* f = (float*)row;
+                            for (size_t j = 0; j < rb / sizeof(float); j++) {
+                                x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                                f[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                            }
+                        } else {
+                            std::memset(row, 0, rb);
+                        }
+                    }
+                    return true;
+                };
+                for (size_t r = 0; r < slot_seed.size(); r++)
+                    if (!fill((int)r, slot_seed[r])) return false;
+                unsigned seq = 0;
+                if (!be->SubmitBatch(sess, (int)slot_seed.size(), seq)) return false;
+                while (!be->CompletionReached(sess, seq)) {}
+                be->CompletionFence();
+                out.clear();   // 复用缓冲：先清（跨调用累积会让 biteq 假败）
+                for (size_t i = 0; i < spec.outs.size(); i++) {
+                    int w = be->OutputWidth(sess, spec.outs[i].name.c_str());
+                    const float* src = w > 0
+                        ? be->OutputRow(sess, spec.outs[i].name.c_str(), slot_read)
+                        : nullptr;
+                    if (!src) return false;
+                    out.insert(out.end(), src, src + w);
+                }
+                return true;
+            };
+            auto biteq = [](const std::vector<float>& a, const std::vector<float>& b) {
+                return a.size() == b.size()
+                    && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+            };
+            std::vector<std::vector<float>> ref((size_t)S);
+            std::vector<int> full;
+            for (int r_ = 0; r_ < S; r_++) full.push_back(r_);
+            bool base = true;
+            for (int r_ = 0; r_ < S; r_++) base = run(full, r_, ref[(size_t)r_]) && base;
+            std::string msg;
+            msg = std::string(tag) + " R5 满批基线";
+            CHECK(base, msg.c_str());
+            std::vector<float> got;
+            bool ok = run({0}, 0, got) && biteq(got, ref[0]);
+            msg = std::string(tag) + " R5a 批大小不变性：n=1 行0 逐位同";
+            CHECK(ok, msg.c_str());
+            ok = run({0, 1, 2}, 2, got) && biteq(got, ref[2]);
+            msg = std::string(tag) + " R5b 批大小不变性：n=3 行2 逐位同";
+            CHECK(ok, msg.c_str());
+            ok = true;
+            for (int p : {1, S / 2, S - 1}) {
+                std::vector<int> pc;
+                for (int i = 0; i < p; i++) pc.push_back(i + 1);
+                pc.push_back(0);
+                ok = run(pc, p, got) && biteq(got, ref[0]) && ok;
+            }
+            msg = std::string(tag) + " R5c 行位置不变性：内容0@槽{1,S/2,S-1} 逐位同";
+            CHECK(ok, msg.c_str());
+            be->DestroySession(sess);
+            delete be;
+        };
+        if (have_ort) {
+            ModelConfig m;
+            m.backend = "ort";
+            m.model_path = kOnnx;
+            r5("ort", CreateOrtBackend(), m, 8);
+        } else {
+            std::printf("SKIP R5 ort: 无 %s\n", kOnnx);
+        }
+        if (InferBackend* trt_be = CreateTrtBackend()) {
+            ModelConfig m;
+            m.backend = "trt";
+            m.engine_path = kTrt;
+            r5("trt", trt_be, m, 8);
+        } else {
+            std::printf("SKIP R5 trt: 本构建未编 TRT\n");
+        }
     }
     if (!have_ort && !have_trt) {
         std::printf("（本目录无模型工件——全部 SKIP 属正常）\n");
