@@ -19,7 +19,7 @@
 // 【PerThreadContext 与满座自驱的实测注记（2026-09-22）】铁律字面要求图会话
 // 的创建/热身/回放同线程；本库银行会话的创建+热身在调度台线程，但**满座自驱
 // 发车**让最后完笔的工人线程就地 RunWithBinding（回放跨线程）。已在
-// onnxruntime 1.30.0（q35 DLL）上以 FARM_BANK_WINDOW_FLOOR=1000 强制逐批自驱
+// onnxruntime 1.30.0 上以 FARM_BANK_WINDOW_FLOOR=1000 强制逐批自驱
 // （self_dep=42/38）实测：结果逐位一致、无异常——即当前版本对回放的实际
 // 约束比文档宽松。升级 ORT 版本时此结论须复验（自驱路径可退化为"置旗由
 // 调度台发射"）。
@@ -423,20 +423,26 @@ private:
     // 实例级 DLL 加载（注册表：同(基名,目录)=复用；基名冲突他目录=改名装载）
     bool LoadLib(const ModelConfig& cfg) {
         if (api_) return true;
+        // 目录解析链：cfg → env → 空（走系统 DLL 搜索，不写死开发机路径）。
+        // 两者皆空时打印排查入口提示——loader 报错难读，提前一句话省一次迷路。
         const char* ed = getenv("FARM_ORT_DIR");
         std::string ort_dir = !cfg.ort_dir.empty() ? cfg.ort_dir
-            : (ed && *ed ? ed
-               : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/onnxruntime/capi");
+            : (ed && *ed ? ed : "");
         const char* cd = getenv("FARM_CUDA_DIR");
         std::string cuda_dir = !cfg.cuda_dir.empty() ? cfg.cuda_dir
-            : (cd && *cd ? cd : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/torch/lib");
+            : (cd && *cd ? cd : "");
+        if (ort_dir.empty())
+            std::fprintf(stderr, "[ort] 未设 ModelConfig.ort_dir / env FARM_ORT_DIR"
+                         "——onnxruntime.dll 走系统 DLL 搜索（加载失败先查这里）\n");
         std::lock_guard<std::mutex> lk(g_ort_dll_mx);
         // PATH 前插（每目录一次；onnxruntime 的 cudart/cublas/DML 依赖解析）
         {
             char old_path[8192];
             GetEnvironmentVariableA("PATH", old_path, sizeof old_path);
-            std::string np = ort_dir + ";" + old_path;
-            if (!dml_ && std::string(old_path).find(cuda_dir) == std::string::npos)
+            std::string np = old_path;
+            if (!ort_dir.empty()) np = ort_dir + ";" + np;
+            if (!dml_ && !cuda_dir.empty()
+                && np.find(cuda_dir) == std::string::npos)
                 np = cuda_dir + ";" + np;
             SetEnvironmentVariableA("PATH", np.c_str());
         }

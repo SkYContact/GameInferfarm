@@ -57,11 +57,12 @@ static void* (*g_trt_create_runtime)(void*, int32_t) = nullptr;
 static void* (*g_trt_create_refitter)(void*, void*, int32_t) = nullptr;
 static int32_t g_trt_ver_int = 0;
 
-// cuda_dir 缺省链：cfg / env FARM_CUDA_DIR / q35 torch/lib（与 ORT 后端同款）
+// cuda_dir 缺省链：cfg / env FARM_CUDA_DIR / 空（走系统 DLL 搜索——不写死
+// 开发机路径；与 ORT 后端同款）
 static std::string DefaultCudaDir(const ModelConfig& cfg) {
     if (!cfg.cuda_dir.empty()) return cfg.cuda_dir;
     if (const char* e = getenv("FARM_CUDA_DIR")) if (*e) return e;
-    return "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/torch/lib";
+    return "";
 }
 
 static int32_t TrtVersionInt() {
@@ -99,15 +100,19 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
     if (g_trt_create_runtime) return true;
     const char* td = getenv("FARM_TRT_DIR");
     std::string trt_dir = !cfg.trt_dir.empty() ? cfg.trt_dir
-        : (td && *td ? td
-           : "C:/Users/41601/Miniconda3/envs/q35/Lib/site-packages/tensorrt_libs");
+        : (td && *td ? td : "");
+    if (trt_dir.empty())
+        std::fprintf(stderr, "[trt] 未设 ModelConfig.trt_dir / env FARM_TRT_DIR"
+                     "——nvinfer_10.dll 走系统 DLL 搜索（加载失败先查这里）\n");
     // PATH 前插（nvinfer 的 cublas/cudart 依赖解析）——与 ORT 同款手法
     {
         char buf[8192];
         GetEnvironmentVariableA("PATH", buf, sizeof buf);
+        std::string np = buf;
         std::string cuda_dir = DefaultCudaDir(cfg);
-        SetEnvironmentVariableA("PATH",
-            (cuda_dir + ";" + trt_dir + ";" + buf).c_str());
+        if (!trt_dir.empty()) np = trt_dir + ";" + np;
+        if (!cuda_dir.empty()) np = cuda_dir + ";" + np;
+        SetEnvironmentVariableA("PATH", np.c_str());
     }
     // TF32 纪律：烤制端 NVIDIA_TF32_OVERRIDE=0，运行端必须一致（Myelin 逐字
     // 比对 build/execution 两侧值，不一致拒建 context）。未设=自设 0；显式

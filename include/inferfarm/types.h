@@ -103,8 +103,11 @@ struct ModelConfig {
 // 拷贝承重——不能让适配器直接读银行显存/arena，见 bank.cpp 收割注释）
 struct OutputDest {
     const char* name = nullptr;       // 输出名（后端模型规格内）
-    float* dst = nullptr;             // 适配器自有缓冲
-    int n = 0;                        // 拷贝宽度（超出模型行宽截断）
+    float* dst = nullptr;             // 适配器自有缓冲（生命周期须跨 SubmitWait：
+                                      // 收割侧回填后才可读）
+    int n = 0;                        // dst 容量（float 元素数）。收割侧拷
+                                      // min(模型行宽, n)：行宽>n 取 n（截断方向
+                                      // =按容量），n≤0 或 dst 空=该输出跳过
 };
 
 // 组装视图：适配器在 AssembleInto 里按名取行指针，直写槽位（零拷贝契约）

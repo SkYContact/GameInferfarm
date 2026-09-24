@@ -91,9 +91,9 @@
   拷贝改名（%TEMP%），依赖解析靠 PATH 前插（改名副本自身目录无依赖）。
 - **DML EP 的 iob 输入忽略**：预绑 CPU 输入读恒零（输出绑定却通）——每次
   Run 前新鲜 CPU OrtValue 重绑输入即愈；probe 两图案门是此症的哨兵。
-- **pip --target 装 ORT-DML**：勿装进 q35（顶掉 onnxruntime-gpu）；
-  `pip install --target D:/ygo_data/dml_rt onnxruntime-directml`，dll 在
-  `<target>/onnxruntime/capi/`。
+- **pip --target 装 ORT-DML**：勿装进主环境（顶掉 onnxruntime-gpu）；
+  `pip install --target <目标目录> onnxruntime-directml`，dll 在
+  `<目标目录>/onnxruntime/capi/`。
 - DML 设备枚举序号=DXGI 适配器序号（dev0/dev1 哪个是核显枚举定，本机
   dev1=610M）；DML 打印的错误消息可能因系统 locale 非 utf-8 解码失败——
   属包装层噪音，不是失败原因。

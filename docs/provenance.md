@@ -2,10 +2,10 @@
 
 ## 本库从哪来
 2026-09-22 用户裁决：推理农场框架库升格新主线——YGO 只是第一个乘客。本仓
-（D:/inferfarm）从 D:/ygo 主线交出的资产抽层而成，协议与并发结构**逐句同源**于
-现役生产代码：
+从 YGO 产线主线仓（私有）交出的资产抽层而成，协议与并发结构**逐句同源**
+于现役生产代码：
 
-| 本库 | YGO 源（D:/ygo/ygopro/ai_core/） |
+| 本库 | YGO 源（产线 ai_core/，私有主线仓） |
 |---|---|
 | `src/fiber_pool.cpp` | `ai_opp_loop.cpp` FiWorker/FiTask/FiChain/RunLegFibers（2026-09-21 fiber_contract） |
 | `src/bank.cpp` | `ai_infer.cpp` 银行段 BankCtl/Claim/SubmitWait/Harvest/BankLoop（2026-09-22 bank_contract） |
@@ -15,8 +15,8 @@
 | `src/backends/ort_backend.cpp` | `ai_infer.cpp` BuildSession 的 ORT 咒语（CUDA EP V2+enable_cuda_graph+IOBinding）——完成检测改为显式整设备同步（ORT 后端 v1 纪律） |
 | `src/farm.cpp` 驱动环 | `ai_opp_loop.cpp` OppRunOneGame/OppCppChain 种子协议与收账语义 |
 
-施工契约原文：`D:/ygo_data/refit_v1/*.md`（bank/fiber/census/refit/integration）。
-交接书：`D:/ygo/.zcode/memory/inferfarm-handover.md`。
+施工契约原文在 YGO 侧私有库（refit_v1/*.md，bank/fiber/census/refit/
+integration 五篇）；交接书同在私有记忆库（未公开）。
 
 ## 数字底账（YGO 产线，本机 9955HX 16C/32T + 5070Ti Laptop）
 - 两夜 42→**317-368 局/s（7.5-8.7×）**；51.4ms CPU/局全账平：工人 48.2
@@ -72,10 +72,10 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
   不拦路）；主构建（ORT）与 build-trt（ORT+TRT）双 ALL PASS。
 
 ## 未决
-- run25 发车仍在 YGO 侧停车等用户口令（发车卡 D:/ygo_data/es_run25_launch.txt）
-  ——**框架会话勿动它**。
-- 框架正式命名待定（暂名 inferfarm/推理农场）。
-- YGO 适配器回接待做（现役 ai_core 即参考实现）；TRT refit 真引擎换心冒烟（RW1 名单对齐 torch 权重名）待做。
+- ~~框架正式命名待定~~ 已定：GameInferfarm（仓）/ inferfarm（命名空间）。
+- ~~YGO 适配器回接待做~~ 已回接（产线现役 ai_core 即参考实现，演化回接走
+  population 路由+SetLegShape 清单形态）。
+- TRT refit 真引擎换心冒烟（RW1 名单对齐 torch 权重名）待做。
 
 ## KataGo 调研与吸收（2026-09-22）
 - 调研动机：KataGo 是固定游戏（围棋），inferfarm 是任意游戏——但推理服务的

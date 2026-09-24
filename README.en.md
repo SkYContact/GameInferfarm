@@ -8,7 +8,8 @@ submission and instrumentation.
 
 The batched-inference layer for self-play training, RL evaluation, evolutionary
 population evaluation and game-data generation: measured **116× over a naive
-python loop** on the public Gomoku benchmark ([docs/benchmark.md](docs/benchmark.md));
+python loop** on the public Gomoku benchmark ([docs/benchmark.md](docs/benchmark.md);
+numerator/denominator of every headline multiplier is tabulated there);
 NVIDIA (ONNX Runtime CUDA / TensorRT) **and AMD (DirectML)** devices, including
 mixed-vendor multi-GPU; bitwise determinism gates enforced in CI.
 
@@ -226,8 +227,12 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
 
 ## Constraints and roadmap
 
-- **Windows-first** for now (fibers via Windows Fibers; the POSIX port surface
-  is confined to the Switch-family in fiber_pool.cpp). C++17, CMake ≥3.16.
+- **Windows-first** for now. Platform-surface status: fiber semantics
+  (fiber_pool.cpp, Windows Fibers) and backend DLL loading (LoadLibrary in the
+  ort/trt backends) are Windows implementations; the platform bits in
+  bank/census/farm (spin primitive / thread priority / timer) are already
+  gated. A POSIX port = those two spots: the Switch family
+  (ucontext / boost::context) + dlopen loading. C++17, CMake ≥3.16.
 - Roadmap: ORT/TRT real-model benchmarks (paradigm borrowed from KataGo's
   benchmarkPureForward: barrier start + per-thread medians + wall clock),
   an fp16 bake tier, hybrid low-load dispatch

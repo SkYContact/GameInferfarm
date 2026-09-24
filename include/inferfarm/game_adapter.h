@@ -13,8 +13,8 @@
 //  3. **逐位确定性由适配器保证**——种子协议（game seed = seed0 + chain*per
 //     + game）给定后，同种子双腿必须逐局同结果；框架的确定性门据此验。
 //
-//  YGO 参考实现：ocgcore+ai_bot 组装+对手执行器（D:/ygo/ygopro/ai_core，
-//  现役生产代码）；本仓 examples/toy 是最小示范。
+//  YGO 参考实现：ocgcore+ai_bot 组装+对手执行器（产线现役代码，私有主线仓）；
+//  本仓 examples/toy 是最小示范。
 // ============================================================
 #pragma once
 #include "tls_frame.h"
@@ -36,8 +36,9 @@ public:
     // 未写完的小输入可在 CollectOutputs 阶段后补，见 bank 层兜底拷贝）。
     virtual void AssembleInto(SlotWriter& slot) = 0;
 
-    // 申报输出缓冲（每次决策调用；dst=适配器自有缓冲，收割侧回填）。
-    // 返回条数（≤cap）。
+    // 申报输出缓冲（每次决策调用；dst=适配器自有缓冲，收割侧回填后才可读，
+    // 缓冲生命周期须跨 SubmitWait）。返回条数 ≤cap——超过=适配器违约（框架
+    // 截断防越界读+本前向判负，绝不静默丢弃已申报输出）。
     virtual int CollectOutputs(OutputDest* dests, int cap) = 0;
 
     // 消费输出（此刻 dests 缓冲已回填）——推进游戏内部状态。

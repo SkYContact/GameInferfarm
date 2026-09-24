@@ -66,7 +66,8 @@ build-trt/Release/gomoku.exe --backend trt --engine models/gomoku_mlp.fb8.trt  #
 - **框架真跑得快**（8192 局同口径，每档 ≥3 跑中位）——python 串行 19.8
   局/s → python 向量化 25.9 → C++ 每链线程+逐次 190.2 → **C++ 推理农场
   （同卡 6 设备组×2 银行）≈2300 局/s**；谱系首尾 **116×**，同 C++ 同模型
-  下 **12.1×**。
+  下 **12.1×**（各倍数的分子分母对照见
+  [docs/benchmark.md](docs/benchmark.md) 倍数口径表）。
 - **同一张卡还能再拆**：设备组=并行填充管线，1 组 780 → 2 组 1376（零
   额外硬件翻倍）→ 6 组 2303 局/s（8 组以上调度台过载反降）。
 - **NVIDIA+AMD 异构混跑**：DirectML 通道（AMD 显卡/核显可直接用）；链
@@ -222,8 +223,11 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
 
 ## 约束与路线
 
-- 当前为 **Windows 优先**（fiber 走 Windows Fibers；POSIX 移植面收口在
-  fiber_pool.cpp 的 Switch 族）。C++17，CMake ≥3.16。
+- 当前为 **Windows 优先**。平台相关面的现状：fiber 语义（fiber_pool.cpp，
+  Windows Fibers）与后端 DLL 装载（ort/trt 的 LoadLibrary 面）为 Windows
+  实现；bank/census/farm 的平台面（自旋原语/线程优先级/timer）已门控收口。
+  POSIX 移植=收口这两处：Switch 族（ucontext/boost::context）+ dlopen 装载。
+  C++17，CMake ≥3.16。
 - 路线：ORT/TRT 真模型实测基准（范式=KataGo benchmarkPureForward：barrier
   同起跑+每线程中位数+全体墙钟）、fp16 烤制档（int8 与 fp32 之间）、低负载
   混合发车（单局场景银行税的解药）、POSIX 纤程、更多游戏范例。
