@@ -6,8 +6,13 @@
 //              → SubmitWait(挂起/收割回投) → ApplyResult } → Outcome
 //
 //  三条契约（违反=框架的正确性前提破洞，见 docs/design-judgments.md）：
-//  1. **Advance 与 Assemble 无挂起点**——银行 close-drain 有界的前提
-//     （在途写手必在几十 µs 完工）。组装内不得 FiberSuspend/阻塞 IO。
+//  1. **组装直写槽无挂起点（Claim→Submit 窗口）**——银行 close-drain 有界
+//     的前提（在途写手必在几十 µs 完工）。AssembleInto 内不得 FiberSuspend/
+//     阻塞 IO。advance 的挂起不受此限：legacy monolith 形态（整局跑在
+//     AdvanceToDecision 里，含 Claim/SubmitWait——YGO 回接形态）合法在
+//     advance 内挂起（挂起时槽已提交，对 drain 无害）。（2026-09-24 修正：
+//     原表述"Advance 与 Assemble 无挂起点"覆盖面写宽，机器断言曾误伤
+//     monolith 形态——现行断言只包 AssembleInto。）
 //  2. **行独立（约束面=推理图）**——推理图必须逐行独立（无 batchnorm 类
 //     跨行算子），银行不满整批照发、尾行旧数据无害，全系于此。**训练图
 //     不限**：训练可带 BN/任何跨行算子，导出前折叠进权重即可（BN folding，

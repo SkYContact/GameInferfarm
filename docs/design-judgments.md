@@ -96,30 +96,57 @@ n>7/8·slots 走整块，否则逐输入前缀。第 n..slots 行图照读显存
   跨流无序（候选机理；含 torch/lib cudart 的 PTDS 混编面），判负纪律不
   兼容。**终审：ORT 后端零围栏判死**——围栏税=ORT 路线的架构成本，TRT
   邮箱收割仍是生产通道（其收益那边早已兑现）。翻案条件：ORT 新版
-  （FARM_ORT_ASYNC=1 复验 + FARM_ORT_CAPTEST=1 探针一键判流归属）或
-  custom op 内吐 event 桥接（模型图侧工程，路标）。FARM_ORT_ASYNC 开关
-  保留=打印判决不启用 async。
-- **终局补测（同日，回应"直接读源码"与混跑质疑，负结果加固）**：①点读
-  rel-1.30.0 源码三件套（info 解析=尺寸_t 指针串；EP ctor=用户流分支
-  `stream_=user_compute_stream` 外部流直达、`cuda_graph_.SetStream(stream)`
-  原样继承；CaptureBegin=先 sync 后 BeginCapture）——**按 tag 源码捕获应
-  落在用户流上且应能工作**，与实测矛盾；②**版本指纹对不上**：本机错误栈
-  `line=56; expr=BeginCapture`，而 rel-1.30.0 tag 的 56 行是 EndCapture
-  （BeginCapture 在 51）⇒ 装机的官方 PyPI wheel（onnxruntime-gpu 1.30.0，
-  cu13.0）的源码 ≠ release tag（nightly/分叉构建）——一切"读码推理"的
-  机制叙述降级为假说，行为判决不受影响；③**混跑排除**：发现进程内双
-  cudart（本库经 torch/lib 的 cudart12，ORT wheel 为 CUDA13 构建走系统
-  CUDA13 bin）后，新增 FARM_CUDART_DLL 选 c13 干净复测——图路径 900 依旧、
-  eager 3 跑 3 指纹依旧 ⇒ 两现象均为干净运行时的真实行为；④终审不变：
-  ORT 零围栏判死（对此 wheel）。复验三件套已仪器化：FARM_ORT_ASYNC=2
-  （翻案强制通道）+ FARM_CUDART_DLL（cudart 版本选择）+ FARM_ORT_CAPTEST=1
-  （流归属探针）；要提上游 issue 须先核该 wheel 的确切 commit（build_and_
-  package_info.py 不含 commit，需 wheel 回源）。
+  （FARM_ORT_ASYNC=2 复验 + FARM_CUDART_DLL 选 cudart 版本 +
+  FARM_ORT_CAPTEST=1 探针）或 custom op 内吐 event 桥接（模型图侧工程，
+  路标）。FARM_ORT_ASYNC=1 保留=打印判决不启用 async。
+- **终局补测（同日，回应"直接读源码"与混跑质疑，负结果加固）**：①稀疏
+  克隆官方 **v1.30.0** tag 精读（注意：release 分支 rel-1.30.0 无同名 tag，
+  真 tag=v1.30.0；此前经转述工具读 rel 分支得出"56 行是 EndCapture、wheel
+  源码≠tag"为**转述数错行的假警报**，修正）——`cuda_graph.cc` **绝对第
+  56 行=BeginCapture**，与错误栈逐字吻合 ⇒ 装机官方 PyPI wheel
+  （onnxruntime-gpu 1.30.0，cu13.0）就是此源码所编；EP ctor 用户流分支
+  `stream_=user_compute_stream` 外部流直达、PerThreadContext（464 行）原样
+  继承 ⇒ **按官方源码捕获应落在用户流上且应能工作**，与实测矛盾；②**混跑
+  排除**：发现进程内双 cudart（本库经 torch/lib 的 cudart12，wheel 为
+  CUDA13 构建走系统 CUDA13 bin）后，新增 FARM_CUDART_DLL=cudart64_13.dll
+  干净复测（loaded 日志确认单 runtime）——**自捕探针 c13 下
+  BeginCapture=0**（同一 runtime、同一 Global 模式、毫秒级先后），ORT 的
+  BeginCapture 仍 900；eager 3 跑 3 指纹依旧 ⇒ 两现象均为干净运行时的真实
+  行为；③终审不变：ORT 零围栏判死（对此 wheel）。**归因：ORT 侧**（证据
+  四条：官方 wheel=官方 tag 源码；我们的流自捕干净；47 行 sync 同句柄成功
+  而 56 行 BeginCapture 失败；源码意图与行为矛盾——上游 issue 素材齐备，
+  是否提交待用户拍板）。复验三件套已仪器化：FARM_ORT_ASYNC=2（翻案强制
+  通道）+ FARM_CUDART_DLL（cudart 版本选择）+ FARM_ORT_CAPTEST=1（流归属
+  探针）。
   测量污染注记：④的 2× 提速数测于**共享 GPU 时段**（本机另有会话在用卡）
   ——量级仅供参考，不入正账；判死结论不依赖它（900 与不确定指纹均为
   负载无关证据：sync 指纹 a3535388 跨天跨会话逐位复现，async 3 跑 3 异）。
   并发会话各有独立 CUDA context，不改变任何一方的逐位结果，只污染时延/
   吞吐数字——**共享时段的吞吐数必须标注或重测**（测量纪律新增）。
+- **零围栏翻案：fence 桥接（2026-09-24 同日，FARM_ORT_ASYNC=3——上条路标
+  的兑现）**：方案=图尾 InferfarmFence custom op（tools/patch_fence.py 打
+  补丁，数学零变化）+ D2H/收割语义重构。**与判死方案的本质差**：不碰
+  user_compute_stream、不赌 ORT 内部流序——fence kernel 是**纯流探针**
+  （Compute 只把 KernelContext_GetGPUComputeStream 给的 EP 统一流登记进
+  全局表），host 在 Run 提交后用该流做 D2H MemcpyAsync+EventRecord（图外
+  常规异步操作）；确定性锚=H2D 同步 memcpy+银行单飞（在飞≤1）+同流序
+  （replay→D2H→事件）。**v1 教训（kernel 内 EventRecord）**：捕获窗
+  （cudaStreamCaptureModeGlobal）内的 cudaEventRecord 把事件重置 pending
+  且不录进图（capture invalidated）——warmup 后事件永 notReady，另一形态
+  直接 Concat cudaErrorInvalidValue（错误漂移）；eager（图关）kernel 内
+  record 正常 ⇒ record 挪到图外 host 侧后图/eager 两态统一成立。
+  **inline（eager）判负补充**：ORT 统一流仅 enable_cuda_graph 启用，eager
+  下多流无探针可依（D2H 挂探针流读到漂移输出，实测）⇒ fence 仅图会话开
+  （for_bank+ort_cuda_graph），inline 回落同步。**验收（R6 门+YGO 产线
+  形状）**：fence==sync 跨通道逐位（gomoku fb8 银行/inline/复跑全绿；
+  YGO D3 fb64 512 局同种子胜局完全一致 195/512）；吞吐 gomoku dep
+  0.18-0.25→0.11-0.14ms/批、gpu_flight 81→98-101%；**YGO 128 链 512 局
+  交替 A/B 三轮：sync 106.9/98.8 vs fence 121.5/128.0 局/s=+21% 稳定**
+  （腿形状定律注意：A/B 已同形状配对）。**运行时契约**：模型须先跑
+  patch_fence.py（流指针走 ticket 握手：host 建会话前领票→kernel 按当前
+  票号登记流→Warmup 认领+烟雾 record/query 验证，认领失败=回落同步）；
+  本机须 FARM_CUDART_DLL=cudart64_13.dll（wheel=cu13 构建）+PATH 含
+  cudnn9（torch/lib）。
 
 ## 13. 推理缓存：键=组装行字节+权重代次（2026-09-22 追加，KataGo 吸收）
 同输入行必同输出（逐位）是行独立契约的直接推论——推理结果可以缓存。键=

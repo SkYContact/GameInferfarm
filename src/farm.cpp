@@ -460,10 +460,12 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
     bool infer_fail = false;
     for (long long guard = 0; guard < cfg_.max_decisions; guard++) {
         if (g->IsDone()) break;
-        {   // 契约 1（advance 无挂起点）的机器校验作用域
-            ScopedNoSuspend ns;
-            if (!g->AdvanceToDecision()) break;
-        }
+        // 契约 1 的机器校验只包 AssembleInto（Claim→Submit 在途写手窗口，
+        // drain 有界的真正对象）——advance 不包：legacy monolith 形态（整局
+        // 跑在 AdvanceToDecision 里，如 YGO 回接）合法地在 advance 内
+        // Claim/SubmitWait=挂起发生在槽已提交之后，对 drain 无害（2026-09-24
+        // YGO 腿首跑实锤误伤，此前断言覆盖面写宽了）。
+        if (!g->AdvanceToDecision()) break;
         dec++;
         if (!DriveDecision(g, grp)) {
             g->OnInferFail();   // 判负纪律：不静默重试（会撕裂确定性）

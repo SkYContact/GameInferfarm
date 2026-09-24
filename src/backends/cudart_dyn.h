@@ -38,6 +38,9 @@ struct Cudart {
     int (*EventQuery)(void*) = nullptr;
     int (*EventSynchronize)(void*) = nullptr;
     int (*EventDestroy)(void*) = nullptr;
+    // 流捕获态查询（fence 诊断；可选符号）：0=None 1=Global 2=ThreadLocal
+    // 3=Relaxed（cudaStreamCaptureStatus）
+    int (*StreamIsCapturing)(void*, int*) = nullptr;
 
     bool ok = false;
 
@@ -85,12 +88,14 @@ struct Cudart {
         EventQuery = (int (*)(void*))g("cudaEventQuery");
         EventSynchronize = (int (*)(void*))g("cudaEventSynchronize");
         EventDestroy = (int (*)(void*))g("cudaEventDestroy");
+        StreamIsCapturing = (int (*)(void*, int*))g("cudaStreamIsCapturing");
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
             || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
             std::fprintf(stderr, "[cudart] 缺导出符号\n");
             return false;
         }
         ok = true;
+        std::fprintf(stderr, "[cudart] loaded %s\n", p.c_str());   // 归属审计
         return true;
     }
 };

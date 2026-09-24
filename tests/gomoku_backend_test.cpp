@@ -11,6 +11,9 @@
 //   R5 批次/位置不变性门（G13 的真后端版，2026-09-24）：同一行内容在批大小
 //      n=1..满 与行位置变化下输出逐位同——GPU 归约策略随 shape 变化的直接
 //      检验。ort/trt 各一（工件/后端缺席=SKIP）
+//   R6 fence 桥接门（FARM_ORT_ASYNC=3，2026-09-24）：patch_fence.py 补丁模型
+//      fence 模式 == sync 基线逐位（跨通道主门）+ 复跑 + 银行 vs inline
+//      （工件缺席=SKIP）
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
@@ -249,6 +252,35 @@ int main() {
             r5("trt", trt_be, m, 8);
         } else {
             std::printf("SKIP R5 trt: 本构建未编 TRT\n");
+        }
+    }
+    // ---------------- R6：fence 桥接门（FARM_ORT_ASYNC=3，2026-09-24）----------------
+    // 判决12 翻案通道的验收：patch_fence.py 打补丁的模型（数学零变化）+ fence
+    // 模式腿 == sync 基线（R1 ort.fp）逐位——上次 =2 用户流方案就是挂在
+    // 这类跨通道对拍上（3 跑 3 指纹）。env 每会话读取（CreateSession 处），
+    // 同进程 _putenv 切档。工件缺席=SKIP。
+    {
+        const char* kFence = "models/gomoku_mlp.fb8_fence.onnx";
+        if (!have_ort) {
+            std::printf("SKIP R6: 无 %s\n", kOnnx);
+        } else if (!FileExists(kFence)) {
+            std::printf("SKIP R6: 无 %s（python tools/patch_fence.py %s "
+                        "--out %s）\n", kFence, kOnnx, kFence);
+        } else {
+            _putenv_s("FARM_ORT_ASYNC", "3");
+            R f1 = Leg("ort", kFence, nullptr, 2);
+            R f2 = Leg("ort", kFence, nullptr, 2);
+            R fi = Leg("ort", kFence, nullptr, 0);
+            _putenv_s("FARM_ORT_ASYNC", "0");
+            CHECK(f1.games == 32, "R6 fence 银行腿完成（32 局）");
+            CHECK(f1.fp == f2.fp, "R6 fence 复跑逐位同");
+            CHECK(f1.fp == fi.fp, "R6 fence 银行 vs inline 逐位一致（含指纹）");
+            if (ort.games == 32)
+                CHECK(f1.fp == ort.fp, "R6 fence==sync 跨通道逐位一致（主门）");
+            std::printf("[R6] fence 银行 %.0f 局/s / fence inline %.0f 局/s"
+                        "（sync 银行 %.0f 局/s）\n",
+                        f1.games / f1.sec, fi.games / f1.sec,
+                        ort.games / ort.sec);
         }
     }
     if (!have_ort && !have_trt) {

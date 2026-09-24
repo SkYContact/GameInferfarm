@@ -70,7 +70,8 @@ void FiberSuspend() {
     // 让出：Switch 回本工人调度器（恢复点=FiberPost 投递后工人再切入；
     // 恢复即结果就绪——收割侧先拷输出后投递）
     if (!t_fi_task) return;   // 线程腿误调=无操作（防御）
-    assert(t_nosuspend == 0);   // 契约 1：advance/assemble 作用域内挂起=适配器违约
+    assert(t_nosuspend == 0);   // 契约 1：组装直写槽窗口（ScopedNoSuspend
+                                 // 只包 AssembleInto）内挂起=适配器违约
     if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnSuspend();
     SwitchToFiber(t_fi_task->sched);
     // 恢复点：工人取走时已把状态翻回 RUNNING（见工人循环取走处）

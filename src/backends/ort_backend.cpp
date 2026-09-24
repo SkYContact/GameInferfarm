@@ -48,6 +48,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -115,14 +116,16 @@ static void SetSpinFlagsOnce() {
 
 // ORT 零围栏开关（env FARM_ORT_ASYNC，缺省关=现行为逐位不动）。语义：
 //   1=实测判死通道（打印判决，不启用 async——2026-09-24 实验账见判决12）
-//   2=翻案实验通道（强制启用 async：换 cudart 版本/换 ORT 版本后复验用；
-//     图会话若再撞 900 即为干净环境下的最终确认）
+//   2=翻案实验通道（用户流方案；判死保留复验用：换 cudart/ORT 版本后重跑）
+//   3=fence 桥接通道（2026-09-24）：图尾 InferfarmFence custom op 在 ORT 自己
+//     的流上盖事件章（tools/patch_fence.py 打补丁）——H2D/D2H 保持同步 memcpy
+//     （确定性锚），Run 带 disable_synchronize_execution_providers，收割=
+//     EventQuery（µs 级）。与 =2 的本质差：完全不碰 ORT 内部流序（上次跨流
+//     无序判死的根治），只在其流尾偷听。每会话 CreateSession 读一次 env
+//     （init 期调用，非热路径——static 缓存会挡住同进程 R6 门切档）。
 static int AsyncEnvMode() {
-    static const int v = [] {
-        const char* e = getenv("FARM_ORT_ASYNC");
-        return e && *e ? atoi(e) : 0;
-    }();
-    return v;
+    const char* e = getenv("FARM_ORT_ASYNC");
+    return e && *e ? atoi(e) : 0;
 }
 static bool SharedEnv() {
     static const bool v = [] {
@@ -131,6 +134,124 @@ static bool SharedEnv() {
     }();
     return v;
 }
+
+// ==================== InferfarmFence custom op（FARM_ORT_ASYNC=3）====================
+// 整设备同步围栏（~0.4-0.5ms/批）的拆除通道（判决12 翻案路标）：tools/
+// patch_fence.py 在 fb onnx 图尾挂一个无输入 fence 节点（输出挂 graph output
+// 防剪枝）。kernel 是**纯流探针**：Compute 里只从 KernelContext 拿 ORT 正在
+// 执行的 GPU 流并登记进全局表——host 侧在 Run 提交后用这条流做 MemcpyAsync
+// (D2H)+EventRecord（图外常规异步操作，零捕获语义参与）。确定性锚=H2D 同步
+// memcpy；同流序 H2D(已完成)→GraphLaunch/eager 内核→D2H→事件 ⇒ 收割=
+// EventQuery（µs 级）。
+//
+// 【为什么不把 EventRecord 放 kernel 里（v1 教训，2026-09-24 实测）】ORT 图
+// 捕获（cudaStreamCaptureModeGlobal）窗口内的 cudaEventRecord 会把事件重置
+// 为 pending 且不录进图（capture invalidated）——warmup 捕获跑后事件永
+// notReady，另一形态直接 Concat cudaErrorInvalidValue（错误漂移）。eager
+// 路径（图关）kernel 内 record 完全正常（inline 392 局/s 实测过）。v2 把
+// record 挪到图外 host 侧后两种模式统一成立。
+//
+// 流指针生命周期=EP 统一流（enable_cuda_graph 时 ORT 自建 NonBlocking 流，
+// 会话终身）——比事件还稳。host 认领在 Warmup（首跑 Compute 必已登记；
+// CreateSession 后 kernel 尚未执行过）。ticket 握手与 v1 同：运行时指针
+// 烤不进 onnx 属性，host 领票→kernel 按当前票号登记→Warmup 持票认领。
+struct FenceKernelData {
+    uint64_t ticket = 0;
+    const OrtApi* api = nullptr;
+};
+
+static std::mutex g_fence_mx;
+static uint64_t g_fence_cur_ticket = 0;
+static std::unordered_map<uint64_t, std::vector<void*>> g_fence_streams;
+
+static uint64_t FenceTicketBegin() {
+    std::lock_guard<std::mutex> lk(g_fence_mx);
+    return ++g_fence_cur_ticket;
+}
+static void* FenceTicketClaim(uint64_t t) {
+    std::lock_guard<std::mutex> lk(g_fence_mx);
+    auto it = g_fence_streams.find(t);
+    if (it == g_fence_streams.end() || it->second.empty()) return nullptr;
+    void* st = it->second.back();
+    it->second.pop_back();
+    if (it->second.empty()) g_fence_streams.erase(it);
+    return st;
+}
+
+static OrtStatusPtr FenceCreateKernel(const OrtCustomOp*, const OrtApi* api,
+                                      const OrtKernelInfo*, void** kernel) {
+    FenceKernelData* k = new FenceKernelData();
+    k->api = api;
+    {
+        std::lock_guard<std::mutex> lk(g_fence_mx);
+        k->ticket = g_fence_cur_ticket;
+    }
+    *kernel = k;
+    return nullptr;
+}
+static void FenceKernelDestroy(void* kernel) {
+    delete (FenceKernelData*)kernel;
+}
+static OrtStatusPtr FenceCompute(void* kernel, OrtKernelContext* context) {
+    FenceKernelData* k = (FenceKernelData*)kernel;
+    // 诊断开关（FARM_ORT_FENCE_DBG=1）：流归属/捕获态一击定位
+    static const bool dbg = [] {
+        const char* e = getenv("FARM_ORT_FENCE_DBG");
+        return e && *e && atoi(e) == 1;
+    }();
+    void* stream = nullptr;
+    OrtStatusPtr st = k->api->KernelContext_GetGPUComputeStream(context, &stream);
+    if (st) {
+        if (dbg) std::fprintf(stderr, "[fence][dbg] GetStream 返回 status\n");
+        return st;
+    }
+    if (!stream) {   // 非 CUDA 执行（EP 回落 CPU 等）——不登记，Warmup 自检
+                     // 会抓住并回落同步
+        if (dbg) std::fprintf(stderr, "[fence][dbg] stream=null（不登记）\n");
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_fence_mx);
+        auto& v = g_fence_streams[k->ticket];
+        if (v.empty() || v.back() != stream) v.push_back(stream);
+    }
+    if (dbg) {
+        int cap = -1;
+        if (g_cu.StreamIsCapturing) g_cu.StreamIsCapturing(stream, &cap);
+        std::fprintf(stderr, "[fence][dbg] 登记流 %p ticket=%llu capturing=%d"
+                     "（0=None 1=Global）\n", stream,
+                     (unsigned long long)k->ticket, cap);
+    }
+    return nullptr;
+}
+
+// vtable：继承聚合零填 + 构造器逐槽位填（C++ 无指定初始化器）；可选回调
+// （GetMayInplace 等）保持 null=ORT 判空跳过
+struct FenceOp : OrtCustomOp {
+    FenceOp() {
+        std::memset(this, 0, sizeof(*this));
+        version = ORT_API_VERSION;
+        CreateKernelV2 = &FenceCreateKernel;
+        GetName = [](const OrtCustomOp*) { return "InferfarmFence"; };
+        GetExecutionProviderType =
+            [](const OrtCustomOp*) { return "CUDAExecutionProvider"; };
+        GetInputTypeCount = [](const OrtCustomOp*) -> size_t { return 0; };
+        GetOutputTypeCount = [](const OrtCustomOp*) -> size_t { return 1; };
+        GetOutputType = [](const OrtCustomOp*, size_t) {
+            return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+        };
+        KernelComputeV2 = &FenceCompute;
+        KernelDestroy = &FenceKernelDestroy;
+        GetInputCharacteristic = [](const OrtCustomOp*, size_t) {
+            return OrtCustomOpInputOutputCharacteristic::
+                INPUT_OUTPUT_OPTIONAL;   // 实际不调（count=0）
+        };
+        GetOutputCharacteristic = [](const OrtCustomOp*, size_t) {
+            return OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_REQUIRED;
+        };
+    }
+};
+static FenceOp g_fence_op;   // 进程一份（注册进每个非 DML 会话的域）
 
 struct OrtIn {
     InputMeta meta;
@@ -187,6 +308,14 @@ struct OrtSess {
     // 通道）。H2D→Run→D2H→EventRecord 同流序 ⇒ 逐位不变性由序保证。
     // 探测会话恒同步（LoadSpec 语义依赖同步 Run）。
     bool async = false;
+    // fence 桥接（FARM_ORT_ASYNC=3）：fence kernel 是流探针（Compute 只登记
+    // ORT 内部流）；host 在 Run 提交后用该流做 D2H MemcpyAsync+EventRecord
+    // （图外常规异步操作）。确定性锚=H2D 同步 memcpy；收割=纯 EventQuery。
+    // 认领在 Warmup（首跑 Compute 必已登记；CreateSession 后 kernel 未跑过）。
+    bool fence = false;
+    uint64_t fence_ticket = 0;
+    void* fence_stream = nullptr;   // 认领自注册表的 ORT EP 统一流
+    OrtCustomOpDomain* domain = nullptr;   // fence 域（ReleaseSession 后释放）
     void* stream = nullptr;
     void* event = nullptr;
     OrtRunOptions* ro = nullptr;
@@ -255,17 +384,38 @@ public:
                     return false;
             }
             if (!RunOnce(s)) {
-                std::fprintf(stderr, "[ort] Warmup 失败（async=%d graph=%d）\n",
-                             (int)s->async, (int)s->graph_on);
+                std::fprintf(stderr, "[ort] Warmup 失败（async=%d graph=%d fence=%d）\n",
+                             (int)s->async, (int)s->graph_on, (int)s->fence);
                 return false;
             }
             if (!s->dml) g_cu.DeviceSynchronize();
         }
-        std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s%s\n", s->slots,
+        // fence 认领+烟雾（FARM_ORT_ASYNC=3）：首跑 Compute 必已登记 ORT 流——
+        // 此刻持票认领，record→sync→query 验证整链（流指针合法+事件真盖章）。
+        // 失败（模型未打补丁/EP 回落 CPU）=回落同步，不等看门狗
+        if (s->fence) {
+            s->fence_stream = FenceTicketClaim(s->fence_ticket);
+            bool ok = s->fence_stream && g_cu.EventRecord && g_cu.EventQuery;
+            if (ok) ok = g_cu.EventRecord(s->event, s->fence_stream) == 0;
+            if (ok) {
+                g_cu.DeviceSynchronize();
+                ok = g_cu.EventQuery(s->event) == 0;
+            }
+            if (!ok) {
+                std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3 fence 认领/烟雾失败"
+                             "（流=%p——模型未打 fence 补丁？）→ 本会话回落同步"
+                             "路径\n", s->fence_stream);
+                s->fence = false;
+                s->fence_stream = nullptr;
+                if (s->ro) { api_->ReleaseRunOptions(s->ro); s->ro = nullptr; }
+            }
+        }
+        std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s%s%s\n", s->slots,
                      s->dml ? "，DML=宿主绑定+同步 Run（无图无围栏）"
                             : (s->graph_on ? "，CUDA Graph=开（银行会话：调度台线程绑定）"
                                            : "，CUDA Graph=关"),
-                     s->async ? "，零围栏=开（用户流+事件收割）" : "");
+                     s->async ? "，零围栏=开（用户流+事件收割）" : "",
+                     s->fence ? "，fence 桥接=开（图尾事件章+同步锚）" : "");
         return true;
     }
 
@@ -324,10 +474,13 @@ public:
         if (s->iob) a->ReleaseIoBinding(s->iob);
         if (s->ro) a->ReleaseRunOptions(s->ro);
         if (s->event && g_cu.EventDestroy) g_cu.EventDestroy(s->event);
+        // （=2 用户流与 fence 桥接的事件均 host 自建——此处统一销毁）
         if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
         for (auto& i : s->ins) if (i.val) a->ReleaseValue(i.val);
         for (auto& o : s->outs) if (o.val) a->ReleaseValue(o.val);
         if (s->sess) a->ReleaseSession(s->sess);
+        if (s->domain) a->ReleaseCustomOpDomain(s->domain);   // 头文件契约：
+        // 域须在所有用它的会话释放之后再删——放 ReleaseSession 后
         if (s->env && !SharedEnv()) a->ReleaseEnv(s->env);   // 共享 env=进程寿命，不释放
         if (s->bind_mem) a->ReleaseMemoryInfo(s->bind_mem);
         if (s->dml) {
@@ -414,6 +567,18 @@ public:
                     }
             }
             if (!RunOnce(s, s->ro)) return false;
+            if (s->fence) {
+                // fence 桥接 v2：replay/eager 内核已提交到 ORT EP 统一流——D2H
+                // 前缀异步挂同流（流序=图内核之后 ⇒ 读到本批输出）+ 事件盖章。
+                // 图外常规异步操作，零捕获语义参与（v1 捕获窗内 record 判死）。
+                for (size_t j = 0; j < s->outs.size(); j++)
+                    if (g_cu.MemcpyAsync(s->outs[j].host, s->outs[j].dev,
+                                         (size_t)s->last_n
+                                             * (size_t)s->outs[j].meta.width * 4,
+                                         2, s->fence_stream))
+                        return false;
+                if (g_cu.EventRecord(s->event, s->fence_stream)) return false;
+            }
             if (s->async) {
                 // 前缀 D2H 同流入队（序=Run 后）+ 事件盖戳——事件完成=输出已
                 // 驻留 host arena（pinned，标准可见性语义）。收割=EventQuery。
@@ -443,6 +608,13 @@ public:
         if (s->dml) return s->h_done.load(std::memory_order_acquire) >= seq;
         if (seq < s->seq) return true;         // 旧序号（早已完成）
         if (s->synced_for_seq) return true;
+        if (s->fence) {
+            // fence 桥接 v2：事件在 D2H 之后同流盖章——ready=前缀输出已驻留
+            // host arena（pinned 完成可见性）。纯查询，µs 级。
+            if (!g_cu.EventQuery || g_cu.EventQuery(s->event) != 0) return false;
+            s->synced_for_seq = true;
+            return true;
+        }
         if (s->async) {
             // 零围栏：事件在 D2H 之后入流——查询完成=前缀输出已驻留 host
             if (g_cu.EventQuery && g_cu.EventQuery(s->event) == 0) {
@@ -726,10 +898,36 @@ private:
                                  && *getenv("FARM_CUDART_DLL")
                                  ? getenv("FARM_CUDART_DLL") : "cudart64_12.dll");
                 }
+            } else if (!spec_out && AsyncEnvMode() == 3
+                       && for_bank && cfg.ort_cuda_graph
+                       && g_cu.EventCreateWithFlags && g_cu.EventRecord
+                       && g_cu.EventQuery) {
+                // fence 桥接：不建用户流、不传 user_compute_stream——ORT 用它
+                // 自己的 EP 统一流（enable_cuda_graph 才启用；eager=多流无探针
+                // 可依，inline 实测漂移=回落同步），fence 探针在图尾暴露该流。
+                // 事件族符号缺席=回落同步。
+                if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+                s->fence = true;
+                std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3：fence 桥接启用"
+                             "（H2D 同步锚+图尾事件章）\n");
             } else if (!spec_out && AsyncEnvMode() == 1) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：实测判死（图=捕获不落"
                              "用户流 900；eager=逐位不确定 3 跑 3 指纹）——本会话"
-                             "走原同步路径（判决12 全账；=2 走翻案实验通道）\n");
+                             "走原同步路径（判决12 全账；=2/=3 走翻案通道）\n");
+            }
+            // fence 域恒注册（非 DML 会话）：模型含 InferfarmFence 节点时探测
+            // 会话（LoadSpec）也须能解析；无 fence 节点的模型注册域零副作用
+            {
+                OrtCustomOpDomain* dom = nullptr;
+                if (!a->CreateCustomOpDomain("inferfarm", &dom)
+                    && !a->CustomOpDomain_Add(dom, &g_fence_op)
+                    && !a->AddCustomOpDomain(opts, dom)) {
+                    s->domain = dom;
+                } else {
+                    if (dom) a->ReleaseCustomOpDomain(dom);
+                    std::fprintf(stderr, "[ort] fence 域注册失败（含 InferfarmFence"
+                                 " 节点的模型将拒载）\n");
+                }
             }
             OrtCUDAProviderOptionsV2* co = nullptr;
             bool graph = for_bank && cfg.ort_cuda_graph;
@@ -767,6 +965,7 @@ private:
         }
         wchar_t wpath[1024];
         MultiByteToWideChar(CP_UTF8, 0, cfg.model_path.c_str(), -1, wpath, 1024);
+        if (s->fence) s->fence_ticket = FenceTicketBegin();
         OrtStatus* stc = a->CreateSession(s->env, wpath, opts, &s->sess);
         a->ReleaseSessionOptions(opts);
         if (stc) {
@@ -775,9 +974,10 @@ private:
             DestroySession(s);
             return nullptr;
         }
-        // 零围栏件：RunOptions（关 EP 同步）+ 事件（disable timing）。失败=回落
-        // 同步（会话已建成，流无害留存）。
-        if (s->async) {
+        // 零围栏件：RunOptions（关 EP 同步）+ 自建事件（disable timing；=2 与
+        // fence 模式共用——fence 的事件在 Warmup 认领流后建）。失败=回落同步
+        // （会话已建成，流无害留存）。
+        if (s->async || s->fence) {
             if (a->CreateRunOptions(&s->ro)
                 || a->AddRunConfigEntry(s->ro,
                                         "disable_synchronize_execution_providers",
@@ -789,6 +989,7 @@ private:
                 if (s->ro) { a->ReleaseRunOptions(s->ro); s->ro = nullptr; }
                 s->event = nullptr;
                 s->async = false;
+                s->fence = false;
             }
         }
         if (dml) {
