@@ -86,7 +86,8 @@ gomoku.exe --backend ort --model models/gomoku_cnn.fb16.onnx \
 
 `models/gomoku_cnn.fb16.onnx` 已随仓分发（27MB）——没有 GPU 训练条件也可
 直接跑后三行。CPU 后端（`--backend cpu`）不支持该 CNN（点积后端仅一层
-MLP）；未训练 MLP 范例走 `tools/bake_gomoku_mlp.py`。
+MLP）；未训练 MLP 范例走 `tools/bake_gomoku_mlp.py`。**cpu 腿定位=确定性
+门/无 GPU 全链验证的工具，非性能路径**——吞吐数字只在同后端之间比较。
 
 ## 生态位（为什么不用现成框架跑这个基准）
 
@@ -96,6 +97,7 @@ MLP）；未训练 MLP 范例走 `tools/bake_gomoku_mlp.py`。
 | SampleFactory | 单机高吞吐 RL 训练系统（batched inference + rollout workers） | 绑定训练算法栈；"带自己的游戏来跑对局"需按其 env API 重写 |
 | OpenSpiel | 博弈算法/环境广度（AlphaZero/MCTS 等） | 以广度为目标，非吞吐 |
 | KataGo | 围棋专用自博弈引擎 | 单游戏，不可接入自己的游戏 |
+| Madrona / Brax 等全设备端仿真 | 整个仿真搬上 GPU（ECS/JIT/vmap） | 轻状态可并行游戏的另一极；协议/状态重的游戏（进程内胖引擎）上不去 GPU——这条边界正是本框架的生态位 |
 | **GameInferfarm** | **游戏无关的推理层库：你的 GameAdapter + 你的模型 → 并发/攒批/图/取证全托管** | 本基准的主角 |
 
 ## 与产线的关系
