@@ -68,6 +68,8 @@ static R Leg(const char* backend, const char* model, const char* engine, int ban
 }
 
 int main() {
+    std::fprintf(stderr, "[test] main 进入\n");
+    std::fflush(stderr);
     const char* kOnnx = "models/gomoku_mlp.fb8.onnx";
     const char* kTrt = "models/gomoku_mlp.fb8.trt";
     std::printf("=== 真模型可选门（工件缺席=SKIP）===\n");

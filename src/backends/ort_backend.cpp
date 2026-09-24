@@ -368,6 +368,14 @@ public:
         return CreateSession(cfg, spec.slots, for_bank, nullptr);
     }
 
+    // 探测砍除通道（能力位）：LoadSpec 的探测会话可砍——首个真实银行会话
+    // 顺带产出 spec（内部 4 参 CreateSession 本就支持 spec_out）
+    bool ProbeFreeSpec() const override { return true; }
+    void* CreateSessionWithSpec(const ModelConfig& cfg, int slots,
+                                bool for_bank, ModelSpec* spec_out) override {
+        return CreateSession(cfg, slots, for_bank, spec_out);
+    }
+
     bool Warmup(void* session) override {
         OrtSess* s = (OrtSess*)session;
         memset(s->in_h_arena, 0, s->in_h_bytes);
@@ -844,9 +852,18 @@ private:
         }
     }
 
-    // spec_out 非空=探测会话（LoadSpec 用）：跑完元数据枚举即毁
+    // spec_out 非空=顺带枚举规格（LoadSpec 探测/探测砍除通道共用）：跑完即毁
+    // 或常驻。**懒加载守卫必须置顶**：探测砍除通道下 LoadSpec 不再被调用，
+    // 本函数就是 DLL/cudart 的首个触碰点（api_/g_cu 全 null 的段错误案
+    // 2026-09-24）——LoadLib/g_cu.Load 均幂等，重复调用零成本。
     OrtSess* CreateSession(const ModelConfig& cfg, int slots, bool for_bank,
                               ModelSpec* spec_out) {
+        dml_ = (cfg.ort_ep == "dml");
+        if (!LoadLib(cfg)) return false;
+        if (!dml_) {
+            if (!g_cu.Load(cfg.cuda_dir)) return false;
+            SetSpinFlagsOnce();
+        }
         const OrtApi* a = api_;
         if (cfg.model_path.empty()) {
             std::fprintf(stderr, "[ort] 缺 model_path（fb 烤死的 onnx）\n");
@@ -905,7 +922,9 @@ private:
             // 铁律：创建/回放同线程——银行会话全生命周期在调度台线程上）。----
             // 零围栏：1=判死打印不启用；2=翻案实验通道（NonBlocking 用户流 +
             // provider option + RunOptions 关 EP 同步 + 事件收割，探测会话除外）
-            if (!spec_out && AsyncEnvMode() == 2) {
+            // 门按 for_bank 判（探测会话 for_bank=false 自然排除）——探测砍除
+            // 通道下首个真实银行会话带 spec_out，照样吃 fence。
+            if (for_bank && AsyncEnvMode() == 2) {
                 if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
                 if (!g_cu.StreamCreateWithFlags
                     || g_cu.StreamCreateWithFlags(&s->stream, 0x01) != 0) {
@@ -919,8 +938,8 @@ private:
                                  && *getenv("FARM_CUDART_DLL")
                                  ? getenv("FARM_CUDART_DLL") : "cudart64_12.dll");
                 }
-            } else if (!spec_out && AsyncEnvMode() == 3
-                       && for_bank && cfg.ort_cuda_graph
+            } else if (for_bank && AsyncEnvMode() == 3
+                       && cfg.ort_cuda_graph
                        && g_cu.EventCreateWithFlags && g_cu.EventRecord
                        && g_cu.EventQuery) {
                 // fence 桥接：不建用户流、不传 user_compute_stream——ORT 用它
@@ -931,7 +950,7 @@ private:
                 s->fence = true;
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3：fence 桥接启用"
                              "（H2D 同步锚+图尾事件章）\n");
-            } else if (!spec_out && AsyncEnvMode() == 1) {
+            } else if (for_bank && AsyncEnvMode() == 1) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：实测判死（图=捕获不落"
                              "用户流 900；eager=逐位不确定 3 跑 3 指纹）——本会话"
                              "走原同步路径（判决12 全账；=2/=3 走翻案通道）\n");

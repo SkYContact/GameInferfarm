@@ -157,6 +157,7 @@ bool Farm::Init(FarmConfig cfg) {
     }
     group_bes_.clear();
     group_specs_.clear();
+    bool g0_deferred = false;   // 探测砍除：组 0 spec 由首个银行会话产出
     for (size_t gi = 0; gi < devs.size(); gi++) {
         InferBackend* be = MakeBackend(devs[gi].model.backend);
         if (!be) {
@@ -169,6 +170,19 @@ bool Farm::Init(FarmConfig cfg) {
         // 组形状提示：主组=cfg.slots；非主组可自带（异构小图，如核显 fb4）
         const int hint = (gi == 0 || devs[gi].slots <= 0) ? cfg_.slots
                                                           : devs[gi].slots;
+        // 探测会话砍除（能力位 ProbeFreeSpec，ort 专属）：组 0 且银行制 →
+        // LoadSpec 延后到首个银行会话顺带产出 spec（YGO 清单模式：探测
+        // ≈0.1s/次 × 56 腿/代 ≈ 5.6s/代 纯探测税）。组 0 spec 占位
+        // （ins 空=延迟标记）；组 1..N 照旧 probe，其结构对拍移到
+        // InitGroups 后与组 0 实 spec 进行。
+        if (gi == 0 && total_banks > 0 && be->ProbeFreeSpec()) {
+            g0_deferred = true;
+            ModelSpec placeholder;
+            placeholder.slots = hint;
+            placeholder.backend = devs[gi].model.backend;
+            group_specs_.push_back(placeholder);
+            continue;
+        }
         ModelSpec s;
         if (!be->LoadSpec(devs[gi].model, hint, s)) {
             std::fprintf(stderr, "[farm] 设备 %zu LoadSpec 失败（backend=%s）\n",
@@ -186,7 +200,7 @@ bool Farm::Init(FarmConfig cfg) {
         }
         if (gi == 0) {
             spec_ = s;
-        } else if (!SpecStructurallyEqual(spec_, s)) {
+        } else if (!g0_deferred && !SpecStructurallyEqual(spec_, s)) {
             std::fprintf(stderr, "[farm] 设备 %zu 模型结构与设备 0 不一致"
                          "（输入名/行宽/dtype、输出名/宽须全同；dim0 可异"
                          "[异构批形状]）\n", gi);
@@ -201,20 +215,22 @@ bool Farm::Init(FarmConfig cfg) {
     backend_ = group_bes_[0];
     n_dev_ = (int)devs.size();
     // population 路由校验（判决16）：须银行制（inline 单会话面未覆盖）+ 主组
-    // spec 确有标记为 population 的输入
+    // spec 确有标记为 population 的输入（探测砍除通道下后半移到 InitGroups 后）
     if (!cfg_.model.population_input.empty()) {
         if (total_banks <= 0) {
             std::fprintf(stderr, "[farm] population 路由须银行制（banks>0）\n");
             return false;
         }
-        bool has_pop = false;
-        for (auto& m : spec_.ins)
-            if (m.population) { has_pop = true; break; }
-        if (!has_pop) {
-            std::fprintf(stderr, "[farm] population_input=\"%s\" 在模型输入中未找到"
-                         "（cpu 后端=decl.pop_p>0 自动追加；ort=路由图导出）\n",
-                         cfg_.model.population_input.c_str());
-            return false;
+        if (!g0_deferred) {
+            bool has_pop = false;
+            for (auto& m : spec_.ins)
+                if (m.population) { has_pop = true; break; }
+            if (!has_pop) {
+                std::fprintf(stderr, "[farm] population_input=\"%s\" 在模型输入中未找到"
+                             "（cpu 后端=decl.pop_p>0 自动追加；ort=路由图导出）\n",
+                             cfg_.model.population_input.c_str());
+                return false;
+            }
         }
     }
     // 链→组分配：平滑加权轮询（nginx 同款；确定性=链号函数，重跑逐位不破）。
@@ -259,6 +275,28 @@ bool Farm::Init(FarmConfig cfg) {
             return false;
         }
         bank_ = &bank_obj_;
+        if (g0_deferred) {
+            // 探测砍除通道的后置校验（原 LoadSpec 期检查后移）：slots/组间
+            // 结构/population——失败=显式关银行（Init 只建未跑，安全）再退
+            bool bad = spec_.slots != cfg_.slots;
+            for (size_t gi = 1; gi < group_specs_.size() && !bad; gi++)
+                bad = !SpecStructurallyEqual(spec_, group_specs_[gi]);
+            if (!bad && !cfg_.model.population_input.empty()) {
+                bool has_pop = false;
+                for (auto& m : spec_.ins)
+                    if (m.population) { has_pop = true; break; }
+                bad = !has_pop;
+            }
+            if (bad) {
+                std::fprintf(stderr, "[farm] 探测砍除通道后置校验失败"
+                             "（dim0=%d hint=%d）——关农场\n",
+                             spec_.slots, cfg_.slots);
+                bank_obj_.Shutdown();
+                bank_ = nullptr;
+                Shutdown();
+                return false;
+            }
+        }
     } else if (!inline_.Init(*backend_, cfg_.model, spec_)) {
         std::fprintf(stderr, "[farm] inline 会话启动失败\n");
         return false;

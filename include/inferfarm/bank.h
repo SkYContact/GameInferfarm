@@ -75,6 +75,9 @@ public:
     bool Init(const BankConfig& cfg, const ModelConfig& mcfg, ModelSpec* spec_out);
     // 多设备组建池：每组独立后端/模型/银行数；spec_out 仍为全局规格（Farm 已
     // 核各组结构一致）。会话按组在调度台线程上创建。
+    // 探测砍除通道：组 0 spec 可延迟产出（BankGroupCfg.spec.ins 空=占位，
+    // 须 ProbeFreeSpec 后端）——首家银行会话经 CreateSessionWithSpec 顺带
+    // 枚举并回填 spec_out；组 1..N 恒须完整 spec。
     bool InitGroups(const BankConfig& cfg, const std::vector<BankGroupCfg>& groups,
                     ModelSpec* spec_out);
     // **前置条件：所有腿已返回**（无在途 FLIGHT、无挂起写手）。停机路径会

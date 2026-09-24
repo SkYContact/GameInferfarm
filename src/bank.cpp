@@ -786,13 +786,19 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     I.n_groups = (int)groups.size();
     // 调度台线程上建会话（ORT 图会话 PerThreadContext 铁律：创建/热身/回放
     // 须同线程；TRT 同规更稳；跨组同线程无碍——各组会话独立）
-    I.disp = std::thread([&I, groups] {
+    I.disp = std::thread([&I, groups, spec_out] {
         double tb0 = NowMsD();
         bool ok = true;
         int id = 0;
+        ModelSpec g0_harvest;         // 探测砍除：组 0 spec 由首家会话产出
         for (int g = 0; g < I.n_groups && ok; g++) {
             const BankGroupCfg& gc = groups[(size_t)g];
             const int gslots = gc.slots > 0 ? gc.slots : gc.spec.slots;
+            if (gc.spec.ins.empty() && g != 0) {   // 防御：延迟 spec 仅组 0
+                std::fprintf(stderr, "[bank] 组 %d spec 占位非法（延迟 spec 仅组 0）\n", g);
+                ok = false;
+                break;
+            }
             ModelSpec gspec = gc.spec;
             gspec.slots = gslots;   // 形状差只许 dim0：行宽/名字已由 Farm 核对
             for (int k = 0; k < gc.banks && ok; k++, id++) {
@@ -801,8 +807,29 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 b.grp = g;
                 b.be = gc.be;
                 b.slots = gslots;
-                b.sess = b.be->CreateSession(gc.model, gspec, /*for_bank=*/true);
-                if (!b.sess) { ok = false; break; }
+                if (g == 0 && gc.spec.ins.empty()) {
+                    // 探测砍除通道（能力位 ProbeFreeSpec）：首个真实银行会话
+                    // 顺带产出组 0 spec——省一次建探测会话即毁（YGO 清单模式
+                    // ≈0.1s×56 腿/代）
+                    b.sess = b.be->CreateSessionWithSpec(gc.model, gslots,
+                                                         /*for_bank=*/true,
+                                                         &g0_harvest);
+                    if (!b.sess) { ok = false; break; }
+                    if (g0_harvest.slots != gslots) {
+                        std::fprintf(stderr, "[bank] 组 0 模型批形状 dim0=%d ≠ %d"
+                                     "（探测砍除通道后校验）\n",
+                                     (int)g0_harvest.slots, gslots);
+                        ok = false;
+                        break;
+                    }
+                    gspec = g0_harvest;
+                    gspec.slots = gslots;
+                    I.spec = g0_harvest;      // Claim 清零面立即可用
+                    *spec_out = g0_harvest;   // Farm 侧 spec_ 回填
+                } else {
+                    b.sess = b.be->CreateSession(gc.model, gspec, /*for_bank=*/true);
+                    if (!b.sess) { ok = false; break; }
+                }
                 if (!b.be->Warmup(b.sess)) { ok = false; break; }
                 b.cursor.store(0);
                 b.inflight.store(0);

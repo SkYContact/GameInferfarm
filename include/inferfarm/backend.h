@@ -69,6 +69,19 @@ public:
         (void)session; (void)pop_input; (void)host;
         return false;
     }
+
+    // 能力位：LoadSpec 需要建"探测会话"（枚举元数据即毁——ORT≈0.1s/次，
+    // 清单模式 56 腿/代≈5.6s/代纯探测税）的后端可声明 true：Farm 对组 0
+    // 砍探测，改由首个真实银行会话经 CreateSessionWithSpec 顺带产出 spec。
+    // cpu（声明展开，零成本）/trt 不必强推——缺省 false 走老路。
+    virtual bool ProbeFreeSpec() const { return false; }
+    // 探测砍除通道：建会话并顺带枚举模型规格写入 *spec_out。仅
+    // ProbeFreeSpec()==true 的后端会被调用；其余后端缺省返回 nullptr。
+    virtual void* CreateSessionWithSpec(const ModelConfig& cfg, int slots,
+                                        bool for_bank, ModelSpec* spec_out) {
+        (void)cfg; (void)slots; (void)for_bank; (void)spec_out;
+        return nullptr;
+    }
 };
 
 } // namespace inferfarm

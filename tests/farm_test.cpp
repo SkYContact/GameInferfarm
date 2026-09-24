@@ -14,8 +14,11 @@
 //  G12 腿形状热调（回接方清单需求）：同农场 SetLegShape 续腿=新鲜农场同形状
 //     逐位同；非法形状拒绝
 //  G13 批次/位置不变性门（后端契约级，行独立的直接机器校验）：同一行内容
-//     在批大小 n=1..满 与行位置 0..满 变化下输出逐位同（G1 是游戏负载的
+//     在批大小 n=1..满 与行位置变化下输出逐位同（G1 是游戏负载的
 //     间接版；本门直接枚举。ort/trt 同协议=R5/gomoku_backend_test）
+//  G14 Farm 代际重建逐位门（清单模式契约，2026-09-24 接入方提案）：同进程
+//     建→跑→销毁 ×3 代同种子逐位同，代间搀异构形态腿弄脏静态；缓存开变体
+//     另验（此前该契约只有 YGO --ort-jobs 侧对拍）
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/backend.h"
@@ -679,6 +682,32 @@ int main() {
             if (sess) be->DestroySession(sess);
         }
         delete be;
+    }
+
+    // ---------------- G14：Farm 代际重建逐位门（清单模式契约）----------------
+    // 同进程 建→跑→销毁 ×3 代同种子：跨代指纹/胜局/决策数逐位同——Farm/
+    // fiber/bank 无静态残留。此前该契约只有 YGO --ort-jobs 侧对拍（跨代际
+    // 同种子逐位三验全绿），框架自有 G 门补上。代间搀入异构形态腿（inline
+    // banks=0，不同种子）弄脏全局静态后仍零携带；缓存开变体另验（缓存表随
+    // Farm 代际重建，跨代零携带且须有真实命中）。
+    {
+        LegResult g[3];
+        bool ok = true;
+        for (int gen = 0; gen < 3; gen++) {
+            g[(size_t)gen] = RunOne(2, true, 4, 20260924u);
+            if (gen) {
+                const LegResult& p = g[0];
+                const LegResult& c = g[(size_t)gen];
+                ok = c.fp == p.fp && c.fw == p.fw && c.sw == p.sw
+                     && c.decisions == p.decisions && ok;
+            }
+            RunOne(0, true, 4, 777u);   // 代间弄脏：异构形态腿（inline）
+        }
+        CHECK(ok, "G14 Farm 代际重建×3 逐位同（代间搀 inline 腿弄脏静态）");
+        LegResult c0 = RunOne(2, true, 4, 20260924u, false, 16);
+        LegResult c1 = RunOne(2, true, 4, 20260924u, false, 16);
+        CHECK(c1.fp == c0.fp && c1.decisions == c0.decisions,
+              "G14a 缓存开代际重建逐位同");
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
