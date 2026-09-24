@@ -859,9 +859,11 @@ private:
     OrtSess* CreateSession(const ModelConfig& cfg, int slots, bool for_bank,
                               ModelSpec* spec_out) {
         dml_ = (cfg.ort_ep == "dml");
-        if (!LoadLib(cfg)) return false;
+        // 指针返回函数：bool 字面量转空指针在严格编译器下报错（2d0d709
+        // 862/864 接入方报告案）——一律 nullptr
+        if (!LoadLib(cfg)) return nullptr;
         if (!dml_) {
-            if (!g_cu.Load(cfg.cuda_dir)) return false;
+            if (!g_cu.Load(cfg.cuda_dir)) return nullptr;
             SetSpinFlagsOnce();
         }
         const OrtApi* a = api_;
