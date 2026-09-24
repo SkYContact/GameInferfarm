@@ -28,7 +28,8 @@ struct FiChain {                        // 链级共享（=线程模式的链线
     int chain = 0, per = 0;
     void* user = nullptr;
 };
-struct FiTask {                         // 一局一 fiber
+struct alignas(64) FiTask {             // 一局一 fiber（64B 对齐：多 fiber 热字
+                                        // 段不共享缓存行——P1-6 伪共享隔离）
     void* fiber = nullptr;
     FiChain* ch = nullptr;
     int gi = 0;

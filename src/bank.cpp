@@ -71,7 +71,9 @@ struct BankReq {
 
 enum { BK_POOL = 0, BK_FILL, BK_CLOSED, BK_FLIGHT };
 
-struct BankCtl {
+struct alignas(64) BankCtl {            // 64B 对齐：相邻银行的 cursor/inflight/
+                                        // state 热原子不与他行共享缓存行
+                                        //（P1-6 伪共享隔离，2026-09-24 审计）
     int id = 0;
     int grp = 0;                          // 设备组号（多 GPU 判决15）
     InferBackend* be = nullptr;           // 组后端（会话仍按银行隔离）

@@ -41,6 +41,12 @@ struct Cudart {
     // 流捕获态查询（fence 诊断；可选符号）：0=None 1=Global 2=ThreadLocal
     // 3=Relaxed（cudaStreamCaptureStatus）
     int (*StreamIsCapturing)(void*, int*) = nullptr;
+    // CUDA 12.8+ 批拷贝（P1-5 稀疏批 H2D 判决实验；可选符号——缺席/失败自动
+    // 回退逐输入路径）。签名（cuda_runtime_api.h:6435, v13.0）：
+    //   cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrsIdxs,
+    //                        numAttrs, stream)
+    int (*MemcpyBatchAsync)(void* const*, const void* const*, const size_t*,
+                            size_t, void*, size_t*, size_t, void*) = nullptr;
 
     bool ok = false;
 
@@ -88,6 +94,9 @@ struct Cudart {
         EventQuery = (int (*)(void*))g("cudaEventQuery");
         EventSynchronize = (int (*)(void*))g("cudaEventSynchronize");
         EventDestroy = (int (*)(void*))g("cudaEventDestroy");
+        MemcpyBatchAsync = (int (*)(void* const*, const void* const*, const size_t*,
+                                    size_t, void*, size_t*, size_t, void*))
+            g("cudaMemcpyBatchAsync");
         StreamIsCapturing = (int (*)(void*, int*))g("cudaStreamIsCapturing");
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
             || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
