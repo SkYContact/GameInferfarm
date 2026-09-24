@@ -28,12 +28,19 @@ set(INFERFARM_TRT_INCLUDE_DIR "" CACHE PATH
 mark_as_advanced(INFERFARM_TRT_INCLUDE_DIR)
 if (INFERFARM_WITH_TRT)
     if (NOT INFERFARM_TRT_INCLUDE_DIR)
-        find_path(INFERFARM_TRT_INCLUDE_DIR NvInferRuntime.h)
+        # env FARM_TRT_INCLUDE_DIR=<含 NvInferRuntime.h 的目录> 可 set 一次
+        # 永久生效（机器路径不写进仓）；未设则走系统默认搜索
+        set(_trt_hint "")
+        if (DEFINED ENV{FARM_TRT_INCLUDE_DIR})
+            file(TO_CMAKE_PATH "$ENV{FARM_TRT_INCLUDE_DIR}" _trt_hint)
+        endif()
+        find_path(INFERFARM_TRT_INCLUDE_DIR NvInferRuntime.h HINTS ${_trt_hint})
     endif()
     if (NOT INFERFARM_TRT_INCLUDE_DIR)
         message(FATAL_ERROR
             "INFERFARM_WITH_TRT=ON 但未找到 NvInferRuntime.h——"
-            "请 -DINFERFARM_TRT_INCLUDE_DIR=<含 NvInferRuntime.h 的目录>")
+            "-DINFERFARM_TRT_INCLUDE_DIR=<含 NvInferRuntime.h 的目录>，"
+            "或 set FARM_TRT_INCLUDE_DIR 后重新 configure")
     endif()
 endif()
 

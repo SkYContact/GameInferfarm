@@ -56,6 +56,8 @@ struct CpuSession {
     // 权重：out j 行 k 对 in i 的向量（长 = min(in 元素数, K)）
     int K = 8;                     // 每输入取行首元素数上限（decl.poly_k）
     int H = 0;                     // 隐藏层单元数（0=纯线性）
+    std::vector<float> hscratch;   // 隐藏层激活 scratch（P0-3：每行 new vector
+                                   // → 会话级复用；值全量覆写，逐位不变）
     std::vector<std::vector<std::vector<std::vector<float>>>> w;   // [j][k][i]
     // MLP：w1[t][i] 向量 + b1[t]；w2[j][k][t] + b2[j][k]
     std::vector<std::vector<std::vector<float>>> w1;              // [t][i]
@@ -344,7 +346,7 @@ public:
                 if (mid < 0) mid = 0;
                 if (mid >= s->P) mid = s->P - 1;
                 const float* flat = poph + (size_t)mid * s->flat_w;
-                std::vector<float> h((size_t)s->H);
+                std::vector<float>& h = s->hscratch; h.resize((size_t)s->H);
                 for (int t = 0; t < s->H; t++) {
                     float acc = flat[s->b1_rel[(size_t)t]];
                     for (size_t fi = 0; fi < s->feat_idx.size(); fi++) {
@@ -395,7 +397,7 @@ public:
         }
         if (s->H > 0) {
             for (int r = 0; r < n_rows; r++) {
-                std::vector<float> h((size_t)s->H);
+                std::vector<float>& h = s->hscratch; h.resize((size_t)s->H);
                 for (int t = 0; t < s->H; t++) {
                     float acc = s->b1[(size_t)t];
                     for (size_t i = 0; i < s->ins.size(); i++) {

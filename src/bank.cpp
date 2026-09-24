@@ -87,6 +87,11 @@ struct BankCtl {
                                          // 期一次分配——req 与槽一一独占：领号
                                          // 串行发号+银行线性生命周期 ⇒ 同槽同时
                                          // 至多一个活 req，无需堆分配）
+    // 槽基址预解（热路径去虚调用+名字串扫，2026-09-24 审计 P0）：行指针=
+    // 基址+slot×row_bytes（InputRow 线性契约，三后端同式）。population 面
+    // =nullptr（不走预解，回退后端直查）
+    std::vector<char*> in_rows;                       // 下标=I.spec.ins 下标
+    std::vector<std::pair<const char*, size_t>> in_idx;   // 名字指针→ins 下标
     // 在途航班（单发=线性生命周期）。非原子字段，同步边=state：
     // 写侧（发车者）先写 flight_* 再 state.store(FLIGHT, release)；
     // 读侧（收割）state.load(FLIGHT, acquire) 后读——release/acquire 配对。
@@ -164,14 +169,21 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
         b_out = fi;
         s_out = v;
         // 全行清零（零基契约）：未写区与"零垫基线"逐位同——适配器的清零类
-        // 组装（高水位清零式）依赖"行起点为零"。
+        // 组装（高水位清零式）依赖"行起点为零"。基址走预解表（空=回退直查）
         {
             const long long tz0 = I.cen && I.cen->on ? NowNsI() : 0;
             for (size_t i = 0; i < I.spec.ins.size(); i++) {
                 if (I.spec.ins[i].population) continue;   // population 面不清零
-                size_t rb = 0;
-                void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
-                if (row) memset(row, 0, rb);
+                if (b.in_rows.empty()) {   // 预解未就绪防御：退回直查（语义同）
+                    size_t rb = 0;
+                    void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
+                    if (row) memset(row, 0, rb);
+                    continue;
+                }
+                char* base = b.in_rows[i];
+                if (base)
+                    memset(base + (size_t)v * I.spec.ins[i].row_bytes, 0,
+                           I.spec.ins[i].row_bytes);
             }
             if (I.cen && I.cen->on) {
                 I.cen->claim_zero_ns.fetch_add(NowNsI() - tz0, std::memory_order_relaxed);
@@ -235,6 +247,18 @@ int BankScheduler::GroupOf(int bank) const {
 void* BankScheduler::InputRow(int bank, int slot, const char* name, size_t* row_bytes) {
     if (!banks_ || bank < 0 || bank >= banks_ || !name) return nullptr;
     BankCtl& b = impl_->banks[(size_t)bank];
+    // 预解只读快路径（多工人线程并发安全——表 init 期填满后不可变）：
+    // 名字→下标（指针同址优先，回退内容比较）→基址+slot×row_bytes。
+    // population/未知名=不在表 → 回退后端直查（语义与直查完全一致）
+    for (auto& e : b.in_idx) {
+        if (!(e.first == name || (e.first && std::strcmp(e.first, name) == 0)))
+            continue;
+        char* base = b.in_rows[(size_t)e.second];
+        if (!base) break;   // population 面 → 直查
+        size_t rb = impl_->spec.ins[(size_t)e.second].row_bytes;
+        if (row_bytes) *row_bytes = rb;
+        return base + (size_t)slot * rb;
+    }
     return b.be->InputRow(b.sess, name, slot, row_bytes);   // 按银行取组后端
 }
 
@@ -362,18 +386,42 @@ void BankScheduler::Abandon(int bank, int slot) {
 // 未返回前回填完成（加超时/取消路径须先改本协议——bank.h Shutdown 前置条件）。
 // req 对象=银行槽池所有（req_pool），此处只摘链不回收。
 static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
+    // P0-1（2026-09-24 审计）：名字→(宽,基址) 每批 hoist——OutputWidth/
+    // OutputRow 的名字查表×行数 收敛为 ×唯一名（OutputRow 线性契约：
+    // 基址+slot×宽，三后端同式）。>16 唯一名退化为直查（正确性不变）
+    struct Hoist { const char* name; int w; const float* base; };
+    Hoist hoist[16];
+    int n_hoist = 0;
+    auto hoisted = [&](const OutputDest& od, int& w, const float*& base) -> bool {
+        for (int i = 0; i < n_hoist; i++)
+            if (hoist[i].name == od.name
+                || std::strcmp(hoist[i].name, od.name) == 0) {
+                w = hoist[i].w;
+                base = hoist[i].base;
+                return true;
+            }
+        if (n_hoist >= 16) return false;
+        w = b.be->OutputWidth(b.sess, od.name);
+        if (w <= 0) return false;
+        base = b.be->OutputRow(b.sess, od.name, 0);
+        if (!base) return false;
+        hoist[n_hoist++] = {od.name, w, base};
+        return true;
+    };
     for (int s = 0; s < b.flight_n; s++) {
         BankReq* r = b.reqs[(size_t)s];
         b.reqs[(size_t)s] = nullptr;
         if (!r) continue;   // 作废槽
         for (int d = 0; d < r->n_dests; d++) {
             const OutputDest& od = r->dests[d];
-            int w = b.be->OutputWidth(b.sess, od.name);
-            if (w <= 0 || !od.dst) continue;
-            const float* src = b.be->OutputRow(b.sess, od.name, s);
+            if (!od.name || !od.dst) continue;
+            int w = 0;
+            const float* src = nullptr;
+            if (!hoisted(od, w, src)) continue;
             int cn = w < od.n ? w : od.n;   // od.n=调用方申报的 dst 容量（负值/空
                                             // 指针此行跳过——min(模型行宽, 容量)）
-            if (src && cn > 0) memcpy(od.dst, src, sizeof(float) * (size_t)cn);
+            if (src && cn > 0) memcpy(od.dst, src + (size_t)s * (size_t)w,
+                                      sizeof(float) * (size_t)cn);
         }
         if (r->fiber) {
             r->ldone->fail = false;   // fiber 腿：SwitchToFiber 全序免锁
@@ -630,7 +678,10 @@ static void BankLoop(BankScheduler::Impl& I) {
             }
         }
         // ---- 汇报（每 300 个回信一行）----
-        if ((int)I.lat.size() >= 300) {
+        if ((int)I.lat.size() >= 3000) {   // P0-4（2026-09-24 审计）：3×sort+
+                                           // printf+fflush 在调度台线程=行速
+                                           // 高时每几 ms 抖一次——×10 节流
+                                           //（细粒度看 census）
             std::sort(I.lat.begin(), I.lat.end());
             std::sort(I.bsz.begin(), I.bsz.end());
             std::sort(I.fl_ms.begin(), I.fl_ms.end());
@@ -839,6 +890,21 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
             }
         }
         int built = id;
+        // 槽基址预解（P0-2，2026-09-24 审计）：全部会话建好后一次性解析
+        //（此时 I.spec 已终态——组 0 延迟收割在会话创建期完成）。**in_idx
+        // 必须在此一次填满、运行期只读**：InputRow 会被多工人线程并发调用，
+        // 运行期 push_back=堆损坏（首版间歇段错误案，2026-09-24）
+        for (int i = 0; i < built; i++) {
+            BankCtl& b = I.banks[(size_t)i];
+            b.in_rows.assign(I.spec.ins.size(), nullptr);
+            b.in_idx.reserve(I.spec.ins.size());
+            for (size_t ii = 0; ii < I.spec.ins.size(); ii++) {
+                if (I.spec.ins[ii].population) continue;
+                size_t rb = 0;
+                b.in_rows[ii] = (char*)b.be->InputRow(b.sess, I.spec.ins[ii].name.c_str(), 0, &rb);
+                b.in_idx.push_back({I.spec.ins[ii].name.c_str(), ii});
+            }
+        }
         // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
         // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）
         for (int i = 0; ok && i < built; i++) {
