@@ -76,7 +76,29 @@ n>7/8·slots 走整块，否则逐输入前缀。第 n..slots 行图照读显存
   GPU 侧多批仍并行）。不赌 ORT 流序是纪律。
 - refit 换心 TRT 独有；ORT 候选迭代=每腿重载会话（秒级）——演化场景选 TRT。
 - 缺的实测点：**"ORT+银行制"的吞吐数**（账本里只有 ORT+线程 100 局/s 与
-  TRT+银行 317-368 局/s 两端）——三后端接口就位后 A/B 交替 ≥4 腿补上。
+  TRT+银行 317-368 局/s 两端）——三后端接口就位后 A/B 交替 ≥4 腿补上
+  （已补：真模型实测 508-722 局/s，见 provenance）。
+
+- **零围栏实验（2026-09-24，判决实验链完整入档——负结果+判死）**：动机=
+  消本条"整设备同步"的围栏税（0.4-0.5ms/批）。方案=用户流
+  （user_compute_stream）+ RunOptions 关 EP 同步
+  （disable_synchronize_execution_providers）+ 事件邮箱收割（TRT 同款）。
+  实验链：①三键在 ORT 1.30 实存（DLL 二进制串+python 实挂会话）✓；
+  ②pybind 路径（python）图+用户流组合可行且捕获真生效（分时=图速
+  0.06ms，spin/iobinding/H2D/会话顺序逐一加回均可）✓；③C-API 路径图会话
+  BeginCapture 恒报 900（stream is capturing）——**自捕探针**（
+  FARM_ORT_CAPTEST=1：把流交给 ORT 前自 BeginCapture/EndCapture 一次）
+  证明我们的流干净可捕 ⇒ ORT 的捕获根不在用户流（CaptureBegin 源码同证：
+  unified-stream 分支自建流接管图管理器）；NonBlocking 创建/共享 env/建会
+  顺序逐一排除。判定=1.30 C-API 集成形态的架构行为，框架侧无杠杆；④eager
+  路径（非图）async 可跑且围栏税真实消失（tiny 模型 inline 0.16→0.08s，
+  ~2×）——但**逐位不确定**（3 跑 3 指纹）：用户流上的 H2D 与 ORT 内核流
+  跨流无序（候选机理；含 torch/lib cudart 的 PTDS 混编面），判负纪律不
+  兼容。**终审：ORT 后端零围栏判死**——围栏税=ORT 路线的架构成本，TRT
+  邮箱收割仍是生产通道（其收益那边早已兑现）。翻案条件：ORT 新版
+  （FARM_ORT_ASYNC=1 复验 + FARM_ORT_CAPTEST=1 探针一键判流归属）或
+  custom op 内吐 event 桥接（模型图侧工程，路标）。FARM_ORT_ASYNC 开关
+  保留=打印判决不启用 async。
 
 ## 13. 推理缓存：键=组装行字节+权重代次（2026-09-22 追加，KataGo 吸收）
 同输入行必同输出（逐位）是行独立契约的直接推论——推理结果可以缓存。键=

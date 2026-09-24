@@ -17,6 +17,7 @@ struct Cudart {
     void* (*Memcpy)(void*, const void*, size_t, int) = nullptr;
     int (*DeviceSynchronize)() = nullptr;
     int (*StreamCreate)(void**, unsigned int) = nullptr;
+    int (*StreamCreateWithFlags)(void**, unsigned int) = nullptr;
     int (*StreamDestroy)(void*) = nullptr;
     int (*MemcpyAsync)(void*, const void*, size_t, int, void*) = nullptr;
     int (*SetDeviceFlags)(unsigned int) = nullptr;
@@ -31,6 +32,12 @@ struct Cudart {
     int (*SetDevice)(int) = nullptr;            // 多卡守卫（可选符号：单卡行为不变）
     int (*GetDevice)(int*) = nullptr;
     int (*GetDeviceCount)(int*) = nullptr;
+    // 事件族（ORT 零围栏实验用；可选符号——缺席=异步模式回落同步）
+    int (*EventCreateWithFlags)(void**, unsigned int) = nullptr;
+    int (*EventRecord)(void*, void*) = nullptr;
+    int (*EventQuery)(void*) = nullptr;
+    int (*EventSynchronize)(void*) = nullptr;
+    int (*EventDestroy)(void*) = nullptr;
 
     bool ok = false;
 
@@ -55,6 +62,7 @@ struct Cudart {
         Memcpy = (void* (*)(void*, const void*, size_t, int))g("cudaMemcpy");
         DeviceSynchronize = (int (*)())g("cudaDeviceSynchronize");
         StreamCreate = (int (*)(void**, unsigned int))g("cudaStreamCreate");
+        StreamCreateWithFlags = (int (*)(void**, unsigned int))g("cudaStreamCreateWithFlags");
         StreamDestroy = (int (*)(void*))g("cudaStreamDestroy");
         MemcpyAsync = (int (*)(void*, const void*, size_t, int, void*))g("cudaMemcpyAsync");
         SetDeviceFlags = (int (*)(unsigned int))g("cudaSetDeviceFlags");
@@ -69,6 +77,11 @@ struct Cudart {
         SetDevice = (int (*)(int))g("cudaSetDevice");
         GetDevice = (int (*)(int*))g("cudaGetDevice");
         GetDeviceCount = (int (*)(int*))g("cudaGetDeviceCount");
+        EventCreateWithFlags = (int (*)(void**, unsigned int))g("cudaEventCreateWithFlags");
+        EventRecord = (int (*)(void*, void*))g("cudaEventRecord");
+        EventQuery = (int (*)(void*))g("cudaEventQuery");
+        EventSynchronize = (int (*)(void*))g("cudaEventSynchronize");
+        EventDestroy = (int (*)(void*))g("cudaEventDestroy");
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
             || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
             std::fprintf(stderr, "[cudart] 缺导出符号\n");

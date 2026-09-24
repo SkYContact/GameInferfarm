@@ -113,6 +113,23 @@ static void SetSpinFlagsOnce() {
     }
 }
 
+// ORT 零围栏开关（env FARM_ORT_ASYNC=1，缺省关=现行为逐位不动）。三键在
+// ORT 1.30 构建的实存性已验（二进制串+python 挂会话，2026-09-24）。
+static bool AsyncEnv() {
+    static const bool v = [] {
+        const char* e = getenv("FARM_ORT_ASYNC");
+        return e && *e && atoi(e) == 1;
+    }();
+    return v;
+}
+static bool SharedEnv() {
+    static const bool v = [] {
+        const char* e = getenv("FARM_ORT_SHARED_ENV");
+        return e && *e && atoi(e) == 1;
+    }();
+    return v;
+}
+
 struct OrtIn {
     InputMeta meta;
     void* host = nullptr;   // pinned carve（dml=普通页 carve，语义同）
@@ -162,6 +179,15 @@ struct OrtSess {
     unsigned h_pending = 0;                 // 在飞作业 seq（0=无；银行单飞≤1）
     std::atomic<unsigned> h_done{0};        // 已完成作业 seq
     bool h_stop = false;
+    // ORT 零围栏（FARM_ORT_ASYNC=1；判决12"整设备同步"结论的实测点补全，
+    // 2026-09-24）：用户流（user_compute_stream）+ RunOptions 关 EP 同步
+    // （disable_synchronize_execution_providers）+ 事件邮箱（TRT 同款收割
+    // 通道）。H2D→Run→D2H→EventRecord 同流序 ⇒ 逐位不变性由序保证。
+    // 探测会话恒同步（LoadSpec 语义依赖同步 Run）。
+    bool async = false;
+    void* stream = nullptr;
+    void* event = nullptr;
+    OrtRunOptions* ro = nullptr;
 };
 
 class OrtBackend : public InferBackend {
@@ -196,6 +222,29 @@ public:
     bool Warmup(void* session) override {
         OrtSess* s = (OrtSess*)session;
         memset(s->in_h_arena, 0, s->in_h_bytes);
+        // 一击必中探针（FARM_ORT_CAPTEST=1，外部审计建议的拦截器思路的零依赖
+        // 版）：把流交给 ORT 前自捕一次。自捕 OK=流干净可捕获 ⇒ ORT 的 900
+        // 来自它没用这条流；自捕 900=流已被捕/不可捕 ⇒ 有谁先动了它。
+        {
+            static const bool captest = [] {
+                const char* e = getenv("FARM_ORT_CAPTEST");
+                return e && *e && atoi(e) == 1;
+            }();
+            if (captest && s->async && s->graph_on && !s->dml) {
+                void* g = nullptr;
+                int rc1 = g_cu.StreamBeginCapture
+                    ? g_cu.StreamBeginCapture(s->stream, 0) : -99;
+                int rc2 = 0;
+                if (rc1 == 0) {
+                    rc2 = g_cu.StreamEndCapture(s->stream, &g);
+                    if (g && g_cu.GraphDestroy) g_cu.GraphDestroy(g);
+                }
+                std::fprintf(stderr, "[ort][captest] stream=%p BeginCapture=%d "
+                             "EndCapture=%d（0=干净可捕；900=已被捕/不可捕）\n",
+                             s->stream, rc1, rc2);
+                std::fflush(stderr);
+            }
+        }
         // 零填充 3 跑（enable_cuda_graph 内部前两跑构图/捕获——捕获窗口内
         // 不容地址/形状变化；地址已钉死=满足）
         for (int r = 0; r < 3; r++) {
@@ -203,13 +252,18 @@ public:
                 if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
                     return false;
             }
-            if (!RunOnce(s)) return false;
+            if (!RunOnce(s)) {
+                std::fprintf(stderr, "[ort] Warmup 失败（async=%d graph=%d）\n",
+                             (int)s->async, (int)s->graph_on);
+                return false;
+            }
             if (!s->dml) g_cu.DeviceSynchronize();
         }
-        std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s\n", s->slots,
+        std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s%s\n", s->slots,
                      s->dml ? "，DML=宿主绑定+同步 Run（无图无围栏）"
                             : (s->graph_on ? "，CUDA Graph=开（银行会话：调度台线程绑定）"
-                                           : "，CUDA Graph=关"));
+                                           : "，CUDA Graph=关"),
+                     s->async ? "，零围栏=开（用户流+事件收割）" : "");
         return true;
     }
 
@@ -266,10 +320,13 @@ public:
         }
         const OrtApi* a = api_;
         if (s->iob) a->ReleaseIoBinding(s->iob);
+        if (s->ro) a->ReleaseRunOptions(s->ro);
+        if (s->event && g_cu.EventDestroy) g_cu.EventDestroy(s->event);
+        if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
         for (auto& i : s->ins) if (i.val) a->ReleaseValue(i.val);
         for (auto& o : s->outs) if (o.val) a->ReleaseValue(o.val);
         if (s->sess) a->ReleaseSession(s->sess);
-        if (s->env) a->ReleaseEnv(s->env);
+        if (s->env && !SharedEnv()) a->ReleaseEnv(s->env);   // 共享 env=进程寿命，不释放
         if (s->bind_mem) a->ReleaseMemoryInfo(s->bind_mem);
         if (s->dml) {
             if (s->in_h_arena) VirtualFree(s->in_h_arena, 0, MEM_RELEASE);
@@ -314,40 +371,58 @@ public:
         if (!s->dml) {
             // 多卡守卫：分配/拷贝作用于当前设备（会话设备）。dml 无 CUDA 面。
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+            // 拷贝通道：异步模式=MemcpyAsync 上用户流（H2D→Run→D2H→事件同流序
+            // ⇒收割语义与逐位结果均不变）；同步模式=阻塞 cudaMemcpy（原行为）。
+            auto h2d = [&](void* dst, const void* src, size_t bytes) {
+                if (s->async)
+                    return g_cu.MemcpyAsync(dst, src, bytes, 1, s->stream) == 0;
+                return g_cu.Memcpy(dst, src, bytes, 1) == nullptr;
+            };
             // population 脏旗（演化路由，判决16）：代际换权重后的单次全量 H2D
             //（代间零拷贝——pop 非每槽输入，不参与前缀）
             if (s->pop_dirty) {
                 for (size_t i = 0; i < s->ins.size(); i++)
                     if (s->ins[i].meta.population
-                        && g_cu.Memcpy(s->ins[i].dev, s->ins[i].host,
-                                       s->ins[i].meta.row_bytes
-                                           * (size_t)s->ins[i].meta.dims[0], 1))
+                        && !h2d(s->ins[i].dev, s->ins[i].host,
+                                s->ins[i].meta.row_bytes
+                                    * (size_t)s->ins[i].meta.dims[0]))
                         return false;
                 s->pop_dirty = false;
             }
             // 前缀 H2D：同步拷贝（返回即完成——与 ORT 内部流旗标无关，零竞态；
             // n>7/8·slots 走整块；population 面跳过）
             if (n_rows > (s->slots * 7) / 8) {
-                if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
+                if (!h2d(s->in_d_arena, s->in_h_arena, s->in_h_bytes))
                     return false;
             } else {
                 for (size_t i = 0; i < s->ins.size(); i++) {
                     if (s->ins[i].meta.population) continue;
-                    if (g_cu.Memcpy(s->ins[i].dev, s->ins[i].host,
-                                    (size_t)n_rows * s->ins[i].meta.row_bytes, 1))
+                    if (!h2d(s->ins[i].dev, s->ins[i].host,
+                             (size_t)n_rows * s->ins[i].meta.row_bytes))
                         return false;
                 }
                 // 前缀路径补充：毒化后的路由键尾段同步到设备（整块路径全量拷贝已含）
                 if (s->pop_mode && n_rows < s->slots)
                     for (int mi : s->mid_like) {
                         OrtIn& m = s->ins[(size_t)mi];
-                        if (g_cu.Memcpy((char*)m.dev + (size_t)n_rows * m.meta.row_bytes,
-                                        (char*)m.host + (size_t)n_rows * m.meta.row_bytes,
-                                        (size_t)(s->slots - n_rows) * m.meta.row_bytes, 1))
+                        if (!h2d((char*)m.dev + (size_t)n_rows * m.meta.row_bytes,
+                                 (char*)m.host + (size_t)n_rows * m.meta.row_bytes,
+                                 (size_t)(s->slots - n_rows) * m.meta.row_bytes))
                             return false;
                     }
             }
-            if (!RunOnce(s)) return false;
+            if (!RunOnce(s, s->ro)) return false;
+            if (s->async) {
+                // 前缀 D2H 同流入队（序=Run 后）+ 事件盖戳——事件完成=输出已
+                // 驻留 host arena（pinned，标准可见性语义）。收割=EventQuery。
+                for (size_t j = 0; j < s->outs.size(); j++)
+                    if (g_cu.MemcpyAsync(s->outs[j].host, s->outs[j].dev,
+                                         (size_t)s->last_n
+                                             * (size_t)s->outs[j].meta.width * 4,
+                                         2, s->stream))
+                        return false;
+                if (g_cu.EventRecord(s->event, s->stream)) return false;
+            }
         } else {
             // DML：投递专属发射线程（同步 Run 不占调度台）；行数据在 host
             // arena，投递前的写在锁释放后对发射线程可见。
@@ -366,6 +441,14 @@ public:
         if (s->dml) return s->h_done.load(std::memory_order_acquire) >= seq;
         if (seq < s->seq) return true;         // 旧序号（早已完成）
         if (s->synced_for_seq) return true;
+        if (s->async) {
+            // 零围栏：事件在 D2H 之后入流——查询完成=前缀输出已驻留 host
+            if (g_cu.EventQuery && g_cu.EventQuery(s->event) == 0) {
+                s->synced_for_seq = true;
+                return true;
+            }
+            return false;
+        }
         // 整设备同步血律（不赌 ORT 内部流序）+ 前缀 D2H
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
         g_cu.DeviceSynchronize();
@@ -377,7 +460,11 @@ public:
         s->synced_for_seq = true;
         return true;
     }
-    void CompletionFence() override {}
+    void CompletionFence() override {
+        // 同步路径=无操作（CompletionReached 已整设备同步）；异步路径的收割
+        // 侧调用发生在 EventQuery 成功之后（事件完成=流上 D2H 全部落定）——
+        // 两路均无需额外等待
+    }
 
     const float* OutputRow(void* session, const char* name, int slot) override {
         OrtSess* s = (OrtSess*)session;
@@ -502,7 +589,7 @@ private:
         return true;
     }
 
-    static bool RunOnce(OrtSess* s) {
+    static bool RunOnce(OrtSess* s, OrtRunOptions* ro = nullptr) {
         const OrtApi* a = s->api;
         if (s->dml) {
             // DML 血律（实测 2026-09-22）：iob 预绑的 CPU 输入被 EP 忽略（读到
@@ -526,7 +613,7 @@ private:
                 if (a->BindInput(s->iob, s->ins[i].meta.name.c_str(), v)) return false;
             }
         }
-        OrtStatus* st = a->RunWithBinding(s->sess, nullptr, s->iob);
+        OrtStatus* st = a->RunWithBinding(s->sess, ro, s->iob);
         if (st) {
             std::printf("[ort] 批异常（RunWithBinding）：%s\n", a->GetErrorMessage(st));
             std::fflush(stdout);
@@ -577,10 +664,18 @@ private:
         s->api = api_;
         s->dml = dml;
         s->dev_id = cfg.device_id;
-        // 每会话独立 env（会话/图/arena 全套自闭环，互不沾染共享态）
+        // 每会话独立 env（会话/图/arena 全套自闭环，互不沾染共享态）；
+        // FARM_ORT_SHARED_ENV=1=进程单 env（零围栏调试面：python 全局 env
+        // 路径与 per-session env 的行为差异排查用）
+        static OrtEnv* g_shared_env = nullptr;
         char env_name[32];
         std::snprintf(env_name, sizeof env_name, "inferfarm_%d", env_seq_++);
-        if (a->CreateEnv(ORT_LOGGING_LEVEL_ERROR, env_name, &s->env)) { DestroySession(s); return nullptr; }
+        if (SharedEnv() && g_shared_env) {
+            s->env = g_shared_env;
+        } else if (a->CreateEnv(ORT_LOGGING_LEVEL_ERROR, env_name, &s->env)) {
+            DestroySession(s); return nullptr;
+        }
+        if (SharedEnv() && !g_shared_env) g_shared_env = s->env;
         OrtSessionOptions* opts = nullptr;
         if (a->CreateSessionOptions(&opts)) { DestroySession(s); return nullptr; }
         a->SetIntraOpNumThreads(opts, cfg.ort_threads > 0 ? cfg.ort_threads : 1);
@@ -613,14 +708,33 @@ private:
             // ---- CUDA EP（+CUDA Graph——KV 串与 python providers=
             // {"enable_cuda_graph":"1"} 同义）。图仅银行会话开（PerThreadContext
             // 铁律：创建/回放同线程——银行会话全生命周期在调度台线程上）。----
+            // 零围栏（FARM_ORT_ASYNC=1）：**实测判死（2026-09-24，实验链全账
+            // 见判决12）**——图会话：ORT 1.30 C-API 形态下图捕获不落在用户流上
+            // （自捕探针：我们的流干净可捕，ORT 的 BeginCapture 仍报 900）；
+            // eager 会话：可跑、围栏税真实消失（tiny 模型 inline 快 2×），但
+            // **逐位不确定**（3 跑 3 指纹=用户流 H2D 与 ORT 内核流跨流无序），
+            // 判负纪律不兼容。本开关保留为翻案仪器（打印判决、不启用 async；
+            // 升级 ORT 后用 FARM_ORT_CAPTEST=1 复验图路径）。
+            if (!spec_out && AsyncEnv()) {
+                std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：实测判死（图=捕获不落"
+                             "用户流 900；eager=逐位不确定 3 跑 3 指纹）——本会话"
+                             "走原同步路径（判决12 全账）\n");
+            }
             OrtCUDAProviderOptionsV2* co = nullptr;
             bool graph = for_bank && cfg.ort_cuda_graph;
             if (a->CreateCUDAProviderOptions(&co)) { a->ReleaseSessionOptions(opts); DestroySession(s); return nullptr; }
             char did[16];
             std::snprintf(did, sizeof did, "%d", cfg.device_id);
-            const char* keys[] = {"device_id", "enable_cuda_graph"};
-            const char* vals[] = {did, graph ? "1" : "0"};
-            OrtStatus* st = a->UpdateCUDAProviderOptions(co, keys, vals, 2);
+            char sptr[32];
+            const char* keys[] = {"device_id", "enable_cuda_graph", "user_compute_stream"};
+            const char* vals[3] = {did, graph ? "1" : "0", nullptr};
+            int nk = 2;
+            if (s->async) {
+                std::snprintf(sptr, sizeof sptr, "%zu", (size_t)s->stream);
+                vals[2] = sptr;
+                nk = 3;
+            }
+            OrtStatus* st = a->UpdateCUDAProviderOptions(co, keys, vals, nk);
             if (st) {
                 std::fprintf(stderr, "[ort] CUDA provider options: %s\n", a->GetErrorMessage(st));
                 a->ReleaseStatus(st);
@@ -649,6 +763,22 @@ private:
             a->ReleaseStatus(stc);
             DestroySession(s);
             return nullptr;
+        }
+        // 零围栏件：RunOptions（关 EP 同步）+ 事件（disable timing）。失败=回落
+        // 同步（会话已建成，流无害留存）。
+        if (s->async) {
+            if (a->CreateRunOptions(&s->ro)
+                || a->AddRunConfigEntry(s->ro,
+                                        "disable_synchronize_execution_providers",
+                                        "1")
+                || !g_cu.EventCreateWithFlags
+                || g_cu.EventCreateWithFlags(&s->event, 0x02)) {
+                std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：RunOptions/Event 失败"
+                             "——本会话回落同步路径\n");
+                if (s->ro) { a->ReleaseRunOptions(s->ro); s->ro = nullptr; }
+                s->event = nullptr;
+                s->async = false;
+            }
         }
         if (dml) {
             if (a->CreateMemoryInfo("Cpu", OrtDeviceAllocator, 0, OrtMemTypeDefault,
