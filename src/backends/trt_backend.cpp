@@ -128,15 +128,26 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
             return false;
         }
     }
-    // 绝对路径 + LOAD_WITH_ALTERED_SEARCH_PATH：依赖解析先搜 nvinfer 自身目录
-    // （普通 LoadLibrary 即便 PATH 前插仍 126——loader 对绝对路径加载的依赖
-    // 解析不采纳进程内改写的 PATH；实测教训）
-    std::string p = trt_dir + "\\nvinfer_10.dll";
-    HMODULE h = LoadLibraryExA(p.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!h) {
-        std::fprintf(stderr, "[trt] LoadLibrary %s 失败 GLE=%lu\n", p.c_str(), GetLastError());
-        return false;
+    // 目录非空：绝对路径 + LOAD_WITH_ALTERED_SEARCH_PATH（依赖解析先搜
+    // nvinfer 自身目录——普通 LoadLibrary 即便 PATH 前插仍 126：loader 对
+    // 绝对路径加载的依赖解析不采纳进程内改写的 PATH；实测教训）。
+    // 目录空：裸名加载（Windows 标准搜索：应用目录→系统32→PATH——语义同
+    // cudart_dyn 空 dir）。此前空目录曾拼出 "\nvinfer_10.dll" 根路径必败
+    // （对外反馈 2026-09-24）。
+    HMODULE h;
+    if (trt_dir.empty()) {
+        h = LoadLibraryA("nvinfer_10.dll");
+        if (!h)
+            std::fprintf(stderr, "[trt] LoadLibrary nvinfer_10.dll（系统搜索）失败 GLE=%lu\n",
+                         GetLastError());
+    } else {
+        std::string p = trt_dir + "\\nvinfer_10.dll";
+        h = LoadLibraryExA(p.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!h)
+            std::fprintf(stderr, "[trt] LoadLibrary %s 失败 GLE=%lu\n",
+                         p.c_str(), GetLastError());
     }
+    if (!h) return false;
     g_trt_create_runtime =
         (void* (*)(void*, int32_t))GetProcAddress(h, "createInferRuntime_INTERNAL");
     if (!g_trt_create_runtime) {

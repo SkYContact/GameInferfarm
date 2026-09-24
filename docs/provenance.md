@@ -227,3 +227,14 @@ fb8 onnx + TRT engine，TF32 关）x2 银行 x8 槽 x4 工人 x32 局：
 - 新坑：FARM_CUDART_DLL 是全局 env——ORT fence 契约（cudart64_13）与 TRT
   cu12 构建（cudart64_12）冲突，两后端混用的进程不能同设（本门 R2 曾被
   此 env 打成 SKIP）。
+
+## 对外反馈批：空目录解析修复（2026-09-24 晚）
+- 反馈：f699bd3 的"cfg→env→空（系统 DLL 搜索）"意图未兑现——空目录拼出
+  "\onnxruntime.dll" 根路径必败（GLE=126）。修=ort/trt 两处空目录走裸名
+  LoadLibrary（标准搜索：应用目录→System32→PATH；语义对齐 cudart_dyn 原
+  生正确写法），ort 基名冲突改名分支对空目录跳过（无"他目录"可冲突），
+  GetApi 版本门失败信息补指路（显式设 FARM_ORT_DIR）。
+- 实测：本机 System32 真有陈年 ORT 1.17.1——修复后裸名加载命中它并被
+  版本门清晰拒载（此前根路径 126 掩盖了整个事实）；trt 空 env 裸名 126
+  排查面正常；全 env 回归（fence ort 指纹 6da7de2ad81bdf36 / trt 指纹
+  502013814d87ca76 / farm_test / gomoku_backend_test）全绿。

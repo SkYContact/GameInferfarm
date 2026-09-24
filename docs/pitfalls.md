@@ -120,3 +120,12 @@
   台照常绑上把 pinned 探针抬高。门改 env 前先盘全部门面。
 - Git Bash heredoc 传 python 源码含 `\n` 的 pattern 会被折叠成真换行
   （第 4 次踩）——替换/匹配一律走编辑工具。
+## DLL 解析链批（2026-09-24 晚）
+- **空目录拼分隔符=根路径**：`dir.empty() ? dll : dir + "\\" + dll` 的三分
+  写法才是对的（cudart_dyn 原生正确）；`dir + "\\" + dll` 在 dir="" 时落成
+  "\onnxruntime.dll" 根路径必败——"空=系统搜索"的意图从未兑现（对外反馈
+  2026-09-24）。ort/trt 两处已修齐。
+- **System32 永远先于 PATH**（标准搜索顺序）：裸名加载会先命中 System32
+  的陈年同名 dll（实测本机 System32 有 ORT 1.17.1，PATH 前插 1.30 永远
+  轮不到）。框架侧正确应对=版本门 fail fast+指路（GetApi 失败信息提示
+  显式设 FARM_ORT_DIR），不静默拿旧版。

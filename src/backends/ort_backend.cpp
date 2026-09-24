@@ -874,7 +874,9 @@ private:
         for (auto& r : g_ort_dlls)
             if (r.base == base) {
                 if (ToLower(r.dir) == ToLower(ort_dir)) { h = r.h; break; }
-                // 基名冲突（Windows 按基名去重回柄）：拷贝改名再装
+                // 基名冲突（Windows 按基名去重回柄）：拷贝改名再装。仅限有
+                // 目录语义的实例——空目录=系统搜索装载，无"他目录"可冲突
+                if (ort_dir.empty()) break;
                 char tmp[MAX_PATH];
                 GetTempPathA(MAX_PATH, tmp);
                 load_path = std::string(tmp) + "inferfarm_ort_"
@@ -890,8 +892,15 @@ private:
                 break;
             }
         if (!h) {
-            if (load_path.empty()) load_path = ort_dir + "\\onnxruntime.dll";
-            h = LoadLibraryA(load_path.c_str());   // 绝对路径：绕开 exe 同目录 CPU 版
+            // 目录空=裸名加载（Windows 标准搜索：应用目录→系统32→PATH——
+            // 语义与 cudart_dyn 空 dir 一致）。此前空目录曾拼出 "\onnxruntime.dll"
+            // 根路径必败（对外反馈 2026-09-24）。裸名搜索顺序含应用目录：exe
+            // 同目录若有 CPU 版同名 dll 会先被命中——标准搜索的既定行为，
+            // 部署上避免在 exe 旁放同名 dll。
+            if (load_path.empty())
+                load_path = ort_dir.empty() ? "onnxruntime.dll"
+                                            : ort_dir + "\\onnxruntime.dll";
+            h = LoadLibraryA(load_path.c_str());
         }
         if (!h) {
             std::fprintf(stderr, "[ort] LoadLibrary %s 失败 GLE=%lu\n",
@@ -910,7 +919,9 @@ private:
         }
         api_ = ab->GetApi(ORT_API_VERSION);
         if (!api_) {
-            std::fprintf(stderr, "[ort] GetApi(%d) 失败（头/DLL 版本不匹配）\n", ORT_API_VERSION);
+            std::fprintf(stderr, "[ort] GetApi(%d) 失败（头/DLL 版本不匹配）——系统搜索"
+                         "命中的可能是旧版 ORT（System32 先于 PATH）：显式设 "
+                         "FARM_ORT_DIR 指向你的 ORT 目录\n", ORT_API_VERSION);
             return false;
         }
         dll_ = h;
