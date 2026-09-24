@@ -41,11 +41,14 @@ struct Cudart {
 
     bool ok = false;
 
-    // cuda_dir: cudart64_12.dll 所在目录（空=PATH 解析）
+    // cuda_dir: cudart 所在目录（空=PATH 解析）；dll 文件名=env FARM_CUDART_DLL
+    // （缺省 cudart64_12.dll——ORT wheel 可能是 CUDA13 构建，与 torch/lib 的
+    // cudart12 混跑=双 runtime 进程，流归属/捕获行为会失真；复验时指 13）
     bool Load(const std::string& cuda_dir) {
         if (ok) return true;
-        std::string p = cuda_dir.empty() ? "cudart64_12.dll"
-                                         : cuda_dir + "\\cudart64_12.dll";
+        const char* dll_env = getenv("FARM_CUDART_DLL");
+        std::string dll = dll_env && *dll_env ? dll_env : "cudart64_12.dll";
+        std::string p = cuda_dir.empty() ? dll : cuda_dir + "\\" + dll;
         HMODULE h = cuda_dir.empty() ? LoadLibraryA(p.c_str())
                                      : LoadLibraryExA(p.c_str(), NULL,
                                                       LOAD_WITH_ALTERED_SEARCH_PATH);

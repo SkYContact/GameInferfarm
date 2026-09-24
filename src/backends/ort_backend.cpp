@@ -113,12 +113,14 @@ static void SetSpinFlagsOnce() {
     }
 }
 
-// ORT 零围栏开关（env FARM_ORT_ASYNC=1，缺省关=现行为逐位不动）。三键在
-// ORT 1.30 构建的实存性已验（二进制串+python 挂会话，2026-09-24）。
-static bool AsyncEnv() {
-    static const bool v = [] {
+// ORT 零围栏开关（env FARM_ORT_ASYNC，缺省关=现行为逐位不动）。语义：
+//   1=实测判死通道（打印判决，不启用 async——2026-09-24 实验账见判决12）
+//   2=翻案实验通道（强制启用 async：换 cudart 版本/换 ORT 版本后复验用；
+//     图会话若再撞 900 即为干净环境下的最终确认）
+static int AsyncEnvMode() {
+    static const int v = [] {
         const char* e = getenv("FARM_ORT_ASYNC");
-        return e && *e && atoi(e) == 1;
+        return e && *e ? atoi(e) : 0;
     }();
     return v;
 }
@@ -708,17 +710,26 @@ private:
             // ---- CUDA EP（+CUDA Graph——KV 串与 python providers=
             // {"enable_cuda_graph":"1"} 同义）。图仅银行会话开（PerThreadContext
             // 铁律：创建/回放同线程——银行会话全生命周期在调度台线程上）。----
-            // 零围栏（FARM_ORT_ASYNC=1）：**实测判死（2026-09-24，实验链全账
-            // 见判决12）**——图会话：ORT 1.30 C-API 形态下图捕获不落在用户流上
-            // （自捕探针：我们的流干净可捕，ORT 的 BeginCapture 仍报 900）；
-            // eager 会话：可跑、围栏税真实消失（tiny 模型 inline 快 2×），但
-            // **逐位不确定**（3 跑 3 指纹=用户流 H2D 与 ORT 内核流跨流无序），
-            // 判负纪律不兼容。本开关保留为翻案仪器（打印判决、不启用 async；
-            // 升级 ORT 后用 FARM_ORT_CAPTEST=1 复验图路径）。
-            if (!spec_out && AsyncEnv()) {
+            // 零围栏：1=判死打印不启用；2=翻案实验通道（NonBlocking 用户流 +
+            // provider option + RunOptions 关 EP 同步 + 事件收割，探测会话除外）
+            if (!spec_out && AsyncEnvMode() == 2) {
+                if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+                if (!g_cu.StreamCreateWithFlags
+                    || g_cu.StreamCreateWithFlags(&s->stream, 0x01) != 0) {
+                    std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=2：StreamCreate 失败"
+                                 "——本会话回落同步路径\n");
+                    s->stream = nullptr;
+                } else {
+                    s->async = true;
+                    std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=2：启用（cudart=%s"
+                                 "）\n", getenv("FARM_CUDART_DLL")
+                                 && *getenv("FARM_CUDART_DLL")
+                                 ? getenv("FARM_CUDART_DLL") : "cudart64_12.dll");
+                }
+            } else if (!spec_out && AsyncEnvMode() == 1) {
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC：实测判死（图=捕获不落"
                              "用户流 900；eager=逐位不确定 3 跑 3 指纹）——本会话"
-                             "走原同步路径（判决12 全账）\n");
+                             "走原同步路径（判决12 全账；=2 走翻案实验通道）\n");
             }
             OrtCUDAProviderOptionsV2* co = nullptr;
             bool graph = for_bank && cfg.ort_cuda_graph;

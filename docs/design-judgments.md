@@ -99,6 +99,22 @@ n>7/8·slots 走整块，否则逐输入前缀。第 n..slots 行图照读显存
   （FARM_ORT_ASYNC=1 复验 + FARM_ORT_CAPTEST=1 探针一键判流归属）或
   custom op 内吐 event 桥接（模型图侧工程，路标）。FARM_ORT_ASYNC 开关
   保留=打印判决不启用 async。
+- **终局补测（同日，回应"直接读源码"与混跑质疑，负结果加固）**：①点读
+  rel-1.30.0 源码三件套（info 解析=尺寸_t 指针串；EP ctor=用户流分支
+  `stream_=user_compute_stream` 外部流直达、`cuda_graph_.SetStream(stream)`
+  原样继承；CaptureBegin=先 sync 后 BeginCapture）——**按 tag 源码捕获应
+  落在用户流上且应能工作**，与实测矛盾；②**版本指纹对不上**：本机错误栈
+  `line=56; expr=BeginCapture`，而 rel-1.30.0 tag 的 56 行是 EndCapture
+  （BeginCapture 在 51）⇒ 装机的官方 PyPI wheel（onnxruntime-gpu 1.30.0，
+  cu13.0）的源码 ≠ release tag（nightly/分叉构建）——一切"读码推理"的
+  机制叙述降级为假说，行为判决不受影响；③**混跑排除**：发现进程内双
+  cudart（本库经 torch/lib 的 cudart12，ORT wheel 为 CUDA13 构建走系统
+  CUDA13 bin）后，新增 FARM_CUDART_DLL 选 c13 干净复测——图路径 900 依旧、
+  eager 3 跑 3 指纹依旧 ⇒ 两现象均为干净运行时的真实行为；④终审不变：
+  ORT 零围栏判死（对此 wheel）。复验三件套已仪器化：FARM_ORT_ASYNC=2
+  （翻案强制通道）+ FARM_CUDART_DLL（cudart 版本选择）+ FARM_ORT_CAPTEST=1
+  （流归属探针）；要提上游 issue 须先核该 wheel 的确切 commit（build_and_
+  package_info.py 不含 commit，需 wheel 回源）。
   测量污染注记：④的 2× 提速数测于**共享 GPU 时段**（本机另有会话在用卡）
   ——量级仅供参考，不入正账；判死结论不依赖它（900 与不确定指纹均为
   负载无关证据：sync 指纹 a3535388 跨天跨会话逐位复现，async 3 跑 3 异）。
