@@ -136,6 +136,7 @@ struct BankScheduler::Impl {
     std::atomic<long long> drain_us{0};
     std::atomic<long long> batches{0}, rows{0};
     std::atomic<int> self_dep{0};
+    bool spin = false;                   // 调度台自旋模式（BankConfig.spin）
     int n_banks = 0;
 
     void Notify() {
@@ -760,20 +761,35 @@ static void BankLoop(BankScheduler::Impl& I) {
             for (int i = 0; i < I.n_banks; i++)
                 if (I.banks[(size_t)i].state.load(std::memory_order_acquire) == BK_FLIGHT)
                     { any_flight = true; break; }
-            double wait_ms = any_flight ? 0.1 : 2.0;
-            for (int g = 0; g < I.n_groups; g++) {
-                if (!window_open[g]) continue;
-                double rem = (window_t0[g] + window_ms) - NowMsD();
-                if (rem < 0.02) rem = 0.02;
-                if (rem < wait_ms) wait_ms = rem;
-            }
-            const long long tw0 = cen && cen->on ? NowNsI() : 0;
-            std::unique_lock<std::mutex> lk(I.mx);
-            I.cv.wait_for(lk, std::chrono::duration<double>(wait_ms / 1000.0));
-            if (cen && cen->on) {
-                cen->seg_wait_ns.fetch_add(NowNsI() - tw0, std::memory_order_relaxed);
-                cen->seg_iter_ns.fetch_add(NowNsI() - it0, std::memory_order_relaxed);
-                cen->seg_iter_n.fetch_add(1, std::memory_order_relaxed);
+            // ---- 等待策略（P1 决策延迟链改造，2026-09-24 接入方诊断）----
+            // spin 模式（FARM_BANK_SPIN=1）：有在飞或有填充银行时**不进 cv**——
+            // cv.wait_for(0.1ms) 在 Windows 实为 1-1.3ms 定时器量子（判决3），
+            // 每决策吃两次（完成检出+下批发车处理）= srv-lat 决策延迟链主项。
+            // 纯轮询=ScheduleSpin 式躲量子：调度台核心独烧（opt-in，专核语义）
+            // 换每决策省 2×量子。全闲才 cv 长等（不烧空核）。
+            bool has_fill = false;
+            for (int g = 0; g < I.n_groups; g++)
+                if (I.fill_idx[g].load(std::memory_order_acquire) >= 0)
+                    { has_fill = true; break; }
+            if (I.spin && (any_flight || has_fill)) {
+                SpinPause();   // 循环体本身就是轮询+发车+收割；PAUSE 一下礼让
+                               // SMT 兄弟，量子彻底不沾
+            } else {
+                double wait_ms = any_flight ? 0.1 : 2.0;
+                for (int g = 0; g < I.n_groups; g++) {
+                    if (!window_open[g]) continue;
+                    double rem = (window_t0[g] + window_ms) - NowMsD();
+                    if (rem < 0.02) rem = 0.02;
+                    if (rem < wait_ms) wait_ms = rem;
+                }
+                const long long tw0 = cen && cen->on ? NowNsI() : 0;
+                std::unique_lock<std::mutex> lk(I.mx);
+                I.cv.wait_for(lk, std::chrono::duration<double>(wait_ms / 1000.0));
+                if (cen && cen->on) {
+                    cen->seg_wait_ns.fetch_add(NowNsI() - tw0, std::memory_order_relaxed);
+                    cen->seg_iter_ns.fetch_add(NowNsI() - it0, std::memory_order_relaxed);
+                    cen->seg_iter_n.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -833,6 +849,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     Impl& I = *impl_;
     I.cen = cen_;
     I.cfg = cfg;
+    I.spin = cfg.spin;
     I.spec = *spec_out;   // 由 Farm 预先 LoadSpec 并核各组结构一致
     *spec_out = I.spec;
     for (int g = 0; g < Impl::kMaxGrp; g++) I.fill_idx[g].store(-1);

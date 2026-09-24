@@ -259,6 +259,8 @@ bool Farm::Init(FarmConfig cfg) {
         bc.slots = cfg_.slots;
         bc.window_ms = cfg_.window_ms;
         bc.window_floor = cfg_.window_floor;
+        bc.spin = EnvInt("FARM_BANK_SPIN", 0) != 0;   // 决策延迟链：调度台自旋
+                                                      // 躲定时器量子（判决3）
         bank_obj_.Bind(*backend_, &census_);   // 单组兼容面（primary=组 0）
         std::vector<BankGroupCfg> groups;
         for (size_t gi = 0; gi < devs.size(); gi++) {

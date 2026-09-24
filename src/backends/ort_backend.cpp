@@ -345,6 +345,9 @@ struct OrtSess {
     uint64_t fence_ticket = 0;
     void* fence_stream = nullptr;   // 认领自注册表的 ORT EP 统一流
     OrtCustomOpDomain* domain = nullptr;   // fence 域（ReleaseSession 后释放）
+    // dep 三段分解累计（P1 仪器；调度台单线程写，打印即清零）
+    unsigned long long dep_h2d_ns = 0, dep_run_ns = 0, dep_d2h_ns = 0;
+    unsigned dep_cnt = 0;
     // P1-5 批拷贝 scratch（FARM_H2D_BATCH=1 且符号在）：稀疏批多输入 H2D
     // 合并为一次 cudaMemcpyBatchAsync（dep=宿主提交税∝提交次数）
     bool h2d_batch = false;
@@ -557,6 +560,8 @@ public:
         s->seq++;
         s->last_n = n_rows;
         s->synced_for_seq = false;
+        const long long dep_t0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         // 批尾毒化（路由模式死行协议，判决16）：未领槽位 [n, slots) 的路由键
         // 置 -1（0xFF）——陈旧 mid 参与图内散射会破坏 (p,j) 唯一性（溢出/碰撞
         // 经 ScatterND 原子写污染新鲜行=活性非确定性）。图侧 v2.2 把 -1 路由
@@ -657,7 +662,11 @@ public:
                             return false;
                     }
             }
+            const long long dep_t1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             if (!RunOnce(s, s->ro)) return false;
+            const long long dep_t2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             if (s->fence) {
                 // fence 桥接 v2：replay/eager 内核已提交到 ORT EP 统一流——D2H
                 // 前缀异步挂同流（流序=图内核之后 ⇒ 读到本批输出）+ 事件盖章。
@@ -669,6 +678,24 @@ public:
                                          2, s->fence_stream))
                         return false;
                 if (g_cu.EventRecord(s->event, s->fence_stream)) return false;
+            }
+            // P1 dep 三段分解（H2D/Run/D2H+盖章；接入方 1.4ms 黑盒定位仪器）
+            {
+                long long t3 = dep_t2;
+                if (s->fence) t3 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                s->dep_h2d_ns += dep_t1 - dep_t0;
+                s->dep_run_ns += dep_t2 - dep_t1;
+                s->dep_d2h_ns += t3 - dep_t2;
+                if (++s->dep_cnt == 256) {
+                    std::fprintf(stderr, "[ort] dep 三段 (n=%u, rows=%d): h2d=%.3f "
+                                 "run=%.3f d2h=%.3f ms/均\n", s->dep_cnt, s->last_n,
+                                 s->dep_h2d_ns / 256e6, s->dep_run_ns / 256e6,
+                                 s->dep_d2h_ns / 256e6);
+                    std::fflush(stderr);
+                    s->dep_h2d_ns = s->dep_run_ns = s->dep_d2h_ns = 0;
+                    s->dep_cnt = 0;
+                }
             }
             if (s->async) {
                 // 前缀 D2H 同流入队（序=Run 后）+ 事件盖戳——事件完成=输出已

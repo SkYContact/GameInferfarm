@@ -9,6 +9,9 @@
 //    FARM_FIBER_WORKERS=K     工人数（缺省=物理核≈hc/2；SMT 负资产勿超）
 //    FARM_BANKS=N             银行家数（0=inline 模式；本机最优 4）
 //    FARM_BANK_WINDOW_FLOOR   有效窗底限 ms（0.2）
+//    FARM_BANK_SPIN=1         调度台自旋模式：有在飞/有填充期不进 cv（躲
+//                             Windows 定时器量子 1-1.3ms——决策延迟链主项；
+//                             专核语义：忙时调度台核 100% 独烧换延迟）
 //    FARM_STAGGER_MS          点火错峰（10ms 甜点）
 //    FARM_CENSUS=1            取证层（~5% 税，仅取证开）
 //    FARM_CACHE_LOG2          推理缓存表容 log2（0=关；如 16=64K 条）——

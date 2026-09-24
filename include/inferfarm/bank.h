@@ -44,6 +44,12 @@ struct BankConfig {
     int slots = 64;              // 每银行槽数（=模型批形状 dim0）
     double window_ms = 0.2;      // 攒批窗
     double window_floor = 0.2;   // 有效窗底限（ms；Windows 定时量子勘误）
+    bool spin = false;           // 调度台自旋模式（FARM_BANK_SPIN=1）：有在飞/
+                                 // 有填充银行期不进 cv——cv.wait_for(0.1ms)
+                                 // 在 Windows 实为 1-1.3ms 定时器量子，每决策
+                                 // 吃两次（完成检出+发车处理）= 决策延迟链主项
+                                 // （2026-09-24 接入方诊断）。专核语义：调度台
+                                 // 核在忙时 100% 独烧换延迟；全闲自动回 cv
 };
 
 // 设备组（多 GPU，判决15）：一组=一套后端实例+模型配置+本组银行数。链 c 钉扎
