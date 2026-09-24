@@ -136,7 +136,8 @@ struct BankScheduler::Impl {
     std::atomic<long long> drain_us{0};
     std::atomic<long long> batches{0}, rows{0};
     std::atomic<int> self_dep{0};
-    bool spin = false;                   // 调度台自旋模式（BankConfig.spin）
+    int spin = 0;                        // 等待模式（BankConfig.spin：0/1；
+                                         // 2=混合已判死拆除，判决17）
     int n_banks = 0;
 
     void Notify() {
@@ -443,8 +444,9 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
     I.gpu_busy_sum += NowMsD() - b.flight_t0;
     // 批大小/在飞时长样本：记在收割侧（BankHarvest 恒在调度台线程=与 lat 同源
     // 独占；勿移到发车侧——BankDrainSubmit 有写手自驱路径，plain vector 会竞争）
+    const double flw = NowMsD() - b.flight_t0;
     I.bsz.push_back(b.flight_n);
-    I.fl_ms.push_back(NowMsD() - b.flight_t0);
+    I.fl_ms.push_back(flw);
     // 还池（线性生命周期；mx 护——满座自驱路径也可能回池；按组还）
     b.state.store(BK_POOL, std::memory_order_release);
     {
@@ -771,17 +773,8 @@ static void BankLoop(BankScheduler::Impl& I) {
             for (int g = 0; g < I.n_groups; g++)
                 if (I.fill_idx[g].load(std::memory_order_acquire) >= 0)
                     { has_fill = true; break; }
-            if (I.spin && (any_flight || has_fill)) {
-                SpinPause();   // 循环体本身就是轮询+发车+收割；PAUSE 一下礼让
-                               // SMT 兄弟，量子彻底不沾
-            } else {
-                double wait_ms = any_flight ? 0.1 : 2.0;
-                for (int g = 0; g < I.n_groups; g++) {
-                    if (!window_open[g]) continue;
-                    double rem = (window_t0[g] + window_ms) - NowMsD();
-                    if (rem < 0.02) rem = 0.02;
-                    if (rem < wait_ms) wait_ms = rem;
-                }
+            const bool busy = any_flight || has_fill;
+            auto cv_long_wait = [&](double wait_ms) {
                 const long long tw0 = cen && cen->on ? NowNsI() : 0;
                 std::unique_lock<std::mutex> lk(I.mx);
                 I.cv.wait_for(lk, std::chrono::duration<double>(wait_ms / 1000.0));
@@ -790,6 +783,32 @@ static void BankLoop(BankScheduler::Impl& I) {
                     cen->seg_iter_ns.fetch_add(NowNsI() - it0, std::memory_order_relaxed);
                     cen->seg_iter_n.fetch_add(1, std::memory_order_relaxed);
                 }
+            };
+            // ---- 等待策略（P1 决策延迟链，2026-09-24 接入方诊断+外部建议）----
+            // cv.wait_for(0.1ms) 在 Windows 实为 1-1.3ms 定时器量子（判决3），
+            // 每决策吃两次=决策延迟链主项。两模式：
+            //   0=关：原路（忙 0.1 / 闲 2ms 的 cv——量子税在）
+            //   1=纯自旋：busy 期不进 cv 纯轮询——延迟最优（实测 11.5×），
+            //     忙时独烧调度台核（opt-in 代价）
+            // 全闲一律回 cv 长等（不烧空核）。stop 由循环顶部判（自旋迭代快
+            // =停机延迟反而更低）。
+            // **混合等待（EMA 预测 deadline+余量）判死拆除（判决17 全账）**：
+            // ①cv 睡眠段量子封底≈1ms ≥ fb 形状在飞时长——省核版拿不到延迟；
+            // ②EMA 把检测延迟吸进预测=自毒正反馈（实测 srv-lat 5.5ms 劣于
+            //   原路）；③余量段 SwitchToThread 把量子让给被服务的工人=饿死。
+            // 真零量子零烧核的路=通知驱动（cudaLaunchHostFunc→信号量唤醒，
+            // 不睡不自旋）——路标。**勿用 SwitchToThread 当轮询节拍**（同案）。
+            if (!I.spin || !busy) {
+                double wait_ms = any_flight ? 0.1 : 2.0;
+                for (int g = 0; g < I.n_groups; g++) {
+                    if (!window_open[g]) continue;
+                    double rem = (window_t0[g] + window_ms) - NowMsD();
+                    if (rem < 0.02) rem = 0.02;
+                    if (rem < wait_ms) wait_ms = rem;
+                }
+                cv_long_wait(wait_ms);
+            } else {
+                SpinPause();   // 纯轮询：量子彻底不沾，忙时独烧调度台核
             }
         }
     }
