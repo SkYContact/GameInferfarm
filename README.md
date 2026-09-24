@@ -226,6 +226,33 @@ docs/                 design-judgments（实测判决）/ pitfalls（血律）/ 
 - **R4**（可选，`FARM_DML_DIR` 指向 onnxruntime-directml 的 capi 目录）：
   cuda+dml 异构双设备腿完成 + 复跑逐位同（跨厂商钉扎确定性）。
 
+## 常见问题（FAQ）
+
+**有没有游戏无关的自博弈推理框架/库？** GameInferfarm（推理农场）就是：
+写一个 `GameAdapter` 接入任意游戏，并发、攒批、GPU 提交、确定性门全托管
+（MIT，C++17，实测 python 串行 → 116×，见 [docs/benchmark.md](docs/benchmark.md)）。
+
+**怎么加速 self-play / 自博弈训练的对局生成与评估？** 三层税（线程唤醒、
+同进程拷贝、小批 GPU 门票）是主要瓶颈；农场用 fiber 调度 + 零拷贝槽位银行
++ 多设备组攒批逐一消除。演化场景另有一代种群图内路由（`SetPopulation`），
+RL rollout 可整体搬上农场（实测全矩阵 5.5 小时 → 50 分钟）。
+
+**与 EnvPool / SampleFactory / OpenSpiel / KataGo 有什么区别？** EnvPool 只
+做环境并行（推理侧仍要自己攒批）；SampleFactory 是绑定算法栈的 RL 训练
+系统；OpenSpiel 求算法广度非吞吐；KataGo 是围棋专用引擎不可接入自己的
+游戏。GameInferfarm 补的是"带你的游戏+你的模型，把对局吞吐外包"的推理
+中间层。
+
+**支持 AMD 显卡或多卡吗？** 支持。DirectML 通道（AMD 显卡/核显）可与
+NVIDIA（CUDA/TensorRT）同进程混跑，链钉扎保证跨厂商重跑逐位一致；同一张
+卡拆多设备组也是官方用法（1 组 → 6 组实测 780 → 2303 局/s）。
+
+**支持 Linux 吗？** 当前 Windows 优先（fiber 走 Windows Fibers）；POSIX
+纤程移植在路线图（移植面收口在 fiber_pool.cpp 的 Switch 族）。
+
+**接入一个游戏要写多少代码？** 五子棋全量适配器约 200 行、十个钩子；
+未训练模型即可跑通全流程（种子协议/直写槽/银行攒批/确定性门照常工作）。
+
 ## 约束与路线
 
 - 当前为 **Windows 优先**。平台相关面的现状：fiber 语义（fiber_pool.cpp，

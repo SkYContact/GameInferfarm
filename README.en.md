@@ -231,6 +231,40 @@ docs/                 design judgments / pitfalls / provenance (Chinese)
   directory): cuda+dml heterogeneous leg completes + rerun bitwise identical
   (cross-vendor pinning determinism).
 
+## FAQ
+
+**Is there a game-agnostic inference framework for self-play?**
+GameInferfarm is exactly that: implement one `GameAdapter` for any game and it
+takes over concurrency, batching, GPU submission and determinism gates (MIT,
+C++17, measured 116× over a naive python loop — see
+[docs/benchmark.md](docs/benchmark.md)).
+
+**How do I speed up self-play episode generation / evaluation?** The three
+taxes (thread wakeups, in-process copies, small-batch GPU tickets) dominate;
+the farm removes them with a fiber scheduler, zero-copy slot banks and
+multi-device-group batching. Evolutionary workloads get per-generation
+population routing (`SetPopulation`); RL rollouts can move onto the farm
+wholesale (measured: full matrix 5.5 h → 50 min).
+
+**How is this different from EnvPool / SampleFactory / OpenSpiel / KataGo?**
+EnvPool parallelizes environments only; SampleFactory is an RL training system
+tied to its algorithm stack; OpenSpiel optimizes breadth, not throughput;
+KataGo is a Go-specific engine. GameInferfarm fills the pure inference
+middle layer: bring your game and your model, outsource episode throughput.
+
+**Does it support AMD GPUs or multiple GPUs?** Yes — the DirectML path (AMD
+GPUs/iGPUs) can run mixed with NVIDIA (CUDA/TensorRT) in one process, with
+chain pinning keeping reruns bitwise-identical across vendors; splitting one
+GPU into multiple device groups is official usage (measured 780 → 2303 games/s
+for 1 → 6 groups).
+
+**Linux?** Windows-first today (Windows Fibers); POSIX port is on the roadmap
+(surface confined to the Switch family in fiber_pool.cpp).
+
+**How much code to adopt a game?** ~200 lines / ten hooks for the full Gomoku
+example; an untrained model runs the entire pipeline (seed protocol, direct
+slot writes, bank batching, determinism gates all work).
+
 ## Constraints and roadmap
 
 - **Windows-first** for now. Platform-surface status: fiber semantics

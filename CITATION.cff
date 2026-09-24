@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use GameInferfarm in your research, please cite it as below."
+title: "GameInferfarm: a game-agnostic C++ inference farm for self-play, RL evaluation and evolutionary search"
+type: software
+authors:
+  - alias: SkYContact
+repository-code: "https://github.com/SkYContact/GameInferfarm"
+url: "https://github.com/SkYContact/GameInferfarm"
+abstract: >-
+  GameInferfarm turns "run a huge number of homogeneous games concurrently,
+  batch every neural-net decision" into a game-agnostic library: a fiber
+  scheduler eliminates per-decision thread wakeups, zero-copy slot banks with
+  per-bank CUDA Graphs amortize the small-batch GPU ticket tax, multi-device
+  groups split one GPU into parallel fill pipelines (NVIDIA CUDA/TensorRT and
+  AMD DirectML, including mixed-vendor multi-GPU), and per-generation
+  population routing serves evolutionary workloads. Measured 116x over a naive
+  python loop on the public Gomoku benchmark; bitwise determinism gates
+  (G1-G9) enforced in CI. MIT license.
+keywords:
+  - self-play
+  - batched inference
+  - reinforcement-learning
+  - evolutionary-computation
+  - game-ai
+  - high-throughput
+  - CUDA-Graph
+  - DirectML
+license: MIT
