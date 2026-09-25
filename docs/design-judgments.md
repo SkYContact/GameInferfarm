@@ -389,3 +389,21 @@ harvest=组 0 spec IO 重复入表（own/opp/policy ×2）——单组腿因结�
 循环为空从未暴露（多组盲区）；多组后置校验红（4 ins vs 2 ins）。修=
 spec_out 只挂 k==0 首家银行。教训：追加式枚举的收割点必须唯一；"单组
 绿"不覆盖"多组对拍"路径。
+
+## 19. ReBAR/直写显存判死（2026-09-24，构造性论证——不动 GPU 下结论）
+
+背景：调研批发现本机 ReBAR 已开（BAR1=16GB 全显存映射），"宿主直写显存
+省 H2D 拷贝"（KataGo zero-copy 式）成为 C 档候选。三步查证后判死，不
+写探针：
+1. **Windows+NV 用户态无直写显存 API**：BAR1 的 WC 映射只有内核驱动能
+   建；cudaHostRegister/VMM API 全是 host→device 注册或 device 侧管理，
+   无显存→宿主地址空间通路。死路。
+2. **WC pinned 变体与架构冲突**：CPU 写 WC 内存不走缓存省污染，但缓存
+   键=组装行字节哈希（判决13）要求**写后立刻读回**——WC 内存 load 强制
+   uncached（~300 cycle/条），176.9KB 行读回哈希直接毒死。写省 ≤ 读毒。
+3. **zero-copy（GPU 读 host pinned）教训重演**：同一根 PCIe（x8 Gen4
+   ~16GB/s），省 memcpy 发射开销 µs 级，kernel 按需拉数据劣于 DMA 引擎
+   满宽顺序读——fence v4"隐藏并行显式化=-17%"直接适用。
+现状查证：CUDA 后端槽 arena=cudaHostAlloc(flags=0) 普通 cacheable
+pinned——本管道下已是最优形态，无可改进面。结论：直写显存线在 Windows
+整线判死；若将来换 Linux（可 mmap BAR）或去哈希化组装可翻案。
