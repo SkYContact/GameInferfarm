@@ -439,3 +439,16 @@ srv-lat p50 2.4ms p90 3.3ms → **S0+HR 1416（+121%）/ p50 1.2ms p90 1.3ms
 工程要点：旗标用数值（0x1|0x2——SDK 常量被 WINVER 守卫，项目未提升）；
 opt-in 默认关=零行为差（HR 关回归 ALL PASS；HR 开 farm_test 70 门全绿、
 33 银行实例走新路径=行为等价实锤）。
+
+## 21. DML 后端可观测面（2026-09-26，dep 拆段）
+
+DML 后端的 flw 是黑盒墙钟（EP 无流无围栏，dep 恒 0）——拆 rebind（新鲜
+CPU OrtValue 重绑的 API 面）/run（RunWithBinding=EP 内部 staging memcpy+
+dispatch+GPU 同步总和）两段，发射线程每 64 批打印（阈值 64 而非 256：大
+批形状 fb64×8 会话总批数少，256 会整腿打不出——首测踩到的坑）。
+
+**首批读数（共享 GPU 时段，量级参考）**：rebind=0.03ms / run=3.3-3.9ms，
+且 run 与批大小无关（rows=2 与 64 同价）=**固定税形态**（dispatch+同步为
+主，staging 非主导）。**连带终判直写零拷贝 ROI**：直写只省 rebind 侧
+（占 0.8%），run 固定税它救不了——假设"staging 占批延迟大头"被自己的
+仪器证伪，判决 19 的判死再加一层。独占复测后数字入正账。

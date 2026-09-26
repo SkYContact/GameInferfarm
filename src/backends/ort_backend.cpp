@@ -320,6 +320,9 @@ struct OrtSess {
     std::vector<OrtIn> ins;
     std::vector<OrtOut> outs;
     void* in_h_arena = nullptr;  size_t in_h_bytes = 0;
+    // DML dep 拆段累计（发射线程独写独读+打印即清零；可观测面 2026-09-26）
+    long long dml_rebind_ns = 0, dml_run_ns = 0;
+    unsigned dml_dep_cnt = 0;
     void* in_d_arena = nullptr;  size_t in_d_bytes = 0;
     void* out_h_arena = nullptr; size_t out_h_bytes = 0;
     void* out_d_arena = nullptr; size_t out_d_bytes = 0;
@@ -487,7 +490,7 @@ public:
             }
         }
         std::fprintf(stderr, "[ort] 热身就绪 slots=%d%s%s%s\n", s->slots,
-                     s->dml ? "，DML=宿主绑定+同步 Run（无图无围栏）"
+                     s->dml ? "，DML=宿主绑定+同步 Run（无图无围栏；dep 拆段每 64 批打印）"
                             : (s->graph_on ? "，CUDA Graph=开（银行会话：调度台线程绑定）"
                                            : "，CUDA Graph=关"),
                      s->async ? "，零围栏=开（用户流+事件收割）" : "",
@@ -942,6 +945,12 @@ private:
             // 恒零设备缓冲——probe 两图案不可分辨即此症），输出预绑却正常回传。
             // 判决：每次 Run 前用**新鲜 CPU OrtValue** 重绑输入（python numpy
             // 路同款），EP 据值对象走 staging 拷入；输出维持预绑。
+            // dep 拆段（2026-09-26，可观测面）：DML 的 flw 是黑盒墙钟，拆
+            // rebind（CPU API 面）/run（RunWithBinding=EP 内部 staging memcpy
+            // +dispatch+GPU 同步的总和）两段——"算力瓶颈 vs 提交瓶颈"的判决
+            // 仪器（发射线程独写独读，Warmup 首次混入 1/256 可忽略）。
+            const long long rb0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             for (size_t i = 0; i < s->ins.size(); i++) {
                 if (s->ins[i].val) a->ReleaseValue(s->ins[i].val);
                 size_t bytes = s->ins[i].meta.population
@@ -958,7 +967,35 @@ private:
                 s->ins[i].val = v;
                 if (a->BindInput(s->iob, s->ins[i].meta.name.c_str(), v)) return false;
             }
+            const long long rb1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            s->dml_rebind_ns += rb1 - rb0;
+            OrtStatus* st = a->RunWithBinding(s->sess, ro, s->iob);
+            const long long rb2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            s->dml_run_ns += rb2 - rb1;
+            // 阈值 64：大批形状（fb64×8 会话）总批数少，256 会整腿打不出
+            if (++s->dml_dep_cnt == 64) {
+                std::fprintf(stderr, "[ort-dml] dep (rows=%d): rebind=%.3f "
+                             "run=%.3f ms/均\n", s->last_n,
+                             s->dml_rebind_ns / 64e6, s->dml_run_ns / 64e6);
+                std::fflush(stderr);
+                s->dml_rebind_ns = s->dml_run_ns = 0;
+                s->dml_dep_cnt = 0;
+            }
+            if (st) {
+                std::printf("[ort] 批异常（RunWithBinding）：%s\n", a->GetErrorMessage(st));
+                std::fflush(stdout);
+                a->ReleaseStatus(st);
+                return false;
+            }
+            return true;
         }
+        return RunWithBindingCommon(s, ro);
+    }
+
+    static bool RunWithBindingCommon(OrtSess* s, OrtRunOptions* ro) {
+        const OrtApi* a = s->api;
         OrtStatus* st = a->RunWithBinding(s->sess, ro, s->iob);
         if (st) {
             std::printf("[ort] 批异常（RunWithBinding）：%s\n", a->GetErrorMessage(st));
