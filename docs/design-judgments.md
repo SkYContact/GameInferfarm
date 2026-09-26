@@ -475,3 +475,13 @@ fp16 归约的固有行为；纯 fp32 档在 RDNA2 上挂死）。
 对比锚点：ORT-DML 同代硬件逐位确定（判决 15）但执行优化被 ORT 封死；
 ncnn 快但非确定；**两者的分工=确定性刚需走 ORT-DML，纯吞吐走 ncnn**。
 v1.2 路标：MatMul 批版图（消逐行 dispatch）+ UMA 直写输入面。
+
+**v1.2 批量图进展（同日，WIP）**：MatMul 语义钉死（源码：transB=1、
+A(w=K,h=M 行) × B → (w=N, h=M)——原生行独立批量；权重 blob 作为 Input
+节点喂，transB=1 时 bin=PyTorch [N,K] 布局直用）。框架侧已就位：常量
+输入机制（net input blob 扣除数据声明=常量，从 pnnx 约定的
+<basename>_<blob>.npy 加载，常驻 external Mat 零拷贝）+ RunBatch 双实现
+开关（FARM_NCNN_BATCH=1 批量/缺省逐行）。**阻塞点**：Vulkan MatMul 执行
+段错误——matmul_vulkan.cpp 的 B shape 约定待源码核对（GitHub 文件路径
+待定位）；另实测 InnerProduct 版 load_model 要求 bin 文件存在（ModelBin
+构造 fopen，无权重层也需占位 bin）。

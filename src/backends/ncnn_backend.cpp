@@ -164,6 +164,17 @@ struct NcnnSess {
     char* out_arena = nullptr;
     size_t out_bytes = 0;
 
+    // 常量输入（v1.2 批量图：MatMul 的权重 blob 作为 Input 节点，数据来自
+    // pnnx 约定的 <basename>_<blob>.npy，f32 C-order）——常驻 external Mat
+    // （零拷贝：数据终身固定，Mat 只建一次）
+    struct ConstIn {
+        std::string name;
+        std::vector<char> data;             // 保活（external mat 不拥有数据）
+        void* mat = nullptr;
+        int w = 0, h = 0;
+    };
+    std::vector<ConstIn> consts;
+
     // 发射线程（DML 同款：同步 extract 不占调度台）
     std::thread helper;
     std::mutex h_mx;
@@ -233,10 +244,14 @@ public:
         s->net = g_ncnn.net_create();
         if (!s->net) { delete s; return nullptr; }
         if (g_ncnn.net_set_vulkan_device) g_ncnn.net_set_vulkan_device(s->net, cfg.device_id);
+        std::fprintf(stderr, "[ncnn] dbg: net created vk=%d\n", cfg.device_id);
+        std::fflush(stderr);
         if (g_ncnn.net_load_param(s->net, param_path_.c_str()) != 0) {
             std::fprintf(stderr, "[ncnn] load_param 失败: %s\n", param_path_.c_str());
             g_ncnn.net_destroy(s->net); delete s; return nullptr;
         }
+        std::fprintf(stderr, "[ncnn] dbg: param loaded\n");
+        std::fflush(stderr);
         if (g_ncnn.net_load_model(s->net, bin_path_.c_str()) != 0) {
             std::fprintf(stderr, "[ncnn] load_model 失败: %s\n", bin_path_.c_str());
             g_ncnn.net_destroy(s->net); delete s; return nullptr;
@@ -310,6 +325,85 @@ public:
             o.host = s->out_arena + off;
             off += (size_t)o.width * 4 * (size_t)s->slots;
         }
+        // ---- 常量输入（v1.2 批量图）：net 的 input blob 中，凡不属于数据
+        // 声明（cfg.cpu.ins）的=权重/常量节点，从 pnnx 约定的
+        // <basename>_<blob>.npy（f32 C-order）加载，常驻 external Mat。
+        // 逐位确定性不在此层保证（见判决 22 非确定档）。
+        {
+            std::vector<std::string> data_names;
+            for (const auto& i : s->ins) data_names.push_back(i.name);
+            const int nin = g_ncnn.net_get_input_count(s->net);
+            for (int i = 0; i < nin; i++) {
+                const char* nm = g_ncnn.net_get_input_name(s->net, i);
+                if (!nm) continue;
+                std::string name(nm);
+                bool is_data = false;
+                for (const auto& d : data_names) is_data = is_data || d == name;
+                if (is_data) continue;
+                // npy 路径：<param basename>_<blob>.npy
+                std::string base = param_path_.substr(0, param_path_.rfind('.'));
+                std::string npy = base + "_" + name + ".npy";
+                FILE* f = fopen(npy.c_str(), "rb");
+                if (!f) {
+                    std::fprintf(stderr, "[ncnn] 常量输入 %s 缺 %s（pnnx 转换产物）\n",
+                                 name.c_str(), npy.c_str());
+                    DestroySession(s);
+                    return nullptr;
+                }
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                std::vector<char> raw((size_t)sz);
+                if (fread(raw.data(), 1, raw.size(), f) != raw.size() || sz < 10
+                    || memcmp(raw.data(), "\x93NUMPY", 6) != 0) {
+                    std::fprintf(stderr, "[ncnn] %s 不是 npy\n", npy.c_str());
+                    fclose(f); DestroySession(s);
+                    return nullptr;
+                }
+                fclose(f);
+                // header：magic(6) ver(2) hlen(2) then dict；只认 v1.0 + <f4 + C-order
+                unsigned short hlen = 0;
+                memcpy(&hlen, raw.data() + 8, 2);
+                std::string hdr(raw.data() + 10, hlen);
+                if (hdr.find("'|f4'") == std::string::npos
+                    && hdr.find("'<f4'") == std::string::npos) {
+                    std::fprintf(stderr, "[ncnn] %s 非 f32 npy\n", npy.c_str());
+                    DestroySession(s);
+                    return nullptr;
+                }
+                if (hdr.find("True") != std::string::npos) {
+                    std::fprintf(stderr, "[ncnn] %s 为 fortran_order，需 C-order\n", npy.c_str());
+                    DestroySession(s);
+                    return nullptr;
+                }
+                int w = 1, h = 1;
+                {
+                    auto grab = [&](const char* key) -> bool {
+                        auto p = hdr.find("'" + std::string(key) + "': (");
+                        if (p == std::string::npos) return false;
+                        auto q1 = hdr.find('(', p) + 1;
+                        auto q2 = hdr.find(')', q1);
+                        std::string body = hdr.substr(q1, q2 - q1);
+                        auto c = body.find(',');
+                        if (c == std::string::npos) { w = atoi(body.c_str()); h = 1; }
+                        else { h = atoi(body.c_str()); w = atoi(body.c_str() + c + 1); }
+                        return true;
+                    };
+                    // shape=(h, w)（np 二维=行,列）
+                    if (!grab("shape")) { DestroySession(s); return nullptr; }
+                }
+                NcnnSess::ConstIn ci;
+                ci.name = name;
+                ci.w = w;
+                ci.h = h;
+                ci.data.assign(raw.end() - (long)(w * h * 4), raw.end());
+                ci.mat = g_ncnn.mat_create_external_2d_elem(w, h, ci.data.data(), 4, 1, nullptr);
+                if (!ci.mat) { DestroySession(s); return nullptr; }
+                s->consts.push_back(std::move(ci));
+                std::fprintf(stderr, "[ncnn] 常量输入 %s <- %s（%dx%d）\n",
+                             name.c_str(), npy.c_str(), w, h);
+            }
+        }
         // 发射线程（extract 同步；投递即返回）
         s->helper = std::thread([s] {
             for (;;) {
@@ -356,6 +450,8 @@ public:
             s->h_cv.notify_all();
             s->helper.join();
         }
+        for (auto& c : s->consts)
+            if (c.mat) g_ncnn.mat_destroy(c.mat);
 #ifdef _WIN32
         if (s->in_arena) VirtualFree(s->in_arena, 0, MEM_RELEASE);
         if (s->out_arena) VirtualFree(s->out_arena, 0, MEM_RELEASE);
@@ -420,17 +516,55 @@ public:
     }
 
 private:
-    // 一批 = 逐行 extract（ncnn 的 InnerProduct 把 (w,h) 输入 flatten 成单
-    // 样本——不保批维，h 维批量在本后端不可用；v1.1 正确性优先，MatMul 批版
-    // 图（行独立批量一次 dispatch）留 v1.2）。external_2d(h=1) 包装槽行=零拷贝。
+    // 一批 = 单次 extract（v1.2 批量图，FARM_NCNN_BATCH=1）：数据输入
+    // external_2d(h=本批行数) 直包槽面，常量输入（权重）复用常驻 external Mat。
+    // ⚠ v1.2 实验档：Vulkan MatMul 对 B 的 shape 约定待源码核对（实测段错误
+    // ——matmul_vulkan.cpp 的 transB 布局文档缺失）；缺省 v1.1 逐行（正确）。
     static void RunBatch(NcnnSess* s) {
+        const char* be = std::getenv("FARM_NCNN_BATCH");
+        if (!(be && *be && std::atoi(be) == 1) || !s->consts.empty() == false) {
+            RunBatchRowwise(s);
+            return;
+        }
+        const int n = s->last_n;
+        void* ex = g_ncnn.extractor_create(s->net);
+        if (!ex) {
+            std::fprintf(stderr, "[ncnn] extractor 创建失败\n");
+            return;
+        }
+        for (auto& c : s->consts)
+            g_ncnn.extractor_input(ex, c.name.c_str(), c.mat);
+        for (auto& i : s->ins) {
+            void* m = g_ncnn.mat_create_external_2d_elem(
+                (int)i.row_elems, n, i.host, 4, 1, nullptr);
+            g_ncnn.extractor_input(ex, i.name.c_str(), m);
+            g_ncnn.mat_destroy(m);
+        }
+        for (auto& o : s->outs) {
+            void* om = nullptr;
+            if (g_ncnn.extractor_extract(ex, o.name.c_str(), &om) != 0 || !om) {
+                std::fprintf(stderr, "[ncnn] extract %s 失败\n", o.name.c_str());
+                continue;
+            }
+            const size_t rowb = (size_t)o.width * 4;
+            if (g_ncnn.mat_get_w(om) == o.width && g_ncnn.mat_get_h(om) == n) {
+                memcpy(o.host, g_ncnn.mat_get_data(om), rowb * (size_t)n);
+            } else {
+                std::fprintf(stderr, "[ncnn] 输出面意外: %s w=%d h=%d（期望 w=%d h=%d）\n",
+                             o.name.c_str(), g_ncnn.mat_get_w(om),
+                             g_ncnn.mat_get_h(om), o.width, n);
+            }
+            g_ncnn.mat_destroy(om);
+        }
+        g_ncnn.extractor_destroy(ex);
+    }
+
+    // v1.1 逐行（正确性参照）：ncnn InnerProduct flatten 语义下唯一确定形
+    static void RunBatchRowwise(NcnnSess* s) {
         const int n = s->last_n;
         for (int r = 0; r < n; r++) {
             void* ex = g_ncnn.extractor_create(s->net);
-            if (!ex) {
-                std::fprintf(stderr, "[ncnn] extractor 创建失败\n");
-                return;
-            }
+            if (!ex) return;
             for (auto& i : s->ins) {
                 void* m = g_ncnn.mat_create_external_2d_elem(
                     (int)i.row_elems, 1, i.host + (size_t)r * i.row_elems * 4,
@@ -440,10 +574,8 @@ private:
             }
             for (auto& o : s->outs) {
                 void* om = nullptr;
-                if (g_ncnn.extractor_extract(ex, o.name.c_str(), &om) != 0 || !om) {
-                    std::fprintf(stderr, "[ncnn] extract %s 失败\n", o.name.c_str());
+                if (g_ncnn.extractor_extract(ex, o.name.c_str(), &om) != 0 || !om)
                     continue;
-                }
                 memcpy(o.host + (size_t)r * o.width * 4,
                        g_ncnn.mat_get_data(om), (size_t)o.width * 4);
                 g_ncnn.mat_destroy(om);

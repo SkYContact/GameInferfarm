@@ -12,6 +12,8 @@
 //   打印代墙钟（对标 torch 参考 1.07s/代）。链 c=个体 c%P（8 局同个体）。
 #include "othello_adapter.h"
 #include <cstdio>
+#include <fcntl.h>
+#include <io.h>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -36,6 +38,7 @@ int main(int argc, char** argv) {
     cfg.model.cpu = OthelloModelDecl(cfg.slots);
     bool show_board = false;
     int pop_p = 0, gens = 1, games_each = 8;
+    bool pipe_mode = false;
     std::string pop_file;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
@@ -51,6 +54,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--ort-dir") && i + 1 < argc) cfg.model.ort_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--trt-dir") && i + 1 < argc) cfg.model.trt_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--cuda-dir") && i + 1 < argc) cfg.model.cuda_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--refit") && i + 1 < argc) cfg.model.refit_weights = argv[++i];
         else if (!std::strcmp(argv[i], "--banks") && i + 1 < argc) cfg.banks = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--chains") && i + 1 < argc) cfg.chains = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--games") && i + 1 < argc) cfg.games = atoi(argv[++i]);
@@ -108,6 +112,20 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--threads")) cfg.fibers = false;
         else if (!std::strcmp(argv[i], "--census")) cfg.census = true;
         else if (!std::strcmp(argv[i], "--show-board")) show_board = true;
+        // ---- 驱动协议与对手模式（实验10 重做）----
+        else if (!std::strcmp(argv[i], "--pipe")) pipe_mode = true;
+        else if (!std::strcmp(argv[i], "--opp") && i + 1 < argc) {
+            const char* m = argv[++i];
+            if (!std::strcmp(m, "random")) OG().opp_mode = 0;
+            else if (!std::strcmp(m, "anchor")) OG().opp_mode = 1;
+            else { std::printf("未知对手 %s（random|anchor）\n", m); return 2; }
+        }
+        else if (!std::strcmp(argv[i], "--our-temp") && i + 1 < argc) OG().our_temp = (float)atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--anchor-temp") && i + 1 < argc) OG().anchor_temp = (float)atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) {
+            OG().dump = fopen(argv[++i], "wb");
+            if (!OG().dump) { std::printf("dump 文件打不开: %s\n", argv[i]); return 2; }
+        }
         else { std::printf("未知参数 %s\n", argv[i]); return 2; }
     }
     if (cfg.model.backend == "ort" && cfg.model.model_path.empty()) {
@@ -123,6 +141,85 @@ int main(int argc, char** argv) {
     }
     Farm farm;
     if (!farm.Init(cfg)) return 1;
+    if (pipe_mode) {
+        // ---- 驱动协议：stdin 二进制消息 → SetPopulation/RefitWeights → 一腿 → JSON ----
+        // 消息：u32 kind（0=退出）| kind1=ES腿: u32 n_pop,n_anc + pop[] + anc[]
+        //       | kind2=PG腿: u32 path_len + path + u32 n_anc + anc[]（RW1 换心）
+        // 回应：单行 JSON（games/wall/decisions/fp/wins/played/dump_pos）
+        _setmode(_fileno(stdin), _O_BINARY);
+        auto rdbl = [&](void* p, size_t n) -> bool { return fread(p, 1, n, stdin) == n; };
+        std::vector<float> pop, anc;
+        for (;;) {
+            uint32_t kind = 0;
+            if (!rdbl(&kind, 4) || kind == 0) break;
+            if (kind == 1) {
+                uint32_t n_pop = 0, n_anc = 0, flip = 0;
+                float our_temp = 0.0f;
+                if (!rdbl(&n_pop, 4) || !rdbl(&n_anc, 4)) break;
+                uint32_t gmix = 0;
+                if (!rdbl(&our_temp, 4) || !rdbl(&flip, 4) || !rdbl(&gmix, 4)) break;
+                OG().our_temp = our_temp;
+                OG().flip_colors = flip != 0;
+                OG().gen_mix = gmix;
+                pop.resize((size_t)n_pop * othello::kFlatW);
+                anc.resize((size_t)n_anc * othello::kFlatW);
+                if (n_pop && !rdbl(pop.data(), pop.size() * 4)) break;
+                if (n_anc && !rdbl(anc.data(), anc.size() * 4)) break;
+                if (n_pop && !farm.SetPopulation(pop.data())) {
+                    std::printf("{\"error\":\"SetPopulation failed\"}\n"); std::fflush(stdout); break;
+                }
+            } else if (kind == 2) {
+                uint32_t plen = 0, n_anc = 0, flip = 0;
+                float our_temp = 0.0f;
+                if (!rdbl(&plen, 4)) break;
+                std::string path(plen, '\0');
+                if (plen && !rdbl(&path[0], plen)) break;
+                uint32_t gmix = 0;
+                if (!rdbl(&our_temp, 4) || !rdbl(&flip, 4) || !rdbl(&gmix, 4)) break;
+                OG().our_temp = our_temp;
+                OG().flip_colors = flip != 0;
+                OG().gen_mix = gmix;
+                if (!rdbl(&n_anc, 4)) break;
+                anc.resize((size_t)n_anc * othello::kFlatW);
+                if (n_anc && !rdbl(anc.data(), anc.size() * 4)) break;
+                if (!farm.RefitWeights(path.c_str())) {
+                    std::printf("{\"error\":\"RefitWeights failed\"}\n"); std::fflush(stdout); break;
+                }
+            } else break;
+            if (!anc.empty()) { OG().anchor_w = anc; OG().opp_mode = 1; }
+            else { OG().anchor_w.clear(); OG().opp_mode = 0; }   // 无锚点=随机对手（清残留）
+            OG().score_sum.assign((size_t)pop_p > 0 ? pop_p : 1, 0.0f);
+            OG().score_games.assign((size_t)pop_p > 0 ? pop_p : 1, 0);
+            double sec = farm.RunLeg(MakeOthelloAdapter, nullptr);
+            const FarmTally& t = farm.tally();
+            std::printf("{\"games\":%d,\"wall\":%.4f,\"decisions\":%lld,\"fails\":%d,"
+                        "\"fp\":\"%016llx\",\"dump_pos\":%llu,\"opp\":%d,\"anch\":%zu",
+                        t.games_done, sec, (long long)t.decisions, t.infer_fails,
+                        (unsigned long long)t.fingerprint, OG().dump_bytes, OG().opp_mode, OG().anchor_w.size() / othello::kFlatW);
+            if (!OG().score_games.empty()) {
+                std::printf(",\"score\":[");
+                for (size_t i = 0; i < OG().score_games.size(); i++)
+                    std::printf("%s%.4f", i ? "," : "", OG().score_sum[i]);
+                std::printf("],\"sgames\":[");
+                for (size_t i = 0; i < OG().score_games.size(); i++)
+                    std::printf("%s%d", i ? "," : "", OG().score_games[i]);
+                std::printf("]");
+            }
+            if (!t.model_games.empty()) {
+                std::printf(",\"wins\":[");
+                for (size_t i = 0; i < t.model_games.size(); i++)
+                    std::printf("%s%d", i ? "," : "", t.model_wins[i]);
+                std::printf("],\"played\":[");
+                for (size_t i = 0; i < t.model_games.size(); i++)
+                    std::printf("%s%d", i ? "," : "", t.model_games[i]);
+                std::printf("]");
+            }
+            std::printf("}\n");
+            std::fflush(stdout);
+        }
+        if (OG().dump) fclose(OG().dump);
+        return 0;
+    }
     if (pop_p > 0) {
         // ---- ES 代际模式：每代换种群跑一腿 ----
         ModelSpec* sp = farm.spec();
