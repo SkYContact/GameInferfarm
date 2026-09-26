@@ -19,6 +19,7 @@
 #include <cstring>
 #include <string>
 
+
 using namespace inferfarm;
 using namespace inferfarm::gomoku;
 
@@ -92,6 +93,7 @@ int main(int argc, char** argv) {
             }
             d.model.population_input = cfg.model.population_input;   // 路由模式组继承
             if (d.model.backend == "cpu") d.model.cpu = GomokuModelDecl(cfg.slots);
+            if (d.model.backend == "ncnn") d.model.cpu = cfg.model.cpu;   // ncnn 声明式 spec 同样继承（否则 --device 组 LoadSpec 空声明必败）
             if (cfg.devices.empty()) {   // 首个：替换主设备
                 cfg.model = d.model;
                 cfg.banks = d.banks;

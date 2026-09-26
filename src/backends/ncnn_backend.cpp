@@ -137,6 +137,8 @@ struct NcnnApi {
         return false;
 #endif
     }
+    // 注：不做会话归零 FreeLibrary——实测 ncnn.dll 卸载 detach 在本机挂死
+    // （vk 清理等齐队列死锁）；保持进程尾随 loader 卸载，退出期 AV 见判决 23。
 };
 
 NcnnApi g_ncnn;   // 进程一份（同 cudart/ORT 模式；同 dll 同运行时）
@@ -246,6 +248,30 @@ public:
         if (g_ncnn.net_set_vulkan_device) g_ncnn.net_set_vulkan_device(s->net, cfg.device_id);
         std::fprintf(stderr, "[ncnn] dbg: net created vk=%d\n", cfg.device_id);
         std::fflush(stderr);
+        // option 必须在 load_param/load_model 之前定死（判决 23）：ncnn 的
+        // layer pipeline 在 load 期按 option 烧制（fp16 存储格式/协作矩阵
+        // 特化都在 create_pipeline 选型）；load 后再改 option=pipeline 与
+        // 运行期数据格式错配。实测（判决 23）：dll 缺省 use_vulkan_compute=
+        // 0（官方默认），旧版 load 后才开 vk+fp16 → 旧数字产生于非受控
+        // 状态且 fp32 档崩；显式先设后，fp32 档全卡可跑。
+        if (void* opt = g_ncnn.net_get_option(s->net)) {
+            g_ncnn.option_set_num_threads(opt, threads_);
+            // fp16/协作矩阵开关（FARM_NCNN_FP16=1 开；FARM_NCNN_CM 缺省关）：
+            // RDNA2 实测（610M，批量图 64 行）：fp16+CM=6.8ms/批 vs CM 关
+            // 1.4ms/批=协作矩阵在 Gemm 批形状上是 4.7× 减速器（16x16x16 tile
+            // 对 M=64 欠利用，与 llama.cpp 在非 NVIDIA 卡禁 CM 同型）；5070Ti
+            // 上 CM 中性。CM 只在乘客显式 FARM_NCNN_CM=1 时启用。fp16 归约/
+            // CM/纯 fp32 三档指纹均非确定（判决 22 扩展：fp32 也不确定）。
+            const char* fp16e = std::getenv("FARM_NCNN_FP16");
+            const bool fp16 = !(fp16e && *fp16e && std::atoi(fp16e) == 0);   // 缺省开
+            const char* cme = std::getenv("FARM_NCNN_CM");
+            const bool cm = cme && *cme && std::atoi(cme) == 1;              // 缺省关
+            if (g_ncnn.option_set_use_vulkan_compute) g_ncnn.option_set_use_vulkan_compute(opt, 1);
+            if (g_ncnn.option_set_use_fp16_packed) g_ncnn.option_set_use_fp16_packed(opt, fp16 ? 1 : 0);
+            if (g_ncnn.option_set_use_fp16_storage) g_ncnn.option_set_use_fp16_storage(opt, fp16 ? 1 : 0);
+            if (g_ncnn.option_set_use_fp16_arithmetic) g_ncnn.option_set_use_fp16_arithmetic(opt, fp16 ? 1 : 0);
+            if (g_ncnn.option_set_use_cooperative_matrix) g_ncnn.option_set_use_cooperative_matrix(opt, cm ? 1 : 0);
+        }
         if (g_ncnn.net_load_param(s->net, param_path_.c_str()) != 0) {
             std::fprintf(stderr, "[ncnn] load_param 失败: %s\n", param_path_.c_str());
             g_ncnn.net_destroy(s->net); delete s; return nullptr;
@@ -255,22 +281,6 @@ public:
         if (g_ncnn.net_load_model(s->net, bin_path_.c_str()) != 0) {
             std::fprintf(stderr, "[ncnn] load_model 失败: %s\n", bin_path_.c_str());
             g_ncnn.net_destroy(s->net); delete s; return nullptr;
-        }
-        // option：vulkan+fp16+协作矩阵全开（610M 能力面实测全 1）
-        if (void* opt = g_ncnn.net_get_option(s->net)) {
-            g_ncnn.option_set_num_threads(opt, threads_);
-            // fp16/协作矩阵开关（FARM_NCNN_FP16=1 开）：RDNA2 的 Vulkan fp16
-            // 协作矩阵归约不保证逐位确定（VK_KHR_cooperative_matrix 规范不保）
-            // ——默认关=fp32 确定档；乘客要速度可开（f16 双速 ×2）
-            const char* fp16e = std::getenv("FARM_NCNN_FP16");
-            const bool fp16 = !(fp16e && *fp16e && std::atoi(fp16e) == 0);   // 缺省开
-            const char* cme = std::getenv("FARM_NCNN_CM");
-            const bool cm = !(cme && *cme && std::atoi(cme) == 0);           // 缺省开
-            if (g_ncnn.option_set_use_vulkan_compute) g_ncnn.option_set_use_vulkan_compute(opt, 1);
-            if (g_ncnn.option_set_use_fp16_packed) g_ncnn.option_set_use_fp16_packed(opt, fp16 ? 1 : 0);
-            if (g_ncnn.option_set_use_fp16_storage) g_ncnn.option_set_use_fp16_storage(opt, fp16 ? 1 : 0);
-            if (g_ncnn.option_set_use_fp16_arithmetic) g_ncnn.option_set_use_fp16_arithmetic(opt, fp16 ? 1 : 0);
-            if (g_ncnn.option_set_use_cooperative_matrix) g_ncnn.option_set_use_cooperative_matrix(opt, cm ? 1 : 0);
         }
         // IO 面（声明驱动）
         for (const auto& m : spec.ins) {
@@ -516,13 +526,16 @@ public:
     }
 
 private:
-    // 一批 = 单次 extract（v1.2 批量图，FARM_NCNN_BATCH=1）：数据输入
-    // external_2d(h=本批行数) 直包槽面，常量输入（权重）复用常驻 external Mat。
-    // ⚠ v1.2 实验档：Vulkan MatMul 对 B 的 shape 约定待源码核对（实测段错误
-    // ——matmul_vulkan.cpp 的 transB 布局文档缺失）；缺省 v1.1 逐行（正确）。
+    // 一批 = 单次 extract（v1.2 批量图，缺省）：数据输入 external_2d(h=本批行数)
+    // 直包槽面，常量输入（权重）复用常驻 external Mat。逐行保留为
+    // FARM_NCNN_BATCH=0 回退档（另：无权重输入 blob 的旧 InnerProduct 图无
+    // 批量形，自动走逐行——见门）。实测（4096 局 ×3 交替，判决 23 后基线）：
+    // 批量 5070Ti 0.15s / 610M 0.94-0.99s vs 逐行 5070Ti 4.3s / 610M 30.7s
+    // ≈29×/32×（逐行每次 extract 重传 1.38MB 权重，批量摊薄 64×）。
     static void RunBatch(NcnnSess* s) {
         const char* be = std::getenv("FARM_NCNN_BATCH");
-        if (!(be && *be && std::atoi(be) == 1) || !s->consts.empty() == false) {
+        const bool want_batch = (be && *be) ? std::atoi(be) == 1 : true;   // 缺省批量
+        if (!want_batch || s->consts.empty()) {
             RunBatchRowwise(s);
             return;
         }
@@ -565,6 +578,10 @@ private:
         for (int r = 0; r < n; r++) {
             void* ex = g_ncnn.extractor_create(s->net);
             if (!ex) return;
+            // 常量输入（v1.2 批量图的权重 blob）逐行同样要喂——图把权重声明
+            // 成 Input blob 时，缺喂=空 blob 进 GPU 层=AV（实测段错误点）
+            for (auto& c : s->consts)
+                g_ncnn.extractor_input(ex, c.name.c_str(), c.mat);
             for (auto& i : s->ins) {
                 void* m = g_ncnn.mat_create_external_2d_elem(
                     (int)i.row_elems, 1, i.host + (size_t)r * i.row_elems * 4,

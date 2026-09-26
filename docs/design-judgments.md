@@ -485,3 +485,65 @@ A(w=K,h=M 行) × B → (w=N, h=M)——原生行独立批量；权重 blob 作�
 段错误——matmul_vulkan.cpp 的 B shape 约定待源码核对（GitHub 文件路径
 待定位）；另实测 InnerProduct 版 load_model 要求 bin 文件存在（ModelBin
 构造 fopen，无权重层也需占位 bin）。
+
+**v1.2 批量图修通（同日晚，判决 22 收口）**：WIP 段的三个悬案一并钉死。
+①**ncnn 20260526 没有 matmul_vulkan**（仓库全树核对：MatMul 只有
+cpu/x86/arm/loongarch/mips 变体；GPU 上只有 Gemm_vulkan 与
+InnerProduct_vulkan）——批量图必须换 Gemm 层。②手写 param 的段错误真因
+不是层而是**拓扑字段**：`MatMul fc1 2 2 cat w1 h1 0=1` 的"2 2"是
+底数+**顶数**，只写 1 个 top 名时 "0=1" 被吞成第二个 top blob、ParamDict
+全空（transB 静默回落 0），blob 总数 8>声明 7 → load_param 越界写堆
+（dll 构建当场段错误，pip 静态构建静默腐坏后延迟崩——同一错误两种脸）。
+正确写法 `Gemm fc1 2 1 cat w1 h1 3=1`（2 底 1 顶，3=transB=1）。
+③**ncnn Concat 的 axis 与直觉相反**：2D 输入下 axis=0 是沿 h 堆叠、
+axis=1 才是沿 w 拼接（concat.cpp：dims==2 && axis==0 走"total height"）。
+旧 v1.1 图 h=1 时 h 堆叠与 w 拼接的扁平序相同所以侥幸正确，批量化后
+立刻翻车（cat 出 (225,2h) 而非 (450,h)）——修 `Concat cat 2 1 own opp
+cat 0=1`。修后 numpy 对照：fp32 精确为 0、fp16 误差 ~5e-4（f16 舍入带）。
+④RunBatchRowwise 补喂 consts（权重 Input blob 缺喂=空 blob 进 GPU 层=AV，
+实测段错误点；旧 InnerProduct 图权重在 bin 无此症）。
+**A/B 数字（4096 局 ×3 交替，mm 图 fp16）**：批量 5070Ti 0.15-0.16s
+（flw 0.31-0.40ms/批）/ 610M 0.94-0.99s（flw 1.37-1.60ms）vs 逐行
+5070Ti 4.2-4.4s / 610M 30.6-30.9s——**≈29×/32×**（逐行每次 extract
+重传 1.38MB 权重 blob，批量摊薄 64×；旧 InnerProduct 逐行 1.46s 不受此
+税因权重驻留 bin）。FARM_NCNN_BATCH 缺省改 1（批量成为缺省），逐行=0
+回退档；旧 InnerProduct 图（consts 空）自动走逐行，无需动 env。
+
+## 23. ncnn option 时序与退出期清理（2026-09-26，fp32 挂死定性）
+
+**现象**：FARM_NCNN_FP16=0（显式关 fp16 三开关）时 gomoku 腿进程挂死/
+段错误，无输出无 TDR。
+
+**定性=我们用法错，已修**：ncnn 的 layer pipeline 在 **load 期**按 option
+烧制（fp16 存储格式/协作矩阵特化都在 create_pipeline 选型），旧版后端在
+load_param/load_model **之后**才 set fp16/vk/cm——fp16 pipeline 配 fp32
+运行期数据=结构错配（UB：挂死或 AV）。python 侧等价实验四组合全过
+（python 在 load 前设 opt）——时序即分野。修复：CreateSession 里 option
+块整体搬到 load_param 之前（net_create → set_vulkan_device → set option →
+load_param → load_model）。修后 fp32 档全卡可跑：5070Ti 0.76-0.79s
+（vs fp16 0.15s ≈5×）、610M 0.96-1.98s（vs fp16 0.94-0.99s ≈1×，
+iGPU 内存带宽瓶颈不吃算度档）4096 局推理故障 0。
+
+**对照矩阵（610M 批量图）**：fp16+CM=6.8ms/批（稳态 flw，非编译税）vs
+CM 关 1.4ms=**协作矩阵在 Gemm 批形状上是 4.7× 减速器**（16x16x16 tile 对
+M=64 欠利用；5070Ti 上 CM 中性 0.14 vs 0.31ms 反而略慢）——FARM_NCNN_CM
+缺省改 0。与 llama.cpp 在非 NVIDIA 卡禁 CM 同型（discussion #13530）。
+**判决 22 扩展**：纯 fp32 档三跑三指纹——非确定不是 fp16/CM 特有，
+ncnn Vulkan 全档非确定，判决 22 的"非确定加速器"定性加固。
+
+**残留（上游 bug，非阻塞）**：进程退出时 ncnn.dll 全局清理 rip=0 空函数
+指针 AV（VEH 抓实；fp16/fp32/两图全配置共有，RunLeg 汇总与全部 teardown
+完成后才发生，工作零影响）=上游已知问题 [#2733](https://github.com/Tencent/ncnn/issues/2733)
+（2021 年 open 至今，vkDestroyDevice 退出崩，显式 destroy_gpu_instance 也
+躲不过），与 python 侧"析构段错误"已知毛病同源。工程侧曾试会话归零
+FreeLibrary 提前卸载→vk 清理死锁（更糟），已回退；处置=编排器认汇总行
+不认退出码，dll 随 loader 卸载。另：dll 实测缺省 option=vk0/fp16 111/
+cm1/threads16/slm1（probe 读回），旧版数字产生于"load 期 vk=0 CPU 层图
++ 运行期 vk=1 混合路径"的非受控状态，判决 23 后所有数字为显式配置基线。
+
+**教训入坑律**：①手工 ncnn param 的"底数 顶数"字段是双计数字段，top
+名数必须与顶数一致——top 缺名不报错而是吞参数（ParamDict 静默空）+blob
+越界，崩相离因十万八千里；②ncnn Concat axis 语义按 ncnn 维序（0=w 维
+仅对 1D 成立，2D 下 0=h/1=w）勿按 torch 直觉写；③换后端 API 时"配置
+必须在 load 前"这类时序铁律要第一时查文档，症状（挂死 vs AV）是UB 的
+抽奖不是线索。

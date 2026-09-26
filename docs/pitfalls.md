@@ -129,3 +129,22 @@
   的陈年同名 dll（实测本机 System32 有 ORT 1.17.1，PATH 前插 1.30 永远
   轮不到）。框架侧正确应对=版本门 fail fast+指路（GetApi 失败信息提示
   显式设 FARM_ORT_DIR），不静默拿旧版。
+
+## ncnn Vulkan 批（2026-09-26）
+- **手写 param 的"底数 顶数"是双计数字段**：top 名给少了不报错——多出的
+  参数 token 被吞成第二个 top blob 名（"0=1"成了 blob）、ParamDict 静默
+  全空（transB 回落 0）、blob 总数超声明 → load_param 越界写堆。崩相=
+  数百毫秒后的段错误/静默腐坏，与病灶相距十万八千里（dll 构建当场崩、
+  pip 静态构建延迟崩，同错两脸）。写 param 后必须 dump `net.layers()`
+  核对 bottoms/tops 计数。
+- **ncnn Concat 的 axis 按 ncnn 维序不按 torch 直觉**：2D 输入 axis=0=
+  沿 h 堆叠、axis=1=沿 w 拼接（"沿宽度拼"要写 0=1）。h=1 时两种写法
+  扁平序相同=侥幸正确，批量化（h>1）立刻翻车。
+- **ncnn 的 option 必须在 load_param/load_model 之前设**：pipeline 在
+  load 期按 option 烧制（fp16 存储格式/CM 特化在 create_pipeline 选型），
+  load 后改 option=pipeline 与数据格式错配（fp32 数据进 fp16 pipeline=
+  挂死/AV）。且 dll 缺省 use_vulkan_compute=0——不显式设 1，load 出来
+  的是 CPU 层图，运行期再开=混合路径非受控状态。
+- **ncnn.dll（20260526）进程退出清理有 rip=0 空 函数指针 AV**（上游
+  #2733，open）：全部工作完成后才发生，编排器认汇总行不认退出码；勿试
+  FreeLibrary 提前卸载（vk 清理死锁）。python 侧"析构段错误"同源。
