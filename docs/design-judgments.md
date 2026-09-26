@@ -452,3 +452,26 @@ dispatch+GPU 同步总和）两段，发射线程每 64 批打印（阈值 64 �
 主，staging 非主导）。**连带终判直写零拷贝 ROI**：直写只省 rebind 侧
 （占 0.8%），run 固定税它救不了——假设"staging 占批延迟大头"被自己的
 仪器证伪，判决 19 的判死再加一层。独占复测后数字入正账。
+
+## 22. ncnn Vulkan 后端 v1.1（2026-09-26，AMD 核显第三路线）
+
+**动机**：ORT-DML 的执行优化（capture 图/直写）被 ORT 分发构建封死（判决 19/21
+链），ncnn Vulkan 是绕开 ORT 的直连栈（Tencent 开源，Vulkan 命令缓冲管理
+内建，AMD 核显大用户群验证）。
+
+**实现**：src/backends/ncnn_backend.cpp——动态加载 ncnn.dll 的 C API
+（GetProcAddress 函数表，零编译期依赖）；执行模型=逐行 extract（**ncnn 的
+InnerProduct 把 (w,h) 输入 flatten 成单样本，不保批维**——h 维批量不可用，
+v1.2 的 MatMul 批版图可解）；发射线程（DML 同款）；spec=声明式（cfg.cpu
+的 ins/outs，blob 名须与 param 一致）。开关：FARM_NCNN_DIR（dll 目录）、
+FARM_NCNN_FP16（缺省开）、FARM_NCNN_CM（缺省开）、device_id=Vulkan 序号。
+
+**实测（610M，gomoku 450→512→225 ncnn 模型，4096 局）**：fp16 档
+13-15K 局/s；**三腿三指纹=非确定**（fp16、CM 开/关三档全非确定——Vulkan
+fp16 归约的固有行为；纯 fp32 档在 RDNA2 上挂死）。
+
+**判决 22（边界与定位）**：ncnn Vulkan=**非确定加速器**——框架的逐位门/
+种子协议血统在其上失效，适用面=纯吞吐乘客（演化/评测类乘客不适用）。
+对比锚点：ORT-DML 同代硬件逐位确定（判决 15）但执行优化被 ORT 封死；
+ncnn 快但非确定；**两者的分工=确定性刚需走 ORT-DML，纯吞吐走 ncnn**。
+v1.2 路标：MatMul 批版图（消逐行 dispatch）+ UMA 直写输入面。

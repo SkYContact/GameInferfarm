@@ -21,6 +21,7 @@ static InferBackend* MakeBackend(const std::string& name) {
     if (name == "cpu") return CreateCpuBackend();
     if (name == "ort") return CreateOrtBackend();
     if (name == "trt") return CreateTrtBackend();
+    if (name == "ncnn") return CreateNcnnBackend();
     return nullptr;
 }
 

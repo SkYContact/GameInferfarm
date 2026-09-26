@@ -41,8 +41,8 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
             cfg.model.backend = argv[++i];
             if (cfg.model.backend != "cpu" && cfg.model.backend != "ort"
-                && cfg.model.backend != "trt") {
-                std::printf("未知后端 %s（cpu|ort|trt）\n", cfg.model.backend.c_str());
+                && cfg.model.backend != "trt" && cfg.model.backend != "ncnn") {
+                std::printf("未知后端 %s（cpu|ort|trt|ncnn）\n", cfg.model.backend.c_str());
                 return 2;
             }
         }
@@ -120,9 +120,12 @@ int main(int argc, char** argv) {
     if (!farm.Init(cfg)) return 1;
     double sec = farm.RunLeg(MakeGomokuAdapter, nullptr);
     const FarmTally& t = farm.tally();
+    std::printf("[gomoku] RunLeg 返回\n");
+    std::fflush(stdout);
     std::printf("[gomoku] %d 局 / %.2fs；先手 %d/%d 后手 %d/%d；指纹 %016llx\n",
                 t.games_done, sec, t.first_wins, t.first_total, t.second_wins,
                 t.second_total, (unsigned long long)t.fingerprint);
+    std::fflush(stdout);
     if (show_board) {
         std::printf("\n终局样例棋盘（链 0 末局）：\n");
         PrintBoard(GomokuAdapter::last_board);

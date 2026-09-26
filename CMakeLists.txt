@@ -54,6 +54,7 @@ add_library(inferfarm STATIC
     src/backends/cpu_backend.cpp
     src/backends/ort_backend.cpp
     src/backends/trt_backend.cpp
+    src/backends/ncnn_backend.cpp
 )
 target_include_directories(inferfarm
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
