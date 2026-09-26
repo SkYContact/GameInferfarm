@@ -100,6 +100,10 @@ if (INFERFARM_BUILD_TESTS)
     add_executable(gomoku_backend_test tests/gomoku_backend_test.cpp)
     target_link_libraries(gomoku_backend_test PRIVATE inferfarm)
 
+    # 纤程开销拆解微基准（判决实验原语单价账；手动跑，不入 ctest）
+    add_executable(fiber_bench tests/fiber_bench.cpp)
+    target_link_libraries(fiber_bench PRIVATE inferfarm)
+
     enable_testing()
     add_test(NAME farm_test COMMAND farm_test)
 endif()

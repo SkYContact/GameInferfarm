@@ -54,6 +54,7 @@ public:
     std::atomic<long long> sub_n{0}, sub_ns{0};
     std::atomic<long long> copyslot_ns{0};
     std::atomic<long long> self_dep{0};
+    std::atomic<long long> susp_n{0};  // 挂起总次数（每决策纤程成本拆账的分母面）
 
     // 选通与生命周期（FARM_CENSUS=1 / Farm 配置；默认关=各点一次可预测分支）
     bool on = false;

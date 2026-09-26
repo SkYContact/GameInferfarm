@@ -56,6 +56,7 @@ void Census::ResetLeg() {
     sub_n.store(0); sub_ns.store(0);
     copyslot_ns.store(0);
     self_dep.store(0);
+    susp_n.store(0);
 }
 
 void Census::OnSpawn() {
@@ -79,6 +80,7 @@ void Census::OnPick(int worker, uint64_t ts_post_us) {
 }
 void Census::OnSuspend() {
     if (!on) return;
+    susp_n.fetch_add(1, std::memory_order_relaxed);
     state[2].fetch_sub(1);
     state[3].fetch_add(1);
 }
@@ -230,8 +232,10 @@ void Census::StopPrinter() {
         bsum += (double)(b / 1000) / 1e6;
         isum += (double)(id / 1000) / 1e6;
     }
-    std::printf("[census] 工人忙闲总账: busy=%.1fs idle=%.1fs busy%%=%.0f（%d 工人）\n",
-                bsum, isum, bsum + isum > 0 ? 100.0 * bsum / (bsum + isum) : 0.0, nw);
+    std::printf("[census] 工人忙闲总账: busy=%.1fs idle=%.1fs busy%%=%.0f（%d 工人）"
+                "挂起=%lld 次\n",
+                bsum, isum, bsum + isum > 0 ? 100.0 * bsum / (bsum + isum) : 0.0, nw,
+                susp_n.load());
     // 银行调度台分段 + 工人侧计数（若银行用过本 census）
     long long cn = claim_n.load(), sn = sub_n.load();
     if (cn > 0 || sn > 0) {
