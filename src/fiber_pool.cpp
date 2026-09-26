@@ -7,6 +7,7 @@
 #include "inferfarm/fiber_pool.h"
 #include "inferfarm/affinity.h"
 #include "inferfarm/census.h"
+#include "fiber_backend.h"
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
@@ -67,6 +68,7 @@ struct FiberPoolState {
 static FiberPoolState g_fps;
 static thread_local FiTask* t_fi_task = nullptr;   // 本工人当前局（等待侧桥取 cookie）
 static thread_local int t_nosuspend = 0;           // 契约 1 断言计数（ScopedNoSuspend）
+static IFiberBackend* g_be = nullptr;              // 切换后端（RunLeg 期选定，池寿命）
 
 // ---------------- 等待侧桥（银行层/任何等待点调用）----------------
 void* FiberCurrent() { return t_fi_task; }
@@ -78,7 +80,7 @@ void FiberSuspend() {
     assert(t_nosuspend == 0);   // 契约 1：组装直写槽窗口（ScopedNoSuspend
                                  // 只包 AssembleInto）内挂起=适配器违约
     if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnSuspend();
-    SwitchToFiber(t_fi_task->sched);
+    g_be->Switch(t_fi_task->sched);
     // 恢复点：工人取走时已把状态翻回 RUNNING（见工人循环取走处）
 }
 
@@ -118,7 +120,7 @@ static void WINAPI FiGameMain(void* p) {
         FiSpawnGame(ch2, tk->gi + 1, tk->worker);
     if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnDone();   // RUNNING→DONE + live--
     tk->finished = true;
-    SwitchToFiber(tk->sched);   // 不归路（工人侧 DeleteFiber；函数返回=杀线程）
+    g_be->Switch(tk->sched);   // 不归路（工人侧 Destroy；函数返回=杀线程）
 }
 
 static void FiSpawnGame(FiChain* ch, int gi, int wid) {
@@ -143,10 +145,10 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
         g_fps.cv.notify_all();
         return;
     }
-    t->fiber = CreateFiberEx(0, 0, FIBER_FLAG_FLOAT_SWITCH, FiGameMain, t);
+    t->fiber = g_be->Create(FiGameMain, t);
     if (!t->fiber) {
-        std::printf("[fiber] CreateFiberEx 失败（链 %d 局 %d，本链放弃=按已收卷计）\n",
-                    ch->chain, gi);
+        std::printf("[fiber] Create 失败（后端 %s；链 %d 局 %d，本链放弃=按已收卷计）\n",
+                    g_be->name(), ch->chain, gi);
         std::fflush(stdout);
         delete t;
         // 该链后续局不再点火——按剩余局数记完成，防收卷谓词挂死
@@ -177,10 +179,10 @@ static void FiWorkerLoop(int wid, Census* cen) {
         PinThread(g_fps.worker_aff, wid, "worker");
     if (cen && cen->on && cen->tids_worker_n < Census::kMaxWorkers)
         cen->tids_worker[cen->tids_worker_n++] = GetCurrentThreadId();
-    w.main_fib = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
+    w.main_fib = g_be->ConvertThread();
     if (!w.main_fib) {
-        std::printf("[fiber] 工人 %d ConvertThreadToFiberEx 失败 GLE=%lu\n",
-                    wid, GetLastError());
+        std::printf("[fiber] 工人 %d ConvertThread 失败（后端 %s）\n",
+                    wid, g_be->name());
         g_fps.workers_ready.fetch_add(1);
         return;
     }
@@ -207,11 +209,11 @@ static void FiWorkerLoop(int wid, Census* cen) {
         // 切换点装卸（首跑/恢复同路）：帧=链寿命 → 同链跨局携带=线程模式语义
         t_fi_task = t;
         if (t->ch->frame) t->ch->frame->Install();
-        SwitchToFiber(t->fiber);
+        g_be->Switch(t->fiber);
         if (t->ch->frame) t->ch->frame->Uninstall();
         t_fi_task = nullptr;
         if (t->finished) {
-            DeleteFiber(t->fiber);
+            g_be->Destroy(t->fiber);
             delete t;
             {
                 std::lock_guard<std::mutex> lk(g_fps.mx);
@@ -223,7 +225,7 @@ static void FiWorkerLoop(int wid, Census* cen) {
         if (con)   // 忙段（含 fiber 全部执行）入账
             cen->busy_ns[wid].fetch_add((Census::NowUs() - t_run0) * 1000);
     }
-    ConvertFiberToThread();
+    g_be->ConvertBack(w.main_fib);
 }
 
 void FiberPool::Configure(int workers, Census* census) {
@@ -247,6 +249,7 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
         std::fflush(stdout);
     }
     auto t0 = std::chrono::steady_clock::now();
+    g_be = FiberBackendSelect();   // 每腿选定（env 可覆写；缺省=构建档决定）
     g_fps.fiw.clear();                   // FiWorker 含 mutex/cv：deque 原地构造免移动
     for (int w = 0; w < K; w++) g_fps.fiw.emplace_back();
     g_fps.done = 0;
@@ -278,8 +281,8 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
         if (stagger_ms > 0 && c + 1 < chains)
             Sleep((DWORD)(stagger_ms + 0.5));
     }
-    std::printf("[fiber] %d 条链已点火（K=%d 工人，每局一 fiber，链-工人亲和 c%%K）\n",
-                spawned, K);
+    std::printf("[fiber] %d 条链已点火（K=%d 工人，后端=%s，每局一 fiber，链-工人亲和 c%%K）\n",
+                spawned, K, g_be->name());
     // 等全部局收卷
     {
         std::unique_lock<std::mutex> lk(g_fps.mx);

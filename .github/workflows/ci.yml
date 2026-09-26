@@ -1,4 +1,6 @@
 # CI：无 GPU 环境跑确定性门（G1-G6 + RW1 负路径）；真模型门 R1/R2 无工件自动 SKIP
+# 双档矩阵：cpp17=回退档（winfiber 缺省=现役零行为差）+ cpp20=INFERFARM_CORO20 档；
+# cpp17 档另跑 fcontext 后端腿（FARM_FIBER_BACKEND=fcontext——新后端的确定性门）
 name: CI
 on:
   push:
@@ -7,13 +9,26 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        std: [cpp17, cpp20]
+        include:
+          - std: cpp17
+            cfg_flags: ""
+          - std: cpp20
+            cfg_flags: "-DINFERFARM_CORO20=ON"
     steps:
       - uses: actions/checkout@v4
-      - name: Configure (CMake)
-        run: cmake -S . -B build
+      - name: Configure (CMake, ${{ matrix.std }})
+        run: cmake -S . -B build ${{ matrix.cfg_flags }}
       - name: Build (Release)
         run: cmake --build build --config Release
       - name: Determinism gates (G1-G6)
+        run: build/Release/farm_test.exe
+      - name: Determinism gates on fcontext backend (cpp17 only)
+        if: matrix.std == 'cpp17'
+        env:
+          FARM_FIBER_BACKEND: fcontext
         run: build/Release/farm_test.exe
       - name: Real-model gates (SKIP without artifacts)
         run: build/Release/gomoku_backend_test.exe

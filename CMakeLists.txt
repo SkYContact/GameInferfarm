@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(inferfarm LANGUAGES CXX)
 
+option(INFERFARM_CORO20 "C++20 档：/std:c++20 + 缺省 fiber 后端=fcontext（判决实验，见 docs/design-cpp20-coroutines.md）" OFF)
+
 set(CMAKE_CXX_STANDARD 17)
+if (INFERFARM_CORO20)
+    set(CMAKE_CXX_STANDARD 20)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 # 单配置生成器缺省 Release（多配置如 VS 由 --config 决定，不受影响）
@@ -12,8 +17,9 @@ endif()
 find_package(Threads REQUIRED)
 
 if (MSVC)
-    # /utf-8：源文件中文注释（库+测试+示例）；多进程编译
-    add_compile_options(/utf-8 /MP)
+    # /utf-8：源文件中文注释（库+测试+示例）；多进程编译。
+    # 生成器表达式限定 CXX/C——ASM_MASM 不认这两个旗标（A4018 噪音）。
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX,C>:/utf-8>" "$<$<COMPILE_LANGUAGE:CXX,C>:/MP>")
 endif()
 
 option(INFERFARM_WITH_TRT "Build the TensorRT backend (needs TRT headers + nvinfer DLL at runtime)" OFF)
@@ -47,6 +53,9 @@ endif()
 add_library(inferfarm STATIC
     src/affinity.cpp
     src/fiber_pool.cpp
+    src/fiber_backend.cpp
+    src/fiber_backend_winfiber.cpp
+    src/fiber_backend_fcontext.cpp
     src/census.cpp
     src/bank.cpp
     src/refit.cpp
@@ -56,6 +65,14 @@ add_library(inferfarm STATIC
     src/backends/trt_backend.cpp
     src/backends/ncnn_backend.cpp
 )
+if (MSVC)
+    # fcontext 后端切换体（MASM64）；非 MSVC=工厂返回 nullptr 回退 winfiber
+    enable_language(ASM_MASM)
+    target_sources(inferfarm PRIVATE src/fcontext.asm)
+endif()
+if (INFERFARM_CORO20)
+    target_compile_definitions(inferfarm PRIVATE INFERFARM_CORO20=1)
+endif()
 target_include_directories(inferfarm
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -103,6 +120,7 @@ if (INFERFARM_BUILD_TESTS)
     # 纤程开销拆解微基准（判决实验原语单价账；手动跑，不入 ctest）
     add_executable(fiber_bench tests/fiber_bench.cpp)
     target_link_libraries(fiber_bench PRIVATE inferfarm)
+
 
     enable_testing()
     add_test(NAME farm_test COMMAND farm_test)

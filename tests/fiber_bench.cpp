@@ -185,6 +185,94 @@ static void BenchPostOpOnly(int rounds) {
                 (t1 - t0) / rounds);
 }
 
+// ---------------- A2. fcontext 切换原语（同 harness 对照，原语门） ----------------
+#if defined(_MSC_VER)
+#include "../src/fcontext.h"
+
+struct FcPing {
+    inferfarm::fc::Ctx* peer = nullptr;   // 对端 ctx
+    int touch_bytes = 0;
+    unsigned char* buf = nullptr;
+};
+static inferfarm::fc::Ctx g_fc_peer_own;  // 对端自有 ctx（单对端基准专用）
+
+static void FcTouchSum(FcPing* c) {
+    if (!c->touch_bytes) return;
+    unsigned acc = 0;
+    for (int i = 0; i < c->touch_bytes; i += 64) acc += c->buf[i];
+    g_sink += acc;
+}
+
+static void FcPeerMain(void* p) {   // 永不返回（收尾由宿主释放栈）
+    FcPing* c = (FcPing*)p;
+    for (;;) {
+        FcTouchSum(c);
+        inferfarm::fc::fi_swap(&g_fc_peer_own, c->peer);
+    }
+}
+
+static void BenchSwitchFC(int touch_bytes, int rounds) {
+    FcPing peer_arg;
+    FcPing main_side;   // main 侧自有工作集（与 A 档 main_ctx 同形）
+    peer_arg.touch_bytes = touch_bytes;
+    main_side.touch_bytes = touch_bytes;
+    if (touch_bytes) {
+        peer_arg.buf = (unsigned char*)VirtualAlloc(nullptr, (SIZE_T)touch_bytes,
+                                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        main_side.buf = (unsigned char*)VirtualAlloc(nullptr, (SIZE_T)touch_bytes,
+                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        for (int i = 0; i < touch_bytes; i += 4096) {
+            peer_arg.buf[i] = (unsigned char)i;
+            main_side.buf[i] = (unsigned char)(i ^ 1);
+        }
+    }
+    const size_t stack_sz = 1024 * 1024;
+    void* base = VirtualAlloc(nullptr, stack_sz, MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE);
+    char* raw_top = (char*)base + stack_sz;
+    void* top = (void*)((((uintptr_t)raw_top - 8) & ~(uintptr_t)15) + 8);
+    inferfarm::fc::fi_make(&g_fc_peer_own, top, FcPeerMain, &peer_arg);
+    inferfarm::fc::Ctx* peer = &g_fc_peer_own;
+    inferfarm::fc::Ctx main_own{};
+    peer_arg.peer = &main_own;
+    for (int i = 0; i < 2000; i++) {
+        inferfarm::fc::fi_swap(&main_own, peer);
+        FcTouchSum(&main_side);
+    }
+    const double t0 = NowNs();
+    for (int i = 0; i < rounds; i++) {
+        inferfarm::fc::fi_swap(&main_own, peer);
+        FcTouchSum(&main_side);
+    }
+    const double t1 = NowNs();
+    VirtualFree(base, 0, MEM_RELEASE);
+    if (peer_arg.buf) VirtualFree(peer_arg.buf, 0, MEM_RELEASE);
+    if (main_side.buf) VirtualFree(main_side.buf, 0, MEM_RELEASE);
+    const double per_rt = (t1 - t0) / rounds;
+    std::printf("[A2] fcontext 往返（2 次切换%s）touch=%4dKB: %8.1f ns/往返 = %6.1f ns/切换\n",
+                touch_bytes ? "，双侧首触" : "", touch_bytes / 1024, per_rt, per_rt / 2);
+}
+
+static void BenchCreateDeleteFC(int rounds) {
+    const size_t stack_sz = 1024 * 1024;
+    const double t0 = NowNs();
+    for (int i = 0; i < rounds; i++) {
+        void* base = VirtualAlloc(nullptr, stack_sz, MEM_RESERVE | MEM_COMMIT,
+                                  PAGE_READWRITE);
+        char* raw_top = (char*)base + stack_sz;
+        void* top = (void*)((((uintptr_t)raw_top - 8) & ~(uintptr_t)15) + 8);
+        inferfarm::fc::Ctx* c = new inferfarm::fc::Ctx{};
+        inferfarm::fc::fi_make(c, top, FcPeerMain, nullptr);
+        g_sink += (unsigned)(uintptr_t)c;
+        delete c;
+        VirtualFree(base, 0, MEM_RELEASE);
+    }
+    const double t1 = NowNs();
+    std::printf("[D2] VirtualAlloc(1MB)+ctx+fi_make+Free: %8.0f ns/对\n",
+                (t1 - t0) / rounds);
+}
+#endif // _MSC_VER
+
 // ---------------- D. CreateFiberEx/DeleteFiber 单价 ----------------
 static void WINAPI NullFiberMain(void*) {}   // 永不入内（只测建/删单价）
 
@@ -211,6 +299,11 @@ int main() {
     BenchSwitch(16 * 1024, 100000);
     BenchSwitch(64 * 1024, 100000);
     BenchSwitch(256 * 1024, 50000);
+#if defined(_MSC_VER)
+    BenchSwitchFC(0, 100000);
+    BenchSwitchFC(64 * 1024, 100000);
+    BenchCreateDeleteFC(20000);
+#endif
     BenchPostPickup(false, 20000);
     BenchPostPickup(true, 20000);
     BenchPostOpOnly(200000);
