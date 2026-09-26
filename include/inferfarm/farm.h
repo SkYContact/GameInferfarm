@@ -12,6 +12,9 @@
 //    FARM_BANK_SPIN           调度台等待模式：0=关 1=纯自旋（混合等待判死
 //                             拆除——判决 17；决策延迟链：躲 Windows 定时器
 //                             量子 1-1.3ms；纯自旋忙时独烧调度台核）
+//    FARM_BANK_HRTIMER=1      缺省档（spin=0）等待面换 高分辨率定时器+唤醒
+//                             事件（Win10 1803+；量子税 ~1ms→过冲 50-600µs
+//                             口径；opt-in 默认关=零行为差）
 //    FARM_STAGGER_MS          点火错峰（10ms 甜点）
 //    FARM_CENSUS=1            取证层（~5% 税，仅取证开）
 //    FARM_WORKER_AFFINITY     工人绑核列表 "0,2-7,phys"（affinity.h；phys=

@@ -420,3 +420,22 @@ vs CCD1 无差别、跨 CCD 无代价、低核区无 GPU 中断干扰（D 组调
 自旋无碍）。**部署红线更新：spin=1 下调度台必须显式钉离工人区**——
 `FARM_WORKER_AFFINITY=<工人集>` 搭配 `FARM_SCHED_AFFINITY=<远核>`，别把
 落位交给 OS 碰运气。
+
+## 20. HR waitable timer 缺省档改造（2026-09-24，FARM_BANK_HRTIMER=1）
+
+判决 3 的量子税（timeBeginPeriod(1) 下 cv.wait_for 仍 ~1-1.3ms）只治了
+spin=1（自旋）——缺省档（spin=0，CI/共享时段/无 fence 的轮询型后端）一直
+在交税。改造：调度台等 [HR 定时器（CreateWaitableTimerExW 0x2 旗标，Win10
+1803+）+ 唤醒事件（I.cv.notify 的 WMO 镜像——Notify 集中镜像+持锁点裸镜
+像）]；醒因不重要（循环体全量状态复查，假唤醒无害）；notify 落在 ResetEvent
+前=丢事件但 timer 必醒（最坏=旧量子行为），无死等。
+
+**实测（fb8 fence 128 链 4096 局 ×2 交替，指纹全同）**：S0 641 局/s /
+srv-lat p50 2.4ms p90 3.3ms → **S0+HR 1416（+121%）/ p50 1.2ms p90 1.3ms
+（尾部紧一半）**；S1 参照 11674 / 0.1ms 不变。HR 档定位=缺省档白捡 2.2×，
+不是冠军争夺——fence 生产用户有 spin=1（延迟冠军）/spin=2（完成信号量
+即时叫醒，比定时唤醒更好）。
+
+工程要点：旗标用数值（0x1|0x2——SDK 常量被 WINVER 守卫，项目未提升）；
+opt-in 默认关=零行为差（HR 关回归 ALL PASS；HR 开 farm_test 70 门全绿、
+33 银行实例走新路径=行为等价实锤）。

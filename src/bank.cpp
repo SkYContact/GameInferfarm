@@ -146,12 +146,20 @@ struct BankScheduler::Impl {
     int spin = 0;                        // 等待模式（BankConfig.spin：0/1；
                                          // 2=混合已判死拆除，判决17）
     int n_banks = 0;
+    // HR waitable timer 等待面（FARM_BANK_HRTIMER=1，2026-09-24）：缺省
+    // 路径的 cv.wait_for 受 ~1ms 定时量子税（判决3），换 高分辨率定时器
+    // （Win10 1803+，实测过冲 50-600µs 文献口径）+调度台唤醒事件（cv.notify
+    // 的 WMO 镜像——Notify 集中镜像+持锁点裸镜像）。opt-in 默认关=零行为差。
+    void* hr_timer = nullptr;            // HR 定时器（自动重置窗闹钟）
+    void* wake_ev = nullptr;             // 手动重置唤醒事件（notify 镜像）
+    bool hr_mode = false;
 
     void Notify() {
         std::lock_guard<std::mutex> lk(mx);
         cv.notify_all();
 #ifdef _WIN32
         if (notify_sem) ReleaseSemaphore((HANDLE)notify_sem, 1, nullptr);   // spin=2 WMO 唤醒
+        if (wake_ev) SetEvent((HANDLE)wake_ev);   // HR timer 路径即时叫醒
 #endif
     }
 };
@@ -574,6 +582,8 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
             I.pool_g[g].pop_front();
             wake.swap(I.waiters_g[g]);
             I.cv.notify_all();
+            if (I.wake_ev) SetEvent((HANDLE)I.wake_ev);   // HR 路径镜像（持锁点
+                                                          // 裸加——Notify 有重锁）
         }
     }
     if (i < 0) return;
@@ -648,6 +658,7 @@ static void BankLoop(BankScheduler::Impl& I) {
                     wake.insert(wake.end(), wg.begin(), wg.end());
                 }
                 I.cv.notify_all();
+                if (I.wake_ev) SetEvent((HANDLE)I.wake_ev);   // stop 即时叫醒 HR 等待
             }
             for (void* fib : wake) FiberPost(fib);
             break;
@@ -811,7 +822,33 @@ static void BankLoop(BankScheduler::Impl& I) {
                     if (rem < 0.02) rem = 0.02;
                     if (rem < wait_ms) wait_ms = rem;
                 }
-                cv_long_wait(wait_ms);
+                if (I.hr_mode) {
+                    // HR 路径：WMO 等 [HR 定时器(相对 due=wait_ms) + 唤醒事件]。
+                    // 醒因不重要——循环体自带全量状态复查，假唤醒无害；
+                    // notify 落在 ResetEvent 前=丢事件但 timer 必醒（最坏等满
+                    // wait_ms = 旧 cv 量子行为），语义安全无死等。
+                    const long long tw0 = cen && cen->on ? NowNsI() : 0;
+                    ResetEvent((HANDLE)I.wake_ev);
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(LONGLONG)(wait_ms * 10000.0);   // ms→100ns 相对
+                    if (SetWaitableTimer((HANDLE)I.hr_timer, &due, 0,
+                                         nullptr, nullptr, FALSE)) {
+                        HANDLE hs[2] = {(HANDLE)I.hr_timer, (HANDLE)I.wake_ev};
+                        WaitForMultipleObjects(2, hs, FALSE,
+                                               (DWORD)(wait_ms + 50.0));
+                    } else {
+                        Sleep((DWORD)(wait_ms + 0.5));   // Set 失败兜底
+                    }
+                    if (cen && cen->on) {
+                        cen->seg_wait_ns.fetch_add(NowNsI() - tw0,
+                                                   std::memory_order_relaxed);
+                        cen->seg_iter_ns.fetch_add(NowNsI() - it0,
+                                                   std::memory_order_relaxed);
+                        cen->seg_iter_n.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    cv_long_wait(wait_ms);
+                }
             } else if (I.spin == 1) {
                 SpinPause();   // 纯轮询：量子彻底不沾，忙时独烧调度台核
             } else {
@@ -918,6 +955,23 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     }
 #ifdef _WIN32
     I.notify_sem = CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
+    // HR waitable timer 等待面（FARM_BANK_HRTIMER=1 opt-in；默认关=零行为差
+    // ——量子税在 cv 里，判决3 的缺省档改造，2026-09-24）
+    if (const char* e = std::getenv("FARM_BANK_HRTIMER"); e && *e && atoi(e) == 1) {
+        I.wake_ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);   // 手动重置
+        // 旗标用数值：CREATE_MANUAL_RESET=0x1 / CREATE_WAITABLE_TIMER_HIGH_
+        // RESOLUTION=0x2（Win10 1803+；SDK 常量被 WINVER 守卫，项目未提升）
+        I.hr_timer = CreateWaitableTimerExW(nullptr, nullptr, 0x1 | 0x2,
+                                            TIMER_ALL_ACCESS);
+        I.hr_mode = I.wake_ev && I.hr_timer;
+        if (!I.hr_mode)
+            std::fprintf(stderr, "[bank] FARM_BANK_HRTIMER=1 但内核对象创建失败"
+                         "（GLE=%lu，Win10 1803+ 才有 HR 旗标）——走原 cv 路\n",
+                         GetLastError());
+        else
+            std::fprintf(stderr, "[bank] HR waitable timer 等待面启用（缺省档"
+                         "量子税改造，实测过冲口径 50-600µs）\n");
+    }
 #endif
     I.spec = *spec_out;   // 由 Farm 预先 LoadSpec 并核各组结构一致
     *spec_out = I.spec;
@@ -1071,6 +1125,8 @@ void BankScheduler::Shutdown() {
             b.sess = nullptr;
         }
     if (I.notify_sem) { CloseHandle(I.notify_sem); I.notify_sem = nullptr; }
+    if (I.hr_timer) { CloseHandle(I.hr_timer); I.hr_timer = nullptr; }
+    if (I.wake_ev) { CloseHandle(I.wake_ev); I.wake_ev = nullptr; }
     delete impl_;
     impl_ = nullptr;
     banks_ = 0;
