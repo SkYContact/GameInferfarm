@@ -40,6 +40,14 @@ struct InputMeta {
                                  // 枚举期标记；未点名=full 现状行为）。正确性前提
                                  // =乘客声明即承诺：行内容演化是前缀增长，depth
                                  // 递减=换局信号（见 SlotWriter::FaceDepth）
+    bool headlive = false;       // 头部活跃面（判决25 扩展，2026-09-27）：配置
+                                 // headlive_inputs 点名的 newest-first 面。行内
+                                 // [0,depth)=本批新鲜内容（每批可任意变化，逆序
+                                 // 移位 OK），[depth,dims[1])=恒零（乘客承诺，
+                                 // 哨兵必校）。设备侧尾槽恒零（zero 基+缩深
+                                 // memset），每批只传 [0,depth)。与 append 互斥
+                                 // （同面双声明=枚举期拒绝）。模型零改动，
+                                 // b4 parity 不破（掼蛋 chain/chattr 形态）
 };
 
 struct OutputMeta {
@@ -109,6 +117,11 @@ struct ModelConfig {
                                       // 经 SlotWriter::FaceDepth 逐行申报有效深度，
                                       // 后端按 [synced, depth) 段增量传输省 PCIe。
                                       // 承诺与边界见 FaceDepth 注释
+    std::vector<std::string> headlive_inputs; // 头部活跃面名单（判决25 扩展）：
+                                      // newest-first 面（新内容压行首、尾槽恒零）。
+                                      // 每批只传 [0,depth)，缩深走设备侧 memset
+                                      // （零 PCIe）。与 append_inputs 同面互斥。
+                                      // 承诺=宿主行尾槽 [depth,slots) 恒零
     std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
                                       // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效；backend=="ncnn" 时
@@ -145,6 +158,11 @@ public:
     //   [0,depth) 重写+尾部清零）。违反承诺=设备侧旧前缀与宿主漂移——输出
     //   错而指纹门红，且 FARM_H2D_DELTA_DEBUG=1 哨兵当场报非 0。无法承诺的
     //   行就别声明（full 兜底永远正确）。实践形态见判决 25 接入指引。
+    // **headlive 承诺（头部活跃面，2026-09-27）**：行内 [0,depth) 是本批
+    //   新鲜内容（每批可任意变化——newest-first 逆序移位 OK），
+    //   [depth,slots) 宿主恒零（zero 基组装天然满足）。后端每批传 [0,depth)、
+    //   缩深走设备 memset；尾槽非零=哨兵违约。depth 语义与 append 相同：
+    //   单位=行首维条目数，值域 [0,dims[1]]，递减=换局。
     virtual void FaceDepth(const char* name, int depth) {
         (void)name; (void)depth;
     }

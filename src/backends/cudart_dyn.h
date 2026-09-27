@@ -27,6 +27,8 @@ struct Cudart {
     int (*StreamCreateWithFlags)(void**, unsigned int) = nullptr;
     int (*StreamDestroy)(void*) = nullptr;
     int (*MemcpyAsync)(void*, const void*, size_t, int, void*) = nullptr;
+    int (*Memset)(void*, int, size_t) = nullptr;
+    int (*MemsetAsync)(void*, int, size_t, void*) = nullptr;
     int (*SetDeviceFlags)(unsigned int) = nullptr;
     int (*GetDeviceFlags)(unsigned int*) = nullptr;
     int (*StreamSynchronize)(void*) = nullptr;
@@ -74,6 +76,8 @@ struct Cudart {
         StreamCreateWithFlags = (int (*)(void**, unsigned int))g("cudaStreamCreateWithFlags");
         StreamDestroy = (int (*)(void*))g("cudaStreamDestroy");
         MemcpyAsync = (int (*)(void*, const void*, size_t, int, void*))g("cudaMemcpyAsync");
+        Memset = (int (*)(void*, int, size_t))g("cudaMemset");
+        MemsetAsync = (int (*)(void*, int, size_t, void*))g("cudaMemsetAsync");
         SetDeviceFlags = (int (*)(unsigned int))g("cudaSetDeviceFlags");
         GetDeviceFlags = (int (*)(unsigned int*))g("cudaGetDeviceFlags");
         StreamSynchronize = (int (*)(void*))g("cudaStreamSynchronize");
@@ -118,7 +122,8 @@ struct Cudart {
         auto g = [&](const char* n) { return (void*)GetProcAddress(h, n); };
         Bind(g);
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
-            || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
+            || !StreamCreate || !StreamDestroy || !MemcpyAsync
+            || !Memset || !MemsetAsync) {
             std::fprintf(stderr, "[cudart] 缺导出符号\n");
             return false;
         }
@@ -144,7 +149,8 @@ struct Cudart {
         auto g = [&](const char* n) { return (void*)dlsym(h, n); };
         Bind(g);
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
-            || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
+            || !StreamCreate || !StreamDestroy || !MemcpyAsync
+            || !Memset || !MemsetAsync) {
             std::fprintf(stderr, "[cudart] 缺导出符号\n");
             return false;
         }

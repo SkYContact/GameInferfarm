@@ -396,8 +396,8 @@ struct OrtIn {
     void* host = nullptr;   // pinned carve（dml=普通页 carve，语义同）
     void* dev = nullptr;    // device carve（dml=host 同址，仅 CUDA 路径用）
     OrtValue* val = nullptr;
-    // ---- 声明式增量 H2D（判决25，append 面专属；append 旗标在 meta.append
-    //      ——单一事实源，spec 与运行时同字段，无双写漂移）----
+    // ---- 声明式增量 H2D（判决25 及其 headlive 扩展；旗标在 meta.append /
+    //      meta.headlive——单一事实源，spec 与运行时同字段，无双写漂移）----
     int stride = 0;          // 一个深度单位的字节数 = row_bytes/dims[1]（nd<2 面不可 append）
     int max_depth = 0;       // 深度上限 = dims[1]
     std::vector<int> synced;     // 每行已同步深度（影子=设备的忠实镜像）；kFullSync=整行
@@ -648,7 +648,7 @@ public:
         if (s->any_append && !s->dml) {
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
             for (auto& i : s->ins)
-                if (i.meta.append)
+                if (i.meta.append || i.meta.headlive)
                     g_cu.Memcpy(i.dev, i.shadow,
                                 i.meta.row_bytes * (size_t)s->slots, 1);
         }
@@ -870,7 +870,7 @@ public:
                 for (size_t i = 0; i < s->ins.size() && ok; i++) {
                     OrtIn& in = s->ins[i];
                     if (in.meta.population) continue;
-                    if (!in.meta.append) {
+                    if (!in.meta.append && !in.meta.headlive) {
                         emit(in.dev, in.host,
                              (size_t)n_rows * in.meta.row_bytes);
                         continue;
@@ -880,6 +880,53 @@ public:
                     char* hb = (char*)in.host;
                     char* db = (char*)in.dev;
                     char* sb = (char*)in.shadow;
+                    if (in.meta.headlive) {
+                        // ---- headlive 面（判决25 扩展）：[0,depth) 本批新鲜
+                        // 内容（可任意变化——逆序移位），[depth,slots) 宿主恒
+                        // 零。每批全量传 [0,d)；缩深=换局信号，设备 [d,旧深)
+                        // 补 memset（device-local 零 PCIe；与上传同流序，段
+                        // 区不相交故与批聚合无序约束）；影子恒=[0,d)宿主+
+                        // 零尾——哨兵 memcmp 全 face 照抓漂移（含宿主尾槽
+                        // 非零=承诺违约）。
+                        for (int r = 0; r < n_rows && ok; r++) {
+                            const int d = in.declared[(size_t)r];
+                            in.declared[(size_t)r] = -1;
+                            const int so = in.synced[(size_t)r];
+                            if (d < 0 || d >= in.max_depth) {
+                                emit(db + (size_t)r * rb, hb + (size_t)r * rb, rb);
+                                if (ok)
+                                    std::memcpy(sb + (size_t)r * rb,
+                                                hb + (size_t)r * rb, rb);
+                                in.synced[(size_t)r] = OrtIn::kFullSync;
+                                continue;
+                            }
+                            const size_t head = (size_t)d * st;
+                            const int so_eff =
+                                (so >= 0 && so <= in.max_depth) ? so : in.max_depth;
+                            if (d < so_eff) {
+                                char* dz = db + (size_t)r * rb + head;
+                                size_t zb = (size_t)(so_eff - d) * st;
+                                if (s->fence_stream) {
+                                    if (g_cu.MemsetAsync(dz, 0, zb,
+                                                         s->fence_stream))
+                                        ok = false;
+                                } else if (g_cu.Memset(dz, 0, zb)) {
+                                    ok = false;
+                                }
+                            }
+                            if (d > 0)
+                                emit(db + (size_t)r * rb, hb + (size_t)r * rb,
+                                     head);
+                            if (ok) {
+                                std::memcpy(sb + (size_t)r * rb, hb + (size_t)r * rb,
+                                            head);
+                                std::memset(sb + (size_t)r * rb + head, 0,
+                                            rb - head);
+                            }
+                            in.synced[(size_t)r] = d;
+                        }
+                        continue;
+                    }
                     for (int r = 0; r < n_rows && ok; r++) {
                         const int d = in.declared[(size_t)r];
                         in.declared[(size_t)r] = -1;   // 消费即复位（陈旧声明防线）
@@ -951,7 +998,7 @@ public:
                 if (s->delta_dbg)
                     for (size_t i = 0; i < s->ins.size(); i++) {
                         OrtIn& in = s->ins[i];
-                        if (!in.meta.append) continue;
+                        if (!(in.meta.append || in.meta.headlive)) continue;
                         if (std::memcmp(in.shadow, in.host,
                                         in.meta.row_bytes
                                             * (size_t)s->slots) != 0) {
@@ -1116,7 +1163,7 @@ public:
         OrtSess* s = (OrtSess*)session;
         if (!s || !s->any_append || !name || slot < 0 || slot >= s->slots) return;
         for (auto& i : s->ins)
-            if (i.meta.append && i.meta.name == name) {
+            if ((i.meta.append || i.meta.headlive) && i.meta.name == name) {
                 if (depth >= 0 && depth <= i.max_depth)
                     i.declared[(size_t)slot] = depth;
                 return;
@@ -1128,7 +1175,7 @@ public:
         OrtSess* s = (OrtSess*)session;
         if (!s || !s->any_append || slot < 0 || slot >= s->slots) return;
         for (auto& i : s->ins)
-            if (i.meta.append) i.declared[(size_t)slot] = -1;
+            if (i.meta.append || i.meta.headlive) i.declared[(size_t)slot] = -1;
     }
 
 private:
@@ -1653,19 +1700,29 @@ private:
             // population 面与 <2 维面深度无定义=忽略点名（静默回落 full）；
             // FARM_H2D_DELTA=0 杀手锏=全部忽略（零行为差回退）。
             if (!dml && !s->ins[i].meta.population && DeltaEnvOn()
-                && !cfg.append_inputs.empty()
+                && (!cfg.append_inputs.empty() || !cfg.headlive_inputs.empty())
                 && s->ins[i].meta.dims.size() >= 2
                 && s->ins[i].meta.dims[1] > 0) {
-                for (const auto& an : cfg.append_inputs) {
-                    if (an != s->ins[i].meta.name) continue;
-                    OrtIn& oi = s->ins[i];
-                    oi.meta.append = true;
+                OrtIn& oi = s->ins[i];
+                bool in_append = false, in_headlive = false;
+                for (const auto& an : cfg.append_inputs)
+                    if (an == oi.meta.name) { in_append = true; break; }
+                for (const auto& hn : cfg.headlive_inputs)
+                    if (hn == oi.meta.name) { in_headlive = true; break; }
+                if (in_append && in_headlive) {
+                    std::fprintf(stderr, "[ort] 面 %s 同时声明 append+headlive"
+                                 "（互斥）——拒绝启动\n", oi.meta.name.c_str());
+                    DestroySession(s);
+                    return nullptr;
+                }
+                if (in_append || in_headlive) {
+                    oi.meta.append = in_append;
+                    oi.meta.headlive = in_headlive;
                     oi.max_depth = (int)oi.meta.dims[1];
                     oi.stride = (int)(oi.meta.row_bytes / (size_t)oi.meta.dims[1]);
                     oi.synced.assign((size_t)slots, 0);
                     oi.declared.assign((size_t)slots, -1);
-                    s->any_append = true;
-                    break;
+                    s->any_append = true;   // any delta 面（append|headlive）
                 }
             }
             if (spec_out) {
@@ -1796,7 +1853,7 @@ private:
             s->delta_dbg = DeltaDebugEnv();
             size_t tot = 0;
             for (size_t i = 0; i < n_in; i++)
-                if (s->ins[i].meta.append)
+                if (s->ins[i].meta.append || s->ins[i].meta.headlive)
                     tot = (tot + s->ins[i].meta.row_bytes * (size_t)slots
                            + kAlign - 1) / kAlign * kAlign;
 #ifdef _WIN32
@@ -1813,7 +1870,7 @@ private:
             }
             size_t soff = 0;
             for (size_t i = 0; i < n_in; i++) {
-                if (!s->ins[i].meta.append) continue;
+                if (!(s->ins[i].meta.append || s->ins[i].meta.headlive)) continue;
                 soff = (soff + kAlign - 1) / kAlign * kAlign;
                 s->ins[i].shadow = (char*)s->shadow_blk + soff;
                 soff += s->ins[i].meta.row_bytes * (size_t)slots;
@@ -1823,7 +1880,7 @@ private:
             // ProbeGraph 图案污染在彼处末尾重零）。
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
             for (size_t i = 0; i < n_in; i++) {
-                if (!s->ins[i].meta.append) continue;
+                if (!(s->ins[i].meta.append || s->ins[i].meta.headlive)) continue;
                 if (g_cu.Memcpy(s->ins[i].dev, s->ins[i].shadow,
                                 s->ins[i].meta.row_bytes * (size_t)slots, 1)) {
                     std::fprintf(stderr, "[ort] 增量面 zero 基 memcpy 失败\n");
@@ -1835,16 +1892,18 @@ private:
             if (s->h2d_batch) {
                 size_t cap = s->ins.size() + 4;
                 for (size_t i = 0; i < n_in; i++)
-                    if (s->ins[i].meta.append) cap += (size_t)slots;
+                    if (s->ins[i].meta.append || s->ins[i].meta.headlive)
+                        cap += (size_t)slots;
                 s->hb_dst.resize(cap);
                 s->hb_src.resize(cap);
                 s->hb_sizes.resize(cap);
                 s->hb_attridx.resize(cap);
             }
-            std::fprintf(stderr, "[ort] 声明式增量 H2D：%zu 个 append 面"
+            std::fprintf(stderr, "[ort] 声明式增量 H2D：%zu 个 append/headlive 面"
                          "（影子 %zuB，stride/depth 见面表%s）\n",
                          [&] { size_t k = 0;
-                               for (auto& i : s->ins) if (i.meta.append) k++;
+                               for (auto& i : s->ins)
+                                   if (i.meta.append || i.meta.headlive) k++;
                                return k; }(),
                          tot, s->delta_dbg ? "；哨兵=开" : "");
             std::fflush(stderr);

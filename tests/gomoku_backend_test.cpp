@@ -24,6 +24,9 @@
 //      包装适配器（own 面深度前缀模式+FaceDepth 申报）append 腿 == 强制
 //      full 腿逐位同（增量漏传必指纹红=哨兵语义验收）+ 复跑 + inline 同
 //      （工件缺席=SKIP）
+//   R8c headlive 头部活跃面（判决25 扩展，2026-09-27）：newest-first 面
+//      [0,depth) 每批可变/尾槽恒零——同深度内容全换（逆序移位，append 做不到）、
+//      缩深 memset 重铸、未声明兜底、宿主尾槽非零哨兵必报
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
@@ -558,6 +561,134 @@ int main(int argc, char** argv) {
             if (sf) be8->DestroySession(sf);
         }
         delete be8;
+
+        // ---- R8c：headlive 头部活跃面（判决25 扩展，2026-09-27）----
+        // newest-first 面：[0,depth) 每批可任意变化（逆序移位——append 做不到
+        // 的语义），[depth,slots) 宿主恒零。与 full 对照会话同写同报逐位；
+        // 缩深=设备 memset 零基重铸；哨兵抓宿主尾槽非零（承诺违约）。
+        {
+            InferBackend* bec = CreateOrtBackend();
+            ModelConfig m8h;
+            m8h.backend = "ort";
+            m8h.model_path = kOnnx;
+            m8h.headlive_inputs.push_back("own");
+            ModelConfig m8c = m8h;
+            m8c.headlive_inputs.clear();   // 强制 full 对照
+            ModelSpec sph, spc;
+            bool r8c_ok = bec && bec->LoadSpec(m8h, 8, sph)
+                && bec->LoadSpec(m8c, 8, spc);
+            bool own_hl = false;
+            for (auto& i : sph.ins)
+                if (i.name == "own" && i.headlive && !i.append) own_hl = true;
+            CHECK(r8c_ok && own_hl,
+                  "R8c headlive 面进 spec（headlive_inputs→InputMeta）");
+            void* sh = r8c_ok ? bec->CreateSession(m8h, sph, true) : nullptr;
+            void* sc = r8c_ok ? bec->CreateSession(m8c, spc, true) : nullptr;
+            bool warmc = sh && sc && bec->Warmup(sh) && bec->Warmup(sc);
+            CHECK(warmc, "R8c headlive/full 双会话建+热身");
+            if (warmc) {
+                const int D = 225;
+                auto fill_live = [&](void* sess, int slot, int depth,
+                                     uint32_t seed) {
+                    size_t rb = 0;
+                    float* own = (float*)bec->InputRow(sess, "own", slot, &rb);
+                    if (!own) return;
+                    for (int k = 0; k < D; k++) {
+                        uint32_t x = seed * (uint32_t)(k + 1);
+                        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                        own[k] = k < depth
+                            ? (float)((int)(x & 0xFFFF) - 32768) / 32768.0f
+                            : 0.0f;
+                    }
+                };
+                auto fill_board2 = [&](void* sess, int slot, uint32_t seed) {
+                    size_t rb = 0;
+                    float* opp = (float*)bec->InputRow(sess, "opp", slot, &rb);
+                    if (!opp) return;
+                    uint32_t x = seed;
+                    for (size_t k = 0; k < rb / sizeof(float); k++) {
+                        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                        opp[k] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                    }
+                };
+                auto snapc = [&](void* sess, int slot) {
+                    std::vector<float> v;
+                    for (size_t i = 0; i < sph.outs.size(); i++) {
+                        int w = bec->OutputWidth(sess, sph.outs[i].name.c_str());
+                        const float* p = w > 0
+                            ? bec->OutputRow(sess, sph.outs[i].name.c_str(), slot)
+                            : nullptr;
+                        if (p) v.insert(v.end(), p, p + w);
+                    }
+                    return v;
+                };
+                auto roundc = [&](int n, const std::vector<int>& depths,
+                                  uint32_t seed, const char* tag) {
+                    for (int r = 0; r < n; r++) {
+                        int d = depths[(size_t)r];
+                        fill_live(sh, r, d, seed + (uint32_t)r * 7u);
+                        fill_live(sc, r, d, seed + (uint32_t)r * 7u);
+                        fill_board2(sh, r, seed + (uint32_t)r);
+                        fill_board2(sc, r, seed + (uint32_t)r);
+                        if (d >= 0) bec->NoteFaceDepth(sh, "own", r, d);
+                    }
+                    unsigned q1 = 0, q2 = 0;
+                    bool ok = bec->SubmitBatch(sh, n, q1)
+                        && bec->SubmitBatch(sc, n, q2);
+                    while (ok && !bec->CompletionReached(sh, q1)) {}
+                    while (ok && !bec->CompletionReached(sc, q2)) {}
+                    bec->CompletionFence();
+                    bool same = ok;
+                    for (int r = 0; r < n && same; r++)
+                        same = snapc(sh, r) == snapc(sc, r);
+                    CHECK(same, tag);
+                    return same;
+                };
+                bool r8c = true;
+                r8c = roundc(5, {4, 4, 4, 4, 4}, 1000u,
+                             "R8c-1 同深度内容全换（newest-first 移位）逐位同") && r8c;
+                r8c = roundc(5, {4, 4, 4, 4, 4}, 2000u,
+                             "R8c-2 同深度再换批（内容漂移持续）逐位同") && r8c;
+                r8c = roundc(6, {12, 8, 3, 9, 1, 6}, 3000u,
+                             "R8c-3 缩深/增长混合（换局 memset 重铸）逐位同") && r8c;
+                r8c = roundc(4, {5, -1, 2, 7}, 4000u,
+                             "R8c-4 未声明行整行兜底逐位同") && r8c;
+                long long vio0c = OrtDeltaDebugViolations();
+                TestSetEnv("FARM_H2D_DELTA_DEBUG", "1");
+                void* svh = bec->CreateSession(m8h, sph, true);
+                bool wvh = svh && bec->Warmup(svh);
+                TestSetEnv("FARM_H2D_DELTA_DEBUG", "0");
+                CHECK(wvh, "R8c-V debug 哨兵会话建+热身");
+                if (wvh) {
+                    fill_live(svh, 0, 3, 5000u);
+                    fill_board2(svh, 0, 5001u);
+                    bec->NoteFaceDepth(svh, "own", 0, 3);
+                    unsigned q = 0;
+                    bool ok1 = bec->SubmitBatch(svh, 1, q);
+                    while (ok1 && !bec->CompletionReached(svh, q)) {}
+                    bec->CompletionFence();
+                    // 违约：宿主尾槽 [3,225) 写非零再申报同深——设备/影子尾
+                    // 恒零 vs 宿主≠零 → memcmp 必报（headlive 承诺的执法面）
+                    size_t rb = 0;
+                    float* own = (float*)bec->InputRow(svh, "own", 0, &rb);
+                    own[100] = 0.5f;
+                    bec->NoteFaceDepth(svh, "own", 0, 3);
+                    bool ok2 = bec->SubmitBatch(svh, 1, q);
+                    while (ok2 && !bec->CompletionReached(svh, q)) {}
+                    bec->CompletionFence();
+                    CHECK(OrtDeltaDebugViolations() > vio0c,
+                          "R8c-V 宿主尾槽非零哨兵必报（承诺违约）");
+                    bec->DestroySession(svh);
+                }
+                (void)r8c;
+                bec->DestroySession(sh);
+                bec->DestroySession(sc);
+            } else {
+                if (sh) bec->DestroySession(sh);
+                if (sc) bec->DestroySession(sc);
+            }
+            delete bec;
+        }
 
         // ---- R8b：farm 级（append 声明腿 == 强制 full 腿，指纹逐位）----
         struct AppendGomokuAdapter : gomoku::GomokuAdapter {

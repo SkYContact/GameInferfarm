@@ -1079,10 +1079,11 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 b.in_idx.push_back({I.spec.ins[ii].name.c_str(), ii});
             }
         }
-        // 声明式增量 H2D（判决25）：append 面存在性门（spec 此刻已终态——组 0
-        // 延迟收割也已完成）。无 append 面=Claim 清声明分支零占用。
+        // 声明式增量 H2D（判决25）：delta 面（append|headlive）存在性门
+        //（spec 此刻已终态——组 0 延迟收割也已完成）。无 delta 面=Claim 清
+        // 声明分支零占用。
         for (auto& m : I.spec.ins)
-            if (m.append) { I.any_append = true; break; }
+            if (m.append || m.headlive) { I.any_append = true; break; }
         // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
         // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）
         for (int i = 0; ok && i < built; i++) {

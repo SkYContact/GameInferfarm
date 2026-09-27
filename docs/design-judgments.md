@@ -812,3 +812,30 @@ ORT-CUDA+TRT 推理=不支持的形状（按后端分进程，与 Windows 生产
 （mkdir 原子+时限可夺+60s 宽限），吞吐数字仅"锁内测得"可引用——判决 26
 的数字系协议立前所测（当时卡上无并发进程、风险理论性），入表读数以锁内
 复验为准。
+
+## 25 续：headlive 头部活跃面（判决 25 扩展，2026-09-27，用户拍板）
+
+掼蛋 v3.1 适配器接线判决 25 时挂起：chain[256]×I32/chattr[256×6]×F32 是
+newest=index0 逆序面，不是 append-only 前缀增长——每手新决策整体移位，
+[synced,depth) 增量契约不成立（notes/adapter_h2d_handoff.md）。用户拍板
+第三选项：**逆序面保留、尾槽不传**——`headlive_inputs` 声明（与
+append_inputs 同面互斥，枚举期拒绝双声明）。
+
+**契约**：行内 [0,depth)=本批新鲜内容（每批可任意变化），[depth,slots)=
+宿主恒零（zero 基组装天然满足）。后端每批传 [0,depth)；缩深=设备侧
+cudaMemset(Async) 零基重铸（零 PCIe，与上传同流序、段区不相交故无序约束）；
+影子恒=[0,d)宿主+零尾——哨兵 memcmp 全 face 照抓漂移，宿主尾槽非零=
+承诺违约必报（R8c-V 执法面）。depth 语义/单位/FaceDepth 调用与 append
+完全一致，复用 declared/synced/shadow 全套机器。
+
+**门（R8c，ort 面 ALL PASS）**：面进 spec（headlive_inputs→InputMeta，
+headlive=true/append=false）；同深度内容全换（newest-first 移位，append
+无法覆盖的语义）×2 轮逐位同；缩深/增长混合（换局 memset 重铸）逐位同；
+未声明行整行兜底逐位同；R8c-V 宿主尾槽非零哨兵必报。
+
+**掼蛋接线（预计半小时）**：①ModelConfig `headlive_inputs={"chain","chattr"}`
+（或面名以适配器实际为准）+env FARM_H2D_BATCH=1 FARM_H2D_ASYNC=1；
+②适配器 AssembleRows 写完后对每申报行 `slot.FaceDepth(面名,
+min(动作数,256))`（行尾恒零已由现有 memset+重写满足）；③验收：先
+FARM_H2D_DELTA_DEBUG=1 哨兵零违约，再压吞吐；A/B=同命令
+FARM_H2D_DELTA=0；默认不开声明时指纹必须仍是基线（零行为差）。
