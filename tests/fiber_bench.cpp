@@ -11,9 +11,13 @@
 //
 // 每决策成本 = 挂起次数 × (A + B + C) + D/每局决策数。
 // 本基准不建模 bank 协议（那是 census 真负载的活）——只给原语单价。
-// Windows-only（WinFiber 原语直测=本基准的目的；非 Windows 构建面留位
-// 编译过，打印一句指路——A2 档 fcontext 原语在 POSIX 面可经 farm_test
-// 全门行为验证，单价微基准未移植，降级点注明 2026-09-27）。
+// 构建面（2026-09-27 移植批升级，此前 POSIX="留位指路"降级点拆除）：
+//   Windows：A/B/B2/D=WinFiber 原语直测 + A2/D2=fcontext(MASM64) 对照；
+//   Linux x64（SysV 切换体所在面）：A2/D2=fcontext(SysV) 单价实测——
+//   SysV vs WinFiber 原语差自此有同 harness 可比数字（跨机器只比量级与
+//   倍率，同机同 harness 才可比绝对数——测量纪律）。
+//   B/B2（Post→pickup/队列本体）测的是 fiber_pool 唤醒机器，与切换后端
+//   无关，farm_test 行为门已覆盖——POSIX 面留位不测（无对象，非降级）。
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -23,6 +27,12 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+// fcontext 切换体所在构建面（Windows=MASM64 src/fcontext.asm；Linux x64=
+// SysV src/fcontext_sysv.S）：A2/D2 原语门在这两面上开测
+#if defined(_MSC_VER) || (defined(__linux__) && defined(__x86_64__))
+#define FI_FC_BENCH 1
+#endif
 
 #ifdef _WIN32
 
@@ -35,8 +45,22 @@ static double NowNs() {
     return (double)c.QuadPart * g_inv_freq_ns;
 }
 
-static unsigned volatile g_sink = 0;
+#elif defined(__linux__) && defined(__x86_64__)
 
+#include <chrono>
+#include <cstdlib>
+
+// steady_clock（glibc=clock_gettime(MONOTONIC)）：ns 读数，微基准够用
+static double NowNs() {
+    return std::chrono::duration<double, std::nano>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#endif
+
+static unsigned volatile g_sink = 0;   // 防 DCE 汇（A/C 与 A2 共用）
+
+#ifdef _WIN32
 // ---------------- A/C. SwitchToFiber 往返（可选双侧工作集互踩） ----------------
 struct PingPongCtx {
     void* peer = nullptr;
@@ -191,9 +215,28 @@ static void BenchPostOpOnly(int rounds) {
                 (t1 - t0) / rounds);
 }
 
+#endif // _WIN32（WinFiber 原语面到此；fcontext 原语门两平台独立开测）
+
 // ---------------- A2. fcontext 切换原语（同 harness 对照，原语门） ----------------
-#if defined(_MSC_VER)
+#ifdef FI_FC_BENCH
 #include "../src/fcontext.h"
+
+// 工作集/栈内存：Windows=VirtualAlloc reserve+commit；POSIX=posix_memalign(64)
+// 全量一次（与后端 FreeStack 同纪律）——D2 数字两侧含义差一阶（按需 commit
+// vs 全量分配），比账时注意。
+#ifdef _WIN32
+static void* FcAlloc(size_t sz) {
+    return VirtualAlloc(nullptr, sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+static void FcFree(void* p) { VirtualFree(p, 0, MEM_RELEASE); }
+#else
+static void* FcAlloc(size_t sz) {
+    void* p = nullptr;
+    if (posix_memalign(&p, 64, sz) != 0) return nullptr;
+    return p;
+}
+static void FcFree(void* p) { free(p); }
+#endif
 
 struct FcPing {
     inferfarm::fc::Ctx* peer = nullptr;   // 对端 ctx
@@ -223,18 +266,15 @@ static void BenchSwitchFC(int touch_bytes, int rounds) {
     peer_arg.touch_bytes = touch_bytes;
     main_side.touch_bytes = touch_bytes;
     if (touch_bytes) {
-        peer_arg.buf = (unsigned char*)VirtualAlloc(nullptr, (SIZE_T)touch_bytes,
-                                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        main_side.buf = (unsigned char*)VirtualAlloc(nullptr, (SIZE_T)touch_bytes,
-                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        peer_arg.buf = (unsigned char*)FcAlloc((size_t)touch_bytes);
+        main_side.buf = (unsigned char*)FcAlloc((size_t)touch_bytes);
         for (int i = 0; i < touch_bytes; i += 4096) {
             peer_arg.buf[i] = (unsigned char)i;
             main_side.buf[i] = (unsigned char)(i ^ 1);
         }
     }
     const size_t stack_sz = 1024 * 1024;
-    void* base = VirtualAlloc(nullptr, stack_sz, MEM_RESERVE | MEM_COMMIT,
-                              PAGE_READWRITE);
+    void* base = FcAlloc(stack_sz);
     char* raw_top = (char*)base + stack_sz;
     void* top = (void*)((((uintptr_t)raw_top - 8) & ~(uintptr_t)15) + 8);
     inferfarm::fc::fi_make(&g_fc_peer_own, top, FcPeerMain, &peer_arg);
@@ -251,9 +291,9 @@ static void BenchSwitchFC(int touch_bytes, int rounds) {
         FcTouchSum(&main_side);
     }
     const double t1 = NowNs();
-    VirtualFree(base, 0, MEM_RELEASE);
-    if (peer_arg.buf) VirtualFree(peer_arg.buf, 0, MEM_RELEASE);
-    if (main_side.buf) VirtualFree(main_side.buf, 0, MEM_RELEASE);
+    FcFree(base);
+    if (peer_arg.buf) FcFree(peer_arg.buf);
+    if (main_side.buf) FcFree(main_side.buf);
     const double per_rt = (t1 - t0) / rounds;
     std::printf("[A2] fcontext 往返（2 次切换%s）touch=%4dKB: %8.1f ns/往返 = %6.1f ns/切换\n",
                 touch_bytes ? "，双侧首触" : "", touch_bytes / 1024, per_rt, per_rt / 2);
@@ -263,22 +303,22 @@ static void BenchCreateDeleteFC(int rounds) {
     const size_t stack_sz = 1024 * 1024;
     const double t0 = NowNs();
     for (int i = 0; i < rounds; i++) {
-        void* base = VirtualAlloc(nullptr, stack_sz, MEM_RESERVE | MEM_COMMIT,
-                                  PAGE_READWRITE);
+        void* base = FcAlloc(stack_sz);
         char* raw_top = (char*)base + stack_sz;
         void* top = (void*)((((uintptr_t)raw_top - 8) & ~(uintptr_t)15) + 8);
         inferfarm::fc::Ctx* c = new inferfarm::fc::Ctx{};
         inferfarm::fc::fi_make(c, top, FcPeerMain, nullptr);
         g_sink += (unsigned)(uintptr_t)c;
         delete c;
-        VirtualFree(base, 0, MEM_RELEASE);
+        FcFree(base);
     }
     const double t1 = NowNs();
-    std::printf("[D2] VirtualAlloc(1MB)+ctx+fi_make+Free: %8.0f ns/对\n",
+    std::printf("[D2] 栈分配(1MB)+ctx+fi_make+回收: %8.0f ns/对\n",
                 (t1 - t0) / rounds);
 }
-#endif // _MSC_VER
+#endif // FI_FC_BENCH
 
+#ifdef _WIN32
 // ---------------- D. CreateFiberEx/DeleteFiber 单价 ----------------
 static void WINAPI NullFiberMain(void*) {}   // 永不入内（只测建/删单价）
 
@@ -308,7 +348,7 @@ int main() {
     BenchSwitch(16 * 1024, 100000);
     BenchSwitch(64 * 1024, 100000);
     BenchSwitch(256 * 1024, 50000);
-#if defined(_MSC_VER)
+#ifdef FI_FC_BENCH
     BenchSwitchFC(0, 100000);
     BenchSwitchFC(64 * 1024, 100000);
     BenchCreateDeleteFC(20000);
@@ -318,9 +358,16 @@ int main() {
     BenchPostOpOnly(200000);
     BenchCreateDelete(20000);
     std::printf("== 完 ==\n");
+#elif defined(FI_FC_BENCH)
+    std::printf("== fiber_bench：fcontext(SysV) 原语单价账（Linux x64 面；"
+                "B/D=WinFiber 专属不适用）==\n");
+    BenchSwitchFC(0, 100000);
+    BenchSwitchFC(64 * 1024, 100000);
+    BenchCreateDeleteFC(20000);
+    std::printf("== 完 ==\n");
 #else
-    std::printf("== fiber_bench：Windows-only 微基准（WinFiber/切换体单价账）；"
-                "非 Windows 面不适用，留位=编译过 ==\n");
+    std::printf("== fiber_bench：本构建面无可测切换原语（WinFiber=Windows 专属；"
+                "fcontext 切换体=Windows x64/Linux x64 ELF）==\n");
 #endif
     return 0;
 }
