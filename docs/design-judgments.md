@@ -612,3 +612,14 @@ FARM_STAGGER_MS=0 FARM_BANK_SPIN=1，交替 10 腿）**：winfiber 中位
 **坑律**（pitfalls 同步入档）：ctx 不驻栈；冷机微基准数字是伪高
 （WinFiber 切换 62ns 冷态 vs 23.3ns 暖态、建删 17.8µs 冷态 vs ~4µs
 暖态——绝对数必须报暖态稳态）。
+
+**后续交付（2026-09-27 同日，POSIX 路线兑现）**：判决书预告的"SysV ABI
+同构可移植"落地——src/fcontext_sysv.S（SysV AMD64 切换体，64B ctx 零 FP
+保存面；参考 Boost.Context，attribution 在源文件头）+ fiber_pool 去
+Windows-only（platform_compat.h 垫片：tid/睡眠/调用约定）+ ort 后端 dlopen
+装载面（fence 信号量=无名 sem_t；DML EP 配置级拒绝）+ CI ubuntu job
+（windows+linux × {C++17,C++20} 四象限，Linux 跑 farm_test cpu 全门——
+非 Windows 可编译可运行的常驻证据）。Windows 四象限本机复验 70 ok 门
+逐条同（零行为差红线）；SysV 语义差（切回后 XMM/MXCSR=对端遗留，不可信
+也无需可信——与 WinFiber FLOAT_SWITCH 宽度差）入 pitfalls 与 fcontext.h
+头注释。

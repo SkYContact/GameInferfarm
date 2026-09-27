@@ -130,17 +130,25 @@ FiberCurrent/FiberSuspend/FiberPost 签名与契约不动）下，纯 C++20 无�
 ## 四、实现边界（如实声明）
 
 - fcontext 后端与 WinFiber 的语义差：
-  - 栈=VirtualAlloc 全量 commit（FARM_FC_STACK_KB，缺省 1024KB），
-    无 guard-page 自动生长——内存足迹 256 局 × 1MB commit 面大于
-    WinFiber 的按需提交；
+  - 栈=全量 commit（FARM_FC_STACK_KB，缺省 1024KB），无 guard-page 自动
+    生长——内存足迹 256 局 × 1MB commit 面大于 WinFiber 的按需提交；
+    Windows=VirtualAlloc reserve+commit，POSIX=posix_memalign 全量（降级点
+    已注记，2026-09-27 Linux 移植）；
   - TEB StackBase/Limit 不随切换更新（WinFiber 会）：**异常/SEH 穿越
     切换点=未定义**（两后端同罪——产线契约本就无 throw 面）；
     栈溢出无硬件兜底（全 commit 下越界=相邻页踩踏）；
-  - 切换保存面=ABI 最小集（GP 非易变+XMM6-15+MXCSR/FCW），比
-    FIBER_FLAG_FLOAT_SWITCH（全 FP）窄且**正确**（C++ 代码按 ABI 编译，
-    易变寄存器跨 call 由编译器自存）。
+  - 切换保存面=ABI 最小集且**正确**：Windows=GP 非易变+XMM6-15+
+    MXCSR/FCW（MSVC ABI xmm6-15 非易变，比 FIBER_FLAG_FLOAT_SWITCH 全 FP
+    窄）；SysV AMD64（Linux）=GP 非易变 6+rip+rsp 共 64B，**零 FP 面**
+    （SysV 全 XMM/MXCSR caller-saved——切出切回后 XMM 内容不可信也无需
+    可信，ABI 义务；语义差注记见 src/fcontext.h SysV 档头注释）。
 - 深栈限制覆盖面：本实现是**全量替换切换原语**，无"部分挂起点"问题
   （选的是有栈路线；无栈路线的覆盖面问题见定理，已判死）。
+- **POSIX 面已落地（2026-09-27，本设计 (c) 的"可移植性载体"兑现）**：
+  src/fcontext_sysv.S（GNU as，SysV AMD64，参考 Boost.Context
+  jump/make_x86_64_sysv_elf_gas.S，BSD 风格许可 attribution 在源文件头）+
+  fiber_pool 去 Windows-only + ort dlopen 面 + CI ubuntu job（双标准档跑
+  farm_test cpu 门）。验收协议第五节由 CI 常驻执行。
 
 ## 五、验收协议
 

@@ -159,3 +159,30 @@
   数只配进漂移带注记，勿入正账。
 - **共享 GPU 时段跨窗口数字不可比**：同命令吞吐差 4×（他会话占卡）——
   A/B 只在同窗口交替腿内比（判决 12/24 两次踩实）。
+
+## SysV AMD64 移植批（2026-09-27，fcontext Linux 面）
+- **SysV 上切回后 XMM/MXCSR 不可信（与 WinFiber FLOAT_SWITCH 语义差）**：
+  SysV AMD64 ABI 把**全部 XMM 与 MXCSR/FCW 定为 caller-saved**——fcontext
+  的 SysV 切换体（src/fcontext_sysv.S）零 FP 保存面是按 ABI 正确，不是偷工：
+  GCC/Clang 编译的 C++ 本就不跨 call 持 XMM 态。但含义必须写明：协程切出
+  再切回后，XMM 内容=对端遗留值，不可信也无需可信。Windows 面语义相反
+  （xmm6-15 非易变，MASM64 切换体显式保存）——**同一份框架代码在两平台
+  的"切换保存 FP 态"承诺宽度不同**，移植依赖 FP 控制寄存器的自定义例程
+  （FTZ/DAZ、x87 精度）时逐侧核对。
+- **.S 汇编的 CMake ASM 编译器要钉到 C 编译器**：`.S`（大写）需要预处理
+  （本仓有 `__CET__` 门），CMake `enable_language(ASM)` 在 Unix 缺省可能
+  选中裸 `as`——预处理行被当注释吞掉，`FI_CET_ENDBR` 宏展开失败当场报
+  错（未静默腐坏，但第一现场难读）。configure 前置
+  `set(CMAKE_ASM_COMPILER "${CMAKE_C_COMPILER}")`（gcc/clang 驱动对 .S 先
+  跑 cpp）。
+- **间接跳目标必须 ENDBR64（CET/IBT）**：Ubuntu 的 GCC 缺省 `-fcf-protection`
+  编译面，fi_swap 用 `jmp *%rax` 切进冷 ctx 的 trampoline=间接跳目标——
+  无 ENDBR64 在 IBT 实启的机器上=#CP 故障。手法同 Boost.Context：
+  `#ifdef __CET__ #include <cet.h>` 取 `_CET_ENDBR`，非 CET 面空宏。
+- **缺少 `.note.GNU-stack` 段=可执行栈**：binutils ≥2.41 对缺段的 .o 告警
+  并给产物打可执行栈标记——汇编文件尾部补
+  `.section .note.GNU-stack,"",@progbits`。
+- **非 Windows 的后端选择必须双向回退**：Linux 面 winfiber 工厂返回
+  nullptr——选择层若只做"fcontext 失败回 winfiber"单向回退，C++17 缺省档
+  （want=winfiber）在 Linux 直接 nullptr 出门=首次 Switch 解引用即炸。
+  回退必须双向（fiber_backend.cpp），且每路回退留 stderr 注记。

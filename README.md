@@ -185,6 +185,30 @@ AMD 卡走 `ep=dml`（DirectML，宿主绑定+同步 Run；需 onnxruntime-direc
 capi 目录——与 CUDA 构建同名冲突由框架自动改名共存）。TRT `device_id>0`
 守卫已就位（单卡机未测，双同构卡即用）。
 
+## 平台支持
+
+| 面 | Windows x64 | Linux x64（Ubuntu 档） |
+|---|---|---|
+| fiber 后端 | `winfiber`（现役，Windows Fibers 1:1）与 `fcontext`（自写 MASM64 切换体）双后端，`FARM_FIBER_BACKEND` 双向选 | `fcontext`（自写 SysV AMD64 切换体，GNU as）；winfiber 不可用自动回退并提示 |
+| 推理后端 | cpu / ORT（CUDA+Graph / DML）/ TRT / ncnn | cpu（全门可跑）；ORT/TRT/ncnn 的动态库装载面已收 dlopen（GPU EP 面**待接待测**，接入=社区通道） |
+| 绑核 | 全功能（判决 18） | env 解析收口，pinned 动作降级跳过（stderr 注记） |
+| census | 全功能（含线程级 CPU 普查） | 打印行/忙闲/进程 pcpu 在；线程普查降级 |
+
+- CI 矩阵=windows+linux × {C++17, C++20}：Linux 面跑 `farm_test` 全部确定性门
+  （cpu 后端；无 GPU 环境 R 门自动 SKIP——这就是"非 Windows 能编译能跑"的常驻证据）。
+- **为什么有栈 context 而非 C++20 无栈协程**：冻结面（`FiberGameFn` 普通函数指针
+  +"返回时局已收卷"契约）下无栈协程不可达——挂起要沿帧链传播，而 game_fn 普通函数
+  帧横在池入口与全部挂起点之间，"每次挂起一次有栈切换"经构造论证不可消去（无栈
+  不可达定理+12µs 拆解账全文见
+  [docs/design-cpp20-coroutines.md](docs/design-cpp20-coroutines.md)、
+  [docs/design-judgments.md](docs/design-judgments.md) 判决 24）。C++20 档
+  （`INFERFARM_CORO20=ON`）的实体=可移植有栈后端（fcontext）+ C++20 工具链通路，
+  协程对象零个——如实声明，不做伪装封装。
+- Linux 面已知边界：fcontext 栈=全量 commit（`FARM_FC_STACK_KB`，缺省 1MB/局，
+  无 guard-page 生长）；SysV ABI 全 XMM/MXCSR caller-saved——切换面零 FP 保存，
+  切出再切回后 XMM 内容不可信也无需可信（ABI 义务，语义差注记见
+  `src/fcontext.h`）；异常穿越切换点=未定义（两后端同罪，产线无 throw 面）。
+
 ## 环境旋钮（显式 Config 为准，env 快速实验）
 
 `FARM_FIBERS` `FARM_FIBER_WORKERS` `FARM_BANKS` `FARM_BANK_WINDOW_FLOOR`
@@ -247,22 +271,24 @@ RL rollout 可整体搬上农场（实测全矩阵 5.5 小时 → 50 分钟）�
 NVIDIA（CUDA/TensorRT）同进程混跑，链钉扎保证跨厂商重跑逐位一致；同一张
 卡拆多设备组也是官方用法（1 组 → 6 组实测 780 → 2303 局/s）。
 
-**支持 Linux 吗？** 当前 Windows 优先（fiber 走 Windows Fibers）；POSIX
-纤程移植在路线图（移植面收口在 fiber_pool.cpp 的 Switch 族）。
+**支持 Linux 吗？** 支持（Linux x64 / Ubuntu 档）：fcontext（SysV AMD64 自写
+有栈切换）+ cpu 后端可编译可跑通全部确定性门（CI 常驻双平台矩阵验证）；GPU
+EP 面待接待测。见上文[平台支持](#平台支持)。
 
 **接入一个游戏要写多少代码？** 五子棋全量适配器约 200 行、十个钩子；
 未训练模型即可跑通全流程（种子协议/直写槽/银行攒批/确定性门照常工作）。
 
 ## 约束与路线
 
-- 当前为 **Windows 优先**。平台相关面的现状：fiber 语义（fiber_pool.cpp，
-  Windows Fibers）与后端 DLL 装载（ort/trt 的 LoadLibrary 面）为 Windows
-  实现；bank/census/farm 的平台面（自旋原语/线程优先级/timer）已门控收口。
-  POSIX 移植=收口这两处：Switch 族（ucontext/boost::context）+ dlopen 装载。
+- 平台现状（2026-09-27 起）：Windows=全功能面（winfiber/fcontext 双后端 +
+  ORT CUDA/DML/TRT/ncnn）；Linux x64=fcontext(SysV) + cpu 后端可编译可跑
+  （确定性门 CI 常驻），GPU EP 面待接待测。fcontext 切换体参考 Boost.Context
+  （BSD 风格许可，attribution 见源文件头）。详见[平台支持](#平台支持)。
   C++17，CMake ≥3.16。
 - 路线：ORT/TRT 真模型实测基准（范式=KataGo benchmarkPureForward：barrier
   同起跑+每线程中位数+全体墙钟）、fp16 烤制档（int8 与 fp32 之间）、低负载
-  混合发车（单局场景银行税的解药）、POSIX 纤程、更多游戏范例。
+  混合发车（单局场景银行税的解药）、Linux GPU EP 面接入（ORT CUDA/TRT/ncnn
+  动态装载面已收 dlopen）、更多游戏范例。
   （多 GPU 已落地：cuda+dml 异构实测跑通、跨厂商复跑逐位同；TRT device_id
   守卫就位待双同构卡实测。）
 

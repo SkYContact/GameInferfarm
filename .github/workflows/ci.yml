@@ -1,6 +1,10 @@
 # CI：无 GPU 环境跑确定性门（G1-G6 + RW1 负路径）；真模型门 R1/R2 无工件自动 SKIP
-# 双档矩阵：cpp17=回退档（winfiber 缺省=现役零行为差）+ cpp20=INFERFARM_CORO20 档；
-# cpp17 档另跑 fcontext 后端腿（FARM_FIBER_BACKEND=fcontext——新后端的确定性门）
+# 双平台矩阵（2026-09-27，非 Windows 可编译可运行交付——判决 24 POSIX 路线）：
+#   windows：全功能面（winfiber 现役 + GPU/DML EP 面）
+#   linux  ：fcontext(SysV) + cpu 后端面（GPU EP 面待接；R 门无环境自动 SKIP）
+# 双标准档：cpp17=回退档 + cpp20=INFERFARM_CORO20 档；
+# cpp17 档另跑 fcontext 后端腿（FARM_FIBER_BACKEND=fcontext——新后端的确定性门；
+# Linux 面 winfiber 不可用本来就走 fcontext 回退，此腿=显式选路的等价验证）
 name: CI
 on:
   push:
@@ -32,3 +36,29 @@ jobs:
         run: build/Release/farm_test.exe
       - name: Real-model gates (SKIP without artifacts)
         run: build/Release/gomoku_backend_test.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        std: [cpp17, cpp20]
+        include:
+          - std: cpp17
+            cfg_flags: ""
+          - std: cpp20
+            cfg_flags: "-DINFERFARM_CORO20=ON"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CMake, ${{ matrix.std }})
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cfg_flags }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Determinism gates (G1-G6, cpu backend; fiber=fcontext SysV)
+        run: ./build/farm_test
+      - name: Determinism gates, explicit fcontext route (cpp17 only)
+        if: matrix.std == 'cpp17'
+        env:
+          FARM_FIBER_BACKEND: fcontext
+        run: ./build/farm_test
+      - name: Real-model gates (SKIP without artifacts)
+        run: ./build/gomoku_backend_test
