@@ -754,7 +754,15 @@ int main() {
             if (phys[k] < 0 || phys[k] >= hc) phys_ok = false;
         for (size_t k = 0; k + 1 < phys.size() && phys_ok; k++)
             if (phys[k] >= phys[k + 1]) phys_ok = false;   // 保序递增且互异
+#ifdef _WIN32
         CHECK(phys_ok, "G15 解析器：垃圾段全拒 + phys=真枚举（非空+界内+互异）");
+#else
+        // POSIX 降级面（2026-09-27）：phys 枚举=Windows 通道（GetLogical-
+        // ProcessorInformationEx），非 Windows=空列表+stderr 注记软失败。
+        // 门改考"降级路径如实降级"：不崩、不产假元素（空过防线同源语义）。
+        CHECK(ParseCpuList("x, -1, 5-3, phys").empty(),
+              "G15 解析器（POSIX）：phys 枚举降级=空列表软失败（无假元素）");
+#endif
 
         // ② 工人绑核腿：全部工人挤核 0（极端配置=最强可观测），指纹必须不动
         int p0 = AffinityPinnedCount();
@@ -762,14 +770,27 @@ int main() {
         LegResult w1 = RunOne(2, true, 4, 4242);
         CHECK(w1.fp == bank1.fp && w1.decisions == bank1.decisions,
               "G15 工人绑核腿指纹==默认腿（调度落位不改算术）");
+#ifdef _WIN32
         CHECK(AffinityPinnedCount() - p0 >= 4, "G15 工人真绑上（pinned≥K，防空过）");
+#else
+        // POSIX 降级面：PinThread=软失败不绑（affinity.cpp 注记）——门考
+        // pinned 恒 0（不虚报绑上）；调度落位不改算术的行为门=上方指纹门
+        //（平台中立，照常断言）。
+        CHECK(AffinityPinnedCount() == p0,
+              "G15（POSIX）绑核降级：pinned 恒 0 软失败，指纹另门已断言同");
+#endif
 
         // ③ 调度台绑核腿：4 工人+1 调度台全上核 0，指纹照常
         TestSetEnv("FARM_SCHED_AFFINITY=0");
         int p1 = AffinityPinnedCount();
         LegResult s1 = RunOne(2, true, 4, 4242);
         CHECK(s1.fp == bank1.fp, "G15 调度台绑核腿指纹==默认腿");
+#ifdef _WIN32
         CHECK(AffinityPinnedCount() - p1 >= 5, "G15 调度台真绑上（pinned≥K+1）");
+#else
+        CHECK(AffinityPinnedCount() == p1,
+              "G15（POSIX）调度台绑核同降级：pinned 恒 0 软失败");
+#endif
 
         // ④ 线程模式链线程同旋钮（G3 形状：每链一线程）
         LegResult t1 = RunOne(2, false, 6, 4242);
