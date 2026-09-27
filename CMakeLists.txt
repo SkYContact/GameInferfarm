@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
-project(inferfarm LANGUAGES CXX)
+# C 语言面=仅为 ASM 编译器宿主（.S 需 cpp 预处理，ASM 编译器钉 C 编译器；
+# 见下方非 Windows 分支）。无任何 C 目标/源，Windows/MSVC 面=零影响。
+project(inferfarm LANGUAGES C CXX)
 
 option(INFERFARM_CORO20 "C++20 档：/std:c++20 + 缺省 fiber 后端=fcontext（判决实验，见 docs/design-cpp20-coroutines.md）" OFF)
 
