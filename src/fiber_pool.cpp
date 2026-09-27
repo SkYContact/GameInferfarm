@@ -2,12 +2,15 @@
 // 游戏无关抽取，2026-09-22。行为与 YGO 产线逐句同源：链-工人亲和、切换点装卸
 // 帧、唤醒队列投递、错峰点火。）
 //
-// Windows Fibers：ConvertThreadToFiberEx/CreateFiberEx/SwitchToFiber。
-// 栈=PE 默认（与 std::thread 同源）。纤程切换本身 ns 级（实测口径）。
+// 切换后端可插拔（fiber_backend.h 五原语）：Windows=winfiber（现役）/
+// fcontext 双选；POSIX x86_64=fcontext（Linux 移植面，2026-09-27——池机器
+// 本体 std::thread/mutex/cv 全可移植，OS 触点只剩 tid 与睡眠，见
+// platform_compat.h；工人绑核在非 Windows=降级跳过，affinity.cpp）。
 #include "inferfarm/fiber_pool.h"
 #include "inferfarm/affinity.h"
 #include "inferfarm/census.h"
 #include "fiber_backend.h"
+#include "platform_compat.h"
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
@@ -16,12 +19,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#error "inferfarm fiber_pool 目前仅 Windows Fibers 实现（POSIX 移植面=本文件内 Switch 族）"
-#endif
 
 namespace inferfarm {
 
@@ -110,7 +107,7 @@ ScopedNoSuspend::~ScopedNoSuspend() { --t_nosuspend; }
 // ---------------- fiber 体与点火 ----------------
 static void FiSpawnGame(FiChain* ch, int gi, int wid);
 
-static void WINAPI FiGameMain(void* p) {
+static void FI_API FiGameMain(void* p) {
     FiTask* tk = (FiTask*)p;
     FiChain* ch2 = tk->ch;
     g_fps.game_fn(ch2->chain, tk->gi, ch2->user);
@@ -178,7 +175,7 @@ static void FiWorkerLoop(int wid, Census* cen) {
     if (!g_fps.worker_aff.empty())
         PinThread(g_fps.worker_aff, wid, "worker");
     if (cen && cen->on && cen->tids_worker_n < Census::kMaxWorkers)
-        cen->tids_worker[cen->tids_worker_n++] = GetCurrentThreadId();
+        cen->tids_worker[cen->tids_worker_n++] = CurrentTid();
     w.main_fib = g_be->ConvertThread();
     if (!w.main_fib) {
         std::printf("[fiber] 工人 %d ConvertThread 失败（后端 %s）\n",
@@ -265,7 +262,7 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
         wth.emplace_back(FiWorkerLoop, w, census_);
     // 等全体工人转 fiber 完（FiSpawnGame 要读 main_fib）
     while (g_fps.workers_ready.load() < K)
-        Sleep(1);
+        FiSleepMs(1);
     // 逐链点火（错峰=stagger 语义：同步起跑=到达层羊群灾难；链 c → 工人
     // c%K=确定性亲和）
     int spawned = 0;
@@ -279,7 +276,7 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
         FiSpawnGame(&ch, 0, c % K);
         spawned++;
         if (stagger_ms > 0 && c + 1 < chains)
-            Sleep((DWORD)(stagger_ms + 0.5));
+            FiSleepMs(stagger_ms);
     }
     std::printf("[fiber] %d 条链已点火（K=%d 工人，后端=%s，每局一 fiber，链-工人亲和 c%%K）\n",
                 spawned, K, g_be->name());
@@ -332,7 +329,7 @@ double RunLegThreads(int chains, int per, FiberGameFn game_fn, FiberFrameFn fram
         lc.chain = c;
         ths.emplace_back(ThreadChainMain, lc);
         if (stagger_ms > 0 && c + 1 < chains)
-            Sleep((DWORD)(stagger_ms + 0.5));
+            FiSleepMs(stagger_ms);
     }
     for (auto& t : ths) t.join();
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
