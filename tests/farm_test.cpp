@@ -45,6 +45,22 @@ static int g_fail = 0;
     std::fflush(stdout); \
 } while (0)
 
+// MSVC _putenv("K=V")/"K="(清) 的可移植等价（POSIX=setenv/unsetenv）。
+// 空值=清除：G15 门"清 env"意图与 ParseCpuList 对空/缺失同语义，两侧一致。
+#ifdef _WIN32
+static void TestSetEnv(const char* assign) { _putenv(assign); }
+#else
+static void TestSetEnv(const char* assign) {
+    const std::string s(assign);
+    const size_t eq = s.find('=');
+    const std::string k = s.substr(0, eq);
+    const std::string v = eq == std::string::npos ? std::string()
+                                                  : s.substr(eq + 1);
+    if (v.empty()) unsetenv(k.c_str());
+    else setenv(k.c_str(), v.c_str(), 1);
+}
+#endif
+
 // 一腿的逐局记录：链 c 局 i → (outcome, decisions)。收账走 tally 之外的
 // 逐局探针——复用适配器自身记录（链级累计）+ tally 汇总即可对 G1；逐局
 // 记录用第二个 Farm tally（先后手胜率）+ 每链 decisions。够 G1/G2/G3。
@@ -742,14 +758,14 @@ int main() {
 
         // ② 工人绑核腿：全部工人挤核 0（极端配置=最强可观测），指纹必须不动
         int p0 = AffinityPinnedCount();
-        _putenv("FARM_WORKER_AFFINITY=0");
+        TestSetEnv("FARM_WORKER_AFFINITY=0");
         LegResult w1 = RunOne(2, true, 4, 4242);
         CHECK(w1.fp == bank1.fp && w1.decisions == bank1.decisions,
               "G15 工人绑核腿指纹==默认腿（调度落位不改算术）");
         CHECK(AffinityPinnedCount() - p0 >= 4, "G15 工人真绑上（pinned≥K，防空过）");
 
         // ③ 调度台绑核腿：4 工人+1 调度台全上核 0，指纹照常
-        _putenv("FARM_SCHED_AFFINITY=0");
+        TestSetEnv("FARM_SCHED_AFFINITY=0");
         int p1 = AffinityPinnedCount();
         LegResult s1 = RunOne(2, true, 4, 4242);
         CHECK(s1.fp == bank1.fp, "G15 调度台绑核腿指纹==默认腿");
@@ -761,15 +777,15 @@ int main() {
 
         // ⑤ 越界核号=软失败不绑，结果照常（清 sched：本门只考 worker 面，
         // 不然调度台照常绑上会把 pinned 探针抬高=门自身假红）
-        _putenv("FARM_SCHED_AFFINITY=");
-        _putenv("FARM_WORKER_AFFINITY=9999");
+        TestSetEnv("FARM_SCHED_AFFINITY=");
+        TestSetEnv("FARM_WORKER_AFFINITY=9999");
         int p2 = AffinityPinnedCount();
         LegResult o1 = RunOne(2, true, 4, 4242);
         CHECK(o1.fp == bank1.fp && AffinityPinnedCount() == p2,
               "G15 越界核号软失败：不绑+指纹照常");
 
-        _putenv("FARM_WORKER_AFFINITY=");
-        _putenv("FARM_SCHED_AFFINITY=");
+        TestSetEnv("FARM_WORKER_AFFINITY=");
+        TestSetEnv("FARM_SCHED_AFFINITY=");
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
