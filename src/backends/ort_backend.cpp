@@ -128,6 +128,14 @@ namespace inferfarm {
 
 static Cudart g_cu;   // 进程一份（cudart 与 ORT 实例无关；DML 实例不加载）
 
+// ORT C API 的 OrtStatus* 返回值带 warn_unused_result 属性（GCC/Clang 编译
+// 必警，2026-09-27 上游转来）。fire-and-forget 调用点（失败语义由相邻显式
+// 检查或上层错误路径覆盖：如 GetInputCount 后有范围闸、InputName 后有
+// nm 判空）统一经此消费+释放；会致命的调用点仍走 if(status) 显式路径。
+static void IgnoreStatus(const OrtApi* a, OrtStatus* st) {
+    if (st) a->ReleaseStatus(st);
+}
+
 // DLL 注册表：双 ORT 共存改名律（基名冲突=拷贝改名再装；依赖 PATH 前插）
 static std::mutex g_ort_dll_mx;
 struct OrtDllRec { std::string base; std::string dir; ortplt::HMODULE h; };
@@ -1382,9 +1390,9 @@ private:
         if (SharedEnv() && !g_shared_env) g_shared_env = s->env;
         OrtSessionOptions* opts = nullptr;
         if (a->CreateSessionOptions(&opts)) { DestroySession(s); return nullptr; }
-        a->SetIntraOpNumThreads(opts, cfg.ort_threads > 0 ? cfg.ort_threads : 1);
-        a->SetInterOpNumThreads(opts, 1);
-        a->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL);
+        IgnoreStatus(a, a->SetIntraOpNumThreads(opts, cfg.ort_threads > 0 ? cfg.ort_threads : 1));
+        IgnoreStatus(a, a->SetInterOpNumThreads(opts, 1));
+        IgnoreStatus(a, a->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL));
         if (dml) {
 #ifdef _WIN32
             // ---- DML EP（AMD/核显路线）：挂 DirectML，device_id=适配器序号 ----
@@ -1585,7 +1593,7 @@ private:
         }
         // ---- 输入元数据 ----
         size_t n_in = 0;
-        a->SessionGetInputCount(s->sess, &n_in);
+        IgnoreStatus(a, a->SessionGetInputCount(s->sess, &n_in));
         if (n_in < 1 || n_in > 64) {
             std::fprintf(stderr, "[ort] 输入数 %zu ∉ [1,64]（模型不对？）\n", n_in);
             DestroySession(s);
@@ -1599,9 +1607,9 @@ private:
         }
         for (size_t i = 0; i < n_in; i++) {
             char* nm = nullptr;
-            a->SessionGetInputName(s->sess, i, alloc, &nm);
+            IgnoreStatus(a, a->SessionGetInputName(s->sess, i, alloc, &nm));
             s->ins[i].meta.name = nm ? nm : "?";
-            if (nm) a->AllocatorFree(alloc, nm);
+            if (nm) IgnoreStatus(a, a->AllocatorFree(alloc, nm));
             s->ins[i].meta.population =
                 !cfg.population_input.empty()
                 && s->ins[i].meta.name == cfg.population_input;   // 路由模式标记
@@ -1616,11 +1624,11 @@ private:
             const OrtTensorTypeAndShapeInfo* info = nullptr;
             if (a->CastTypeInfoToTensorInfo(ti, &info)) { a->ReleaseTypeInfo(ti); DestroySession(s); return nullptr; }
             ONNXTensorElementDataType et;
-            a->GetTensorElementType(info, &et);
+            IgnoreStatus(a, a->GetTensorElementType(info, &et));
             size_t nd = 0;
-            a->GetDimensionsCount(info, &nd);
+            IgnoreStatus(a, a->GetDimensionsCount(info, &nd));
             s->ins[i].meta.dims.resize(nd);
-            a->GetDimensions(info, s->ins[i].meta.dims.data(), nd);
+            IgnoreStatus(a, a->GetDimensions(info, s->ins[i].meta.dims.data(), nd));
             a->ReleaseTypeInfo(ti);
             s->ins[i].meta.et = OnnxToElem(et);
             s->ins[i].meta.esize = OnnxElemSize(et);
@@ -1667,7 +1675,7 @@ private:
         }
         // ---- 输出元数据（须 fp32）----
         size_t n_out = 0;
-        a->SessionGetOutputCount(s->sess, &n_out);
+        IgnoreStatus(a, a->SessionGetOutputCount(s->sess, &n_out));
         if (n_out < 1 || n_out > 64) {
             std::fprintf(stderr, "[ort] 输出数 %zu ∉ [1,64]\n", n_out);
             DestroySession(s);
@@ -1676,9 +1684,9 @@ private:
         s->outs.resize(n_out);
         for (size_t j = 0; j < n_out; j++) {
             char* nm = nullptr;
-            a->SessionGetOutputName(s->sess, j, alloc, &nm);
+            IgnoreStatus(a, a->SessionGetOutputName(s->sess, j, alloc, &nm));
             s->outs[j].meta.name = nm ? nm : "?";
-            if (nm) a->AllocatorFree(alloc, nm);
+            if (nm) IgnoreStatus(a, a->AllocatorFree(alloc, nm));
             OrtTypeInfo* ti = nullptr;
             if (a->SessionGetOutputTypeInfo(s->sess, j, &ti)) { DestroySession(s); return nullptr; }
             const OrtTensorTypeAndShapeInfo* info = nullptr;
@@ -1688,11 +1696,11 @@ private:
                 return nullptr;
             }
             ONNXTensorElementDataType et;
-            a->GetTensorElementType(info, &et);
+            IgnoreStatus(a, a->GetTensorElementType(info, &et));
             size_t nd = 0;
-            a->GetDimensionsCount(info, &nd);
+            IgnoreStatus(a, a->GetDimensionsCount(info, &nd));
             std::vector<int64_t> dims(nd);
-            a->GetDimensions(info, dims.data(), nd);
+            IgnoreStatus(a, a->GetDimensions(info, dims.data(), nd));
             a->ReleaseTypeInfo(ti);
             if (et != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
                 std::fprintf(stderr, "[ort] 输出 %s 非 fp32（协议恒 f32）\n",

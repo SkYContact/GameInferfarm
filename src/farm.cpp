@@ -306,14 +306,14 @@ bool Farm::Init(FarmConfig cfg) {
                                      m.name.c_str(), m.row_bytes, m.dims.size());
                     std::fprintf(stderr, " outs:");
                     for (auto& m : a.outs)
-                        std::fprintf(stderr, " [%s w=%zu]", m.name.c_str(), m.width);
+                        std::fprintf(stderr, " [%s w=%d]", m.name.c_str(), m.width);
                     std::fprintf(stderr, "\n[farm]     b(LoadSpec) ins:");
                     for (auto& m : b.ins)
                         std::fprintf(stderr, " [%s rb=%zu d=%zu]",
                                      m.name.c_str(), m.row_bytes, m.dims.size());
                     std::fprintf(stderr, " outs:");
                     for (auto& m : b.outs)
-                        std::fprintf(stderr, " [%s w=%zu]", m.name.c_str(), m.width);
+                        std::fprintf(stderr, " [%s w=%d]", m.name.c_str(), m.width);
                     std::fprintf(stderr, "\n");
                 }
                 bank_obj_.Shutdown();
