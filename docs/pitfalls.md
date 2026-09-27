@@ -186,3 +186,10 @@
   nullptr——选择层若只做"fcontext 失败回 winfiber"单向回退，C++17 缺省档
   （want=winfiber）在 Linux 直接 nullptr 出门=首次 Switch 解引用即炸。
   回退必须双向（fiber_backend.cpp），且每路回退留 stderr 注记。
+- **宿主平台从未编译过的 #else 面=首编译即爆**：winfiber 空工厂引用
+  IFiberBackend 但头包含在 #ifdef _WIN32 内、bank 两处 SetEvent 在
+  HR 镜像路径裸奔、ort CreateSession 的 wchar 路径——全是"Windows 上
+  永远不编译的分支"里潜伏的雷，一次 Linux 构建全炸出来。收口纪律：
+  条件编译面的**两侧**都要能编译（有空工厂就得有头；Win32 调用点跟随
+  对象创建点同门），移植批的验证载体=一台真 Linux 盒（本批用 8.222.179.238
+  relay 盒 git archive 直传，cmake+2 核构建+全门运行 ~3 分钟/轮）。
