@@ -582,8 +582,10 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
             I.pool_g[g].pop_front();
             wake.swap(I.waiters_g[g]);
             I.cv.notify_all();
+#ifdef _WIN32
             if (I.wake_ev) SetEvent((HANDLE)I.wake_ev);   // HR 路径镜像（持锁点
                                                           // 裸加——Notify 有重锁）
+#endif
         }
     }
     if (i < 0) return;
@@ -658,7 +660,9 @@ static void BankLoop(BankScheduler::Impl& I) {
                     wake.insert(wake.end(), wg.begin(), wg.end());
                 }
                 I.cv.notify_all();
+#ifdef _WIN32
                 if (I.wake_ev) SetEvent((HANDLE)I.wake_ev);   // stop 即时叫醒 HR 等待
+#endif
             }
             for (void* fib : wake) FiberPost(fib);
             break;
