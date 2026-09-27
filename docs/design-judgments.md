@@ -624,6 +624,35 @@ Windows-only（platform_compat.h 垫片：tid/睡眠/调用约定）+ ort 后端
 也无需可信——与 WinFiber FLOAT_SWITCH 宽度差）入 pitfalls 与 fcontext.h
 头注释。
 
+**移植收官（2026-09-27 晚，真盒验收+原语对比账——判决 24 全链闭合）**：
+- **真 Linux 盒验收**：8.222.179.238（Alibaba Cloud Linux 3≈RHEL8 生态，
+  x86_64 2 核 1GB）git clone 直拉分支；工具链=dnf git + gcc-toolset-12
+  （系统 gcc 10.2 作 C/ASM 宿主）+ cmake 3.26.5。{C++17,C++20} 双档
+  cmake 配置+构建全过（-j2 约 41s）；farm_test cpu 门两档 **ALL PASS
+  （70 ok / 0 失败**，R/G16 无模型工件自动 SKIP 属正常）；显式
+  FARM_FIBER_BACKEND=fcontext 腿同绿；gomoku_backend_test 无工件 SKIP
+  干净。CI 佐证：windows+linux 四 job 全绿（run 55 @5b28419 起）。
+- **原语对比账（fiber_bench A2/D2 过 POSIX 面后，暖态稳态；跨机器只比
+  量级与倍率，同机同 harness 才比绝对数——测量纪律）**：
+
+  | 档 | 平台/机 | 纯切换 | 64KB 双侧首触 | 建 1MB 栈+ctx+回收 |
+  |---|---|---|---|---|
+  | A WinFiber | 本机 9955HX | 24.1 ns/切换 | 312.6 | 5.78 µs/对 |
+  | A2 fcontext(MASM64) | 本机 9955HX | 11.0 | 301.7 | 3.33 µs（VirtualAlloc） |
+  | A2 fcontext(SysV) | 云盒 2 核 | 11.0 | 542.5 | **0.14 µs（posix_memalign）** |
+
+  要点：①SysV 切换体纯单价与 Win 档同数（11ns）——零 FP 保存面红利
+  实测兑现（判决 (c) 的"原语差"从 Win 面 3.3× 到 SysV 面 2.2×，端到端
+  仍属尾项，判死结论不变）；②首触差=云核 L1/L2 面宽（非原语项，C 档
+  纪律同前）；③建删账两侧 23×差=**分配语义差一阶**（Windows=内核页
+  commit，Linux=glibc malloc 复用）——跨平台建删账不可直比，与 fcontext
+  Linux 全量 commit 栈的内存足迹注记互证。
+- **移植账（本收官批增量）**：tests/fiber_bench.cpp A2/D2 门从 _MSC_VER
+  独占改 FI_FC_BENCH（Windows MASM64 + Linux x86_64 SysV 两面开测），
+  "POSIX 留位指路"降级点拆除；POSIX 计时=steady_clock、内存=
+  posix_memalign(64)（与后端 FreeStack 同纪律）。至此五原语抽象+双后端
+  +双平台+双标准档验收协议全链闭合。
+
 ## 25. 声明式增量 H2D（2026-09-27，掼蛋 PCIe 瓶颈的框架级解法）
 
 **问题**：掼蛋类负载输入=行动历史槽（256 槽×18 维）append-only 逐步增长，

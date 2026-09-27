@@ -157,4 +157,6 @@ FiberCurrent/FiberSuspend/FiberPost 签名与契约不动）下，纯 C++20 无�
 2. 性能门：gomoku fb8 fence（--chains 256 --games 4096 --banks 4，
    FARM_STAGGER_MS=0 FARM_BANK_SPIN=1）**交替腿 ≥3 取中位**+指纹全同
    （共享 GPU 时段两侧对称污染——方向可信幅度存疑，判决书标注）。
-3. 原语门：fiber_bench 增补 fcontext 档，直接量切换单价差。
+3. 原语门：fiber_bench 增补 fcontext 档，直接量切换单价差。（2026-09-27
+   移植收官：A2/D2 过 POSIX 面，SysV vs WinFiber 同 harness 对比账+
+   真 Linux 盒双档验收结果入判决 24"移植收官"段。）

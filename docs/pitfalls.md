@@ -193,6 +193,17 @@
   条件编译面的**两侧**都要能编译（有空工厂就得有头；Win32 调用点跟随
   对象创建点同门），移植批的验证载体=一台真 Linux 盒（本批用 8.222.179.238
   relay 盒 git archive 直传，cmake+2 核构建+全门运行 ~3 分钟/轮）。
+- **基准"留位=编译过"的降级点会过期**：fiber_bench 首版把 A2 档门写成
+  `#if defined(_MSC_VER)`，POSIX 面只打印一句指路——后端通了、基准没跟上，
+  头注释里的降级注记成了唯一线索。移植收官批把门改成"切换体所在构建面"
+  宏（FI_FC_BENCH：MASM64 与 SysV 两面开测），降级点拆除。教训：写
+  降级注记时带上拆除条件（"等切换体过 POSIX 面"），移植批 grep 注记
+  逐条清账。
+- **跨平台"建删账"差一阶（含分配语义差）**：D2 档（1MB 栈+ctx+回收）
+  Linux posix_memalign 实测 0.14µs/对 vs Windows VirtualAlloc ~3.3µs/对
+  （23×）——glibc malloc 复用 vs 内核页 commit；且含义差一阶：Windows
+  reserve+commit 按需提交 vs Linux 全量一次分配（fcontext Linux 档内存
+  足迹注记的另一半）。建删摊销账跨平台不可直比，比账只同平台内 A/B。
 
 ## 声明式增量 H2D 批（2026-09-27，判决 25）
 - **省字节≠省时间（逐段 memcpy 的 WDDM 提交税）**：增量 H2D 缺省逐段
