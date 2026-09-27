@@ -744,3 +744,34 @@ full 腿逐位同含指纹+复跑+inline 同）；farm_test G16（同 R8b 主门
 - 增量通道 CUDA 专属；cpu/dml/trt/ncnn 对声明零反应（full 现状）；
   FARM_H2D_DELTA=0 全局回落。声明在 spec（InputMeta.append）可观测，
   配置声明与运行时同字段无双写漂移。
+
+## 26. Linux 提交面 A/B 首测：WDDM 税实测蒸发（2026-09-27，ASUS TUF A15/RTX 3060M/Ubuntu 26.04/驱动 595.91.07）
+
+本机立项动机（判决 17 的另一半）首次实测兑现。同款五子棋 fb8 工件、128 链
+×512 局、stagger=0、banks=2、ORT ep=cuda（1.26.0 pip wheel+dlopen，CUDA 12.9
+运行时经 LD_LIBRARY_PATH 供面），与 Windows 台（9955HX+5070Ti，判决 17/20
+同形状读数）对拍：
+
+| 配置 | Linux 8C/3060M | Windows 16C/5070Ti |
+|---|---|---|
+| S0 缺省 cv 等待 | **3283 局/s**，srv-lat p50 0.5ms | 641 局/s，p50 2.4ms |
+| S1 spin=1 | **9941 局/s**，cycle=0.09ms | 11674 局/s，cycle=0.09ms |
+| fence+S1 | 9193 局/s（噪声带内平价） | +21%（生产推荐） |
+
+**结论**：①Linux 缺省档即 5.1×——WDDM 1.7ms 批排队税与 Windows 定时器量子
+在 S0 形态合计吞掉 ~1.9ms/批，Linux 全蒸发（dep 三段 h2d 0.012+run 0.036+
+d2h 0.000≈0.05ms/批，正中判决 17 时代"真实提交工作"预测值）；②spin=1 下
+两平台 cycle 同为 0.09ms=每批提交地板一致，Windows 的差距纯是税；Linux 用
+一半 CPU 核+小 GPU 达 Windows 冠军 85%；③**fence 桥价值=WDDM 专属**——
+Linux 同步路径已在地板，fence 无增益（写稿时 fence 叙事须加此前提）；
+④spin=0/spin=1/fence 三态指纹逐位一致（6da7de2ad81bdf36，8 链形状
+a3535388ff95061c 与 Windows R3 跨日值逐位同）=跨平台逐位等价首次双平台
+实证。⑤fence custom op+增量 H2D（R8）在 Linux CUDA EP 首次真启用全绿。
+
+**运行面（Linux GPU EP 复现配方）**：ORT 取 pip wheel（cp312 manylinux）
+解包 `--target`，`FARM_ORT_DIR=<pkg>/onnxruntime/capi`（需手工
+`ln -s libonnxruntime.so.<ver>` 裸名链接=框架 dlopen 契约）；
+`FARM_CUDA_DIR=<pkg>/nvidia/cuda_runtime/lib`（cudart_dyn 缺省
+libcudart.so.12 直配）；cudnn/cublas 等 EP 依赖经 `LD_LIBRARY_PATH` 供面
+（wheel 不落系统目录）。ORT 1.30 cuda extras=CUDA13 线解析不可达时 pip
+自动回落 1.26（CUDA12 soname 系）——自洽即用，勿强扭。
