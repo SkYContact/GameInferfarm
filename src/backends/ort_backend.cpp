@@ -98,7 +98,7 @@ inline HMODULE LibLoad(const char* p) {
     return h;
 }
 inline void* LibSym(HMODULE h, const char* n) { return ::dlsym(h, n); }
-inline unsigned long LastErr() { return (unsigned long)::errno; }
+inline unsigned long LastErr() { return (unsigned long)errno; }
 inline void* FenceSemCreate() {
     ::sem_t* s = new ::sem_t;
     if (::sem_init(s, 0, 0) != 0) { delete s; return nullptr; }
