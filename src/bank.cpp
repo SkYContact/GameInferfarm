@@ -128,6 +128,9 @@ struct BankScheduler::Impl {
                                          // 调度台 WMO 消费；Shutdown 兜底唤醒）
     std::atomic<bool> stop{false};
     std::atomic<bool> running{false};
+    bool any_append = false;             // 声明式增量 H2D 面（判决25）存在性：
+                                         // Claim 清声明/热路径的门（无 append 面
+                                         // =零开销，"数组写点与默认关=零开销同门"）
     // init 握手（会话建在调度台线程上：ORT 图会话 PerThreadContext 铁律）
     std::mutex init_mx;
     std::condition_variable init_cv;
@@ -213,6 +216,10 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
                 I.cen->claim_try_ns.fetch_add(NowNsI() - tp0, std::memory_order_relaxed);
             }
         }
+        // 声明会话起点复位（判决25）：领槽=新组装开始，上任写手的陈旧深度
+        // 声明必须作废——否则本批 SubmitBatch 会把陈旧声明当有效读（若本组装
+        // 未重新声明）=按错段传输=静默漏传。仅 append 农场付费（旗标同门）。
+        if (I.any_append) b.be->ClearFaceDepths(b.sess, v);
         if (v == 0) I.Notify();   // 只在首行通知调度台起窗（每批一次，替代每行
                                   // notify_all 风暴——高行速时调度台被叫醒风暴拖垮）
         return true;
@@ -288,6 +295,16 @@ bool BankScheduler::SetPopulation(int bank, const char* pop_input, const void* h
     if (!banks_ || bank < 0 || bank >= banks_ || !pop_input) return false;
     BankCtl& b = impl_->banks[(size_t)bank];
     return b.be->SetPopulation(b.sess, pop_input, host);
+}
+
+// 声明式增量 H2D（判决25）：组装期深度申报的银行侧转发。写手 fiber 在
+// AssembleInto 内调用（Claim→Submit 窗口，同槽独占=无并发）；到达后端后
+// 只写该 append 面的 declared[slot]（SubmitBatch 消费后复位）。后端未实现
+// 增量=缺省虚函数零反应；无 append 面=适配器从不调用=本函数零占用。
+void BankScheduler::FaceDepth(int bank, int slot, const char* name, int depth) {
+    if (!banks_ || bank < 0 || bank >= banks_ || !name) return;
+    BankCtl& b = impl_->banks[(size_t)bank];
+    b.be->NoteFaceDepth(b.sess, name, slot, depth);
 }
 
 // ---------------- 提交与收割 ----------------
@@ -1062,6 +1079,10 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 b.in_idx.push_back({I.spec.ins[ii].name.c_str(), ii});
             }
         }
+        // 声明式增量 H2D（判决25）：append 面存在性门（spec 此刻已终态——组 0
+        // 延迟收割也已完成）。无 append 面=Claim 清声明分支零占用。
+        for (auto& m : I.spec.ins)
+            if (m.append) { I.any_append = true; break; }
         // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
         // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）
         for (int i = 0; ok && i < built; i++) {

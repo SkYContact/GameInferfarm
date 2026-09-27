@@ -204,6 +204,23 @@ static bool SharedEnv() {
     return v;
 }
 
+// 声明式增量 H2D（判决25）env 面（均 CreateSession 期读取，非热路径）：
+//   FARM_H2D_DELTA：总开关（缺省开；=0=杀手锏——点名面一律回落 full，零行为差
+//     回退通道；配置声明仍进 spec 供观测）
+//   FARM_H2D_DELTA_DEBUG：影子哨兵——每批 H2D 后影子 vs 宿主做全 face memcmp。
+//     影子只同步"实际传输的段"=设备忠实镜像；非 0=设备侧与宿主漂移（声明漏
+//     传/append-only 承诺违约/段规划 bug）。fprintf 报首个错+计数（R8 哨兵
+//     门断言计数，防"打印没人看"的空过）。
+static bool DeltaEnvOn() {
+    const char* e = getenv("FARM_H2D_DELTA");
+    return !(e && *e && atoi(e) == 0);
+}
+static bool DeltaDebugEnv() {
+    const char* e = getenv("FARM_H2D_DELTA_DEBUG");
+    return e && *e && atoi(e) == 1;
+}
+static std::atomic<long long> g_delta_violations{0};
+
 // ==================== InferfarmFence custom op（FARM_ORT_ASYNC=3）====================
 // 整设备同步围栏（~0.4-0.5ms/批）的拆除通道（判决12 翻案路标）：tools/
 // patch_fence.py 在 fb onnx 图尾挂一个无输入 fence 节点（输出挂 graph output
@@ -371,6 +388,15 @@ struct OrtIn {
     void* host = nullptr;   // pinned carve（dml=普通页 carve，语义同）
     void* dev = nullptr;    // device carve（dml=host 同址，仅 CUDA 路径用）
     OrtValue* val = nullptr;
+    // ---- 声明式增量 H2D（判决25，append 面专属；append 旗标在 meta.append
+    //      ——单一事实源，spec 与运行时同字段，无双写漂移）----
+    int stride = 0;          // 一个深度单位的字节数 = row_bytes/dims[1]（nd<2 面不可 append）
+    int max_depth = 0;       // 深度上限 = dims[1]
+    std::vector<int> synced;     // 每行已同步深度（影子=设备的忠实镜像）；kFullSync=整行
+    std::vector<int> declared;   // 每行本批申报深度（组装期写入；SubmitBatch 消费后
+                                 // 复位 -1=未声明→整行兜底）
+    void* shadow = nullptr;      // 影子缓冲 carve（宿主侧设备镜像，与面等字节）
+    static constexpr int kFullSync = 1 << 30;   // "整行已同步"哨兵（>任何合法深度）
 };
 struct OrtOut {
     OutputMeta meta;
@@ -447,6 +473,15 @@ struct OrtSess {
     bool h2d_batch = false;   // 依赖 h2d_async（批 API 只有异步形态）
     std::vector<void*> hb_dst, hb_src;
     std::vector<size_t> hb_sizes, hb_attridx;
+    // 声明式增量 H2D（判决25）：append 面存在性（SubmitBatch 热路径分流的唯一
+    // 门——无 append 面=与旧路径逐指令同）；debug 哨兵（影子 vs 宿主全 face
+    // memcmp，非 0=声明漏传/承诺违约）；dep h2d 段字节数（A/B 测量面）
+    bool any_append = false;
+    bool delta_dbg = false;
+    bool delta_vio_printed = false;   // 哨兵打印去重（首个错即可；计数不封顶）
+    void* shadow_blk = nullptr;   // append 面影子总块（一次分配按面 carve）
+    size_t shadow_blk_bytes = 0;
+    unsigned long long dep_h2d_bytes = 0;   // 累计（与 dep_cnt 同节奏打印清零）
     void* stream = nullptr;
     void* event = nullptr;
     OrtRunOptions* ro = nullptr;
@@ -599,6 +634,16 @@ public:
         bool diff = ref1 != ref2;
         bool stable = ref1 == r2b;
         bool bok = diff && stable;
+        // 增量面 zero 基重建（判决25）：图案实验把显存写花——影子（恒未写=零）
+        // 回拷恢复"设备=影子=零基"起步态（synced 恒 0 未动）。仅各组首家银行走
+        // ProbeGraph；其余银行 Warmup 整块零拷后无人再碰=天然零基。
+        if (s->any_append && !s->dml) {
+            if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+            for (auto& i : s->ins)
+                if (i.meta.append)
+                    g_cu.Memcpy(i.dev, i.shadow,
+                                i.meta.row_bytes * (size_t)s->slots, 1);
+        }
         std::printf("[ort-probe] 两图案可分辨=%d 复跑稳定=%d%s\n",
                     (int)diff, (int)stable, bok ? "" : " ←FAIL");
         std::fflush(stdout);
@@ -647,6 +692,13 @@ public:
             if (s->in_d_arena) g_cu.Free(s->in_d_arena);
             if (s->out_h_arena) g_cu.FreeHost(s->out_h_arena);
             if (s->out_d_arena) g_cu.Free(s->out_d_arena);
+        }
+        if (s->shadow_blk) {   // 增量影子块（判决25）
+#ifdef _WIN32
+            VirtualFree(s->shadow_blk, 0, MEM_RELEASE);
+#else
+            std::free(s->shadow_blk);
+#endif
         }
         delete s;
     }
@@ -708,11 +760,14 @@ public:
                         return false;
                 s->pop_dirty = false;
             }
+            if (!s->any_append) {
             // 前缀 H2D：同步拷贝（返回即完成——与 ORT 内部流旗标无关，零竞态；
-            // n>7/8·slots 走整块；population 面跳过）
+            // n>7/8·slots 走整块；population 面跳过）。无 append 面=原路径逐
+            // 指令不变（any_append 门=零行为差保证，判决25）
             if (n_rows > (s->slots * 7) / 8) {
                 if (!h2d(s->in_d_arena, s->in_h_arena, s->in_h_bytes))
                     return false;
+                s->dep_h2d_bytes += s->in_h_bytes;
             } else if (s->fence && s->h2d_batch && s->ins.size() >= 2) {
                 // P1-5 批拷贝判决实验（FARM_H2D_BATCH=1）：稀疏批多输入 H2D
                 // 合并为一次 cudaMemcpyBatchAsync——dep=宿主提交税∝提交次数
@@ -746,6 +801,7 @@ public:
                                  s->hb_src[0], s->hb_sizes[0]);
                     std::fflush(stderr);
                 }
+                for (size_t i = 0; i < nb; i++) s->dep_h2d_bytes += s->hb_sizes[i];
                 if (g_cu.MemcpyBatchAsync(s->hb_dst.data(), s->hb_src.data(),
                                           s->hb_sizes.data(), nb, &attr,
                                           s->hb_attridx.data(), 1,
@@ -765,6 +821,8 @@ public:
                     if (!h2d(s->ins[i].dev, s->ins[i].host,
                              (size_t)n_rows * s->ins[i].meta.row_bytes))
                         return false;
+                    s->dep_h2d_bytes +=
+                        (size_t)n_rows * s->ins[i].meta.row_bytes;
                 }
                 // 前缀路径补充：毒化后的路由键尾段同步到设备（整块路径全量拷贝已含）
                 if (s->pop_mode && n_rows < s->slots)
@@ -774,6 +832,134 @@ public:
                                  (char*)m.host + (size_t)n_rows * m.meta.row_bytes,
                                  (size_t)(s->slots - n_rows) * m.meta.row_bytes))
                             return false;
+                    }
+            }
+            } else {
+                // ---- 声明式增量 H2D（判决25）----
+                // append 面逐行分流：增长只传 [synced,depth) 段（append-only
+                // 承诺=前缀未变）；depth 递减=换局信号，影子重铸 [0,旧synced)
+                // （新前段+零尾）一段式回传；未声明/满深行=整行兜底（永远正确，
+                // 逐行混批）。full 面=前缀 [0,n)——append 面在批内，整块快捷会
+                // 把增量面的陈旧行也重传（前功尽弃），故此模式不用整块判定。
+                // 批拷贝通道可用=段聚合一次提交，否则逐段（先正确后优化）。
+                const bool batch = s->fence && s->h2d_batch;
+                size_t nb = 0;
+                unsigned long long seg_bytes = 0;
+                bool ok = true;
+                auto emit = [&](void* dst, const void* src, size_t bytes) {
+                    if (!ok || bytes == 0) return;
+                    seg_bytes += bytes;
+                    if (batch) {
+                        s->hb_dst[nb] = dst;
+                        s->hb_src[nb] = (void*)src;
+                        s->hb_sizes[nb] = bytes;
+                        s->hb_attridx[nb] = 0;
+                        nb++;
+                    } else if (!h2d(dst, src, bytes)) {
+                        ok = false;
+                    }
+                };
+                for (size_t i = 0; i < s->ins.size() && ok; i++) {
+                    OrtIn& in = s->ins[i];
+                    if (in.meta.population) continue;
+                    if (!in.meta.append) {
+                        emit(in.dev, in.host,
+                             (size_t)n_rows * in.meta.row_bytes);
+                        continue;
+                    }
+                    const size_t rb = in.meta.row_bytes;
+                    const size_t st = (size_t)in.stride;
+                    char* hb = (char*)in.host;
+                    char* db = (char*)in.dev;
+                    char* sb = (char*)in.shadow;
+                    for (int r = 0; r < n_rows && ok; r++) {
+                        const int d = in.declared[(size_t)r];
+                        in.declared[(size_t)r] = -1;   // 消费即复位（陈旧声明防线）
+                        const int so = in.synced[(size_t)r];
+                        if (d < 0 || d >= in.max_depth) {
+                            // 未声明/满深：整行兜底
+                            emit(db + (size_t)r * rb, hb + (size_t)r * rb, rb);
+                            if (ok)
+                                std::memcpy(sb + (size_t)r * rb,
+                                            hb + (size_t)r * rb, rb);
+                            in.synced[(size_t)r] = OrtIn::kFullSync;
+                        } else if (d > so) {
+                            // 增长：只传 [so,d)；影子同步仅此段（影子保持设备
+                            // 镜像——哨兵 memcmp 才抓得到前缀违约）
+                            const size_t off = (size_t)so * st;
+                            const size_t bytes = (size_t)(d - so) * st;
+                            emit(db + (size_t)r * rb + off,
+                                 hb + (size_t)r * rb + off, bytes);
+                            if (ok)
+                                std::memcpy(sb + (size_t)r * rb + off,
+                                            hb + (size_t)r * rb + off, bytes);
+                            in.synced[(size_t)r] = d;
+                        } else if (d < so) {
+                            // 递减=换局：影子重铸本行 [0,有效旧深)（新前段+零尾）
+                            // 后一段式回传。旧深以行界钳制——kFullSync（整行兜底
+                            // 同步过，含虚增量未组装槽）或越界都按"整行"处理，
+                            // 零尾到行尾为止（宿主侧该行=Claim 清零+[0,d) 新内容，
+                            // 设备侧必须同样恢复零基）。无钳制=tail≈4GB 越界
+                            // memset（虚增量+整行兜底组合实测段错误案）。
+                            const int so_eff =
+                                (so >= 0 && so <= in.max_depth) ? so : in.max_depth;
+                            char* sh = sb + (size_t)r * rb;
+                            const char* hh = hb + (size_t)r * rb;
+                            const size_t head = (size_t)d * st;
+                            const size_t tail = (size_t)(so_eff - d) * st;
+                            std::memcpy(sh, hh, head);
+                            std::memset(sh + head, 0, tail);
+                            emit(db + (size_t)r * rb, sh, head + tail);
+                            in.synced[(size_t)r] = d;
+                        }
+                        // d == so：零段（承诺=前缀未变、行尾已零）
+                    }
+                }
+                // population 死行毒化尾段（判决16；宿主侧毒化已在批头完成）
+                if (ok && s->pop_mode && n_rows < s->slots)
+                    for (int mi : s->mid_like) {
+                        OrtIn& m = s->ins[(size_t)mi];
+                        emit((char*)m.dev + (size_t)n_rows * m.meta.row_bytes,
+                             (char*)m.host + (size_t)n_rows * m.meta.row_bytes,
+                             (size_t)(s->slots - n_rows) * m.meta.row_bytes);
+                    }
+                if (ok && batch && nb > 0) {
+                    HbAttr attr;
+                    std::memset(&attr, 0, sizeof attr);
+                    attr.srcAccessOrder = 0x3;   // SrcAccessOrderAny（同 P1-5）
+                    if (g_cu.MemcpyBatchAsync(s->hb_dst.data(),
+                                              s->hb_src.data(),
+                                              s->hb_sizes.data(), nb, &attr,
+                                              s->hb_attridx.data(), 1,
+                                              s->fence_stream))
+                        ok = false;
+                }
+                if (!ok) return false;
+                s->dep_h2d_bytes += seg_bytes;
+                // debug 哨兵（FARM_H2D_DELTA_DEBUG=1）：影子=设备忠实镜像——
+                // 全 face memcmp 宿主，非 0=设备侧与宿主漂移（声明漏传/
+                // append-only 承诺违约/段规划 bug）。首个错打印；计数=门断言面
+                //（OrtDeltaDebugViolations，防"打印没人看"的空过）。
+                if (s->delta_dbg)
+                    for (size_t i = 0; i < s->ins.size(); i++) {
+                        OrtIn& in = s->ins[i];
+                        if (!in.meta.append) continue;
+                        if (std::memcmp(in.shadow, in.host,
+                                        in.meta.row_bytes
+                                            * (size_t)s->slots) != 0) {
+                            g_delta_violations.fetch_add(
+                                1, std::memory_order_relaxed);
+                            if (!s->delta_vio_printed) {
+                                s->delta_vio_printed = true;
+                                std::fprintf(stderr,
+                                             "[ort] H2D 增量哨兵：face \"%s\" "
+                                             "影子≠宿主（声明漏传或 append-only "
+                                             "承诺违约——核对 FaceDepth 声明与"
+                                             "行内容）\n",
+                                             in.meta.name.c_str());
+                                std::fflush(stderr);
+                            }
+                        }
                     }
             }
             const long long dep_t1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -807,11 +993,13 @@ public:
                 s->dep_d2h_ns += t3 - dep_t2;
                 if (++s->dep_cnt == 256) {
                     std::fprintf(stderr, "[ort] dep 三段 (n=%u, rows=%d): h2d=%.3f "
-                                 "run=%.3f d2h=%.3f ms/均\n", s->dep_cnt, s->last_n,
+                                 "run=%.3f d2h=%.3f ms/均 h2d=%.1fkB/批\n", s->dep_cnt, s->last_n,
                                  s->dep_h2d_ns / 256e6, s->dep_run_ns / 256e6,
-                                 s->dep_d2h_ns / 256e6);
+                                 s->dep_d2h_ns / 256e6,
+                                 s->dep_h2d_bytes / 256.0 / 1024.0);
                     std::fflush(stderr);
                     s->dep_h2d_ns = s->dep_run_ns = s->dep_d2h_ns = 0;
+                    s->dep_h2d_bytes = 0;
                     s->dep_cnt = 0;
                 }
             }
@@ -910,6 +1098,29 @@ public:
                 return true;
             }
         return false;
+    }
+
+    // 声明式增量 H2D（判决25）：组装期行深度申报。仅 append 面接收（深度单位
+    // =行首维 dims[1]）；界外深度=拒绝（该行按未声明整行兜底——fail-safe）。
+    // 写手 fiber 调用（Claim→Submit 窗口同槽独占=无并发）；SubmitBatch 消费后
+    // 复位。无 append 面的会话=any_append 门一击即回（零占用）。
+    void NoteFaceDepth(void* session, const char* name, int slot, int depth) override {
+        OrtSess* s = (OrtSess*)session;
+        if (!s || !s->any_append || !name || slot < 0 || slot >= s->slots) return;
+        for (auto& i : s->ins)
+            if (i.meta.append && i.meta.name == name) {
+                if (depth >= 0 && depth <= i.max_depth)
+                    i.declared[(size_t)slot] = depth;
+                return;
+            }
+    }
+    // 声明会话起点复位（Claim 领槽调用）：上任写手的陈旧声明作废——否则新
+    // 组装未重新声明的行会被陈旧深度误读=按错段传输。
+    void ClearFaceDepths(void* session, int slot) override {
+        OrtSess* s = (OrtSess*)session;
+        if (!s || !s->any_append || slot < 0 || slot >= s->slots) return;
+        for (auto& i : s->ins)
+            if (i.meta.append) i.declared[(size_t)slot] = -1;
     }
 
 private:
@@ -1429,6 +1640,26 @@ private:
             size_t row = 1;
             for (size_t d = 1; d < nd; d++) row *= (size_t)s->ins[i].meta.dims[d];
             s->ins[i].meta.row_bytes = row * s->ins[i].meta.esize;
+            // 声明式增量 H2D（判决25）：点名面标记。深度单位=行首维 dims[1]
+            // （掼蛋形状 [256,18] → depth∈[0,256]、stride=18*esize 字节）。
+            // population 面与 <2 维面深度无定义=忽略点名（静默回落 full）；
+            // FARM_H2D_DELTA=0 杀手锏=全部忽略（零行为差回退）。
+            if (!dml && !s->ins[i].meta.population && DeltaEnvOn()
+                && !cfg.append_inputs.empty()
+                && s->ins[i].meta.dims.size() >= 2
+                && s->ins[i].meta.dims[1] > 0) {
+                for (const auto& an : cfg.append_inputs) {
+                    if (an != s->ins[i].meta.name) continue;
+                    OrtIn& oi = s->ins[i];
+                    oi.meta.append = true;
+                    oi.max_depth = (int)oi.meta.dims[1];
+                    oi.stride = (int)(oi.meta.row_bytes / (size_t)oi.meta.dims[1]);
+                    oi.synced.assign((size_t)slots, 0);
+                    oi.declared.assign((size_t)slots, -1);
+                    s->any_append = true;
+                    break;
+                }
+            }
             if (spec_out) {
                 InputMeta m = s->ins[i].meta;
                 spec_out->ins.push_back(std::move(m));
@@ -1548,6 +1779,68 @@ private:
                 return nullptr;
             }
         }
+        // ---- 声明式增量影子块（判决25，仅 CUDA 路径）----
+        // 影子=设备输入面的宿主镜像（只同步实际传输的段——这是哨兵有牙齿的
+        // 前提：影子漂移=设备漂移）。VirtualAlloc 零页=零基起步（宿主零基组装
+        // 起点=0、显存 zero 基=0、影子=0、synced=0 四方一致）；POSIX 面=堆零块
+        // （增量通道暂未上非 Windows，防御面同语义）。
+        if (s->any_append) {
+            s->delta_dbg = DeltaDebugEnv();
+            size_t tot = 0;
+            for (size_t i = 0; i < n_in; i++)
+                if (s->ins[i].meta.append)
+                    tot = (tot + s->ins[i].meta.row_bytes * (size_t)slots
+                           + kAlign - 1) / kAlign * kAlign;
+#ifdef _WIN32
+            s->shadow_blk = VirtualAlloc(nullptr, tot ? tot : 1,
+                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+            s->shadow_blk = std::malloc(tot ? tot : 1);
+            if (s->shadow_blk) std::memset(s->shadow_blk, 0, tot ? tot : 1);
+#endif
+            if (!s->shadow_blk) {
+                std::fprintf(stderr, "[ort] 增量影子块(%zuB) 分配失败\n", tot);
+                DestroySession(s);
+                return nullptr;
+            }
+            size_t soff = 0;
+            for (size_t i = 0; i < n_in; i++) {
+                if (!s->ins[i].meta.append) continue;
+                soff = (soff + kAlign - 1) / kAlign * kAlign;
+                s->ins[i].shadow = (char*)s->shadow_blk + soff;
+                soff += s->ins[i].meta.row_bytes * (size_t)slots;
+            }
+            // 显存 zero 基（会话创建一次）：设备 append 面=影子（全零）。首批
+            // 增量段只补 [0,depth)，行尾零由此保证（ Warmup 整块零拷幂等重做；
+            // ProbeGraph 图案污染在彼处末尾重零）。
+            if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+            for (size_t i = 0; i < n_in; i++) {
+                if (!s->ins[i].meta.append) continue;
+                if (g_cu.Memcpy(s->ins[i].dev, s->ins[i].shadow,
+                                s->ins[i].meta.row_bytes * (size_t)slots, 1)) {
+                    std::fprintf(stderr, "[ort] 增量面 zero 基 memcpy 失败\n");
+                    DestroySession(s);
+                    return nullptr;
+                }
+            }
+            // 批拷贝 scratch 扩容：增量段上限=每面每行至多一段+full 面前缀段
+            if (s->h2d_batch) {
+                size_t cap = s->ins.size() + 4;
+                for (size_t i = 0; i < n_in; i++)
+                    if (s->ins[i].meta.append) cap += (size_t)slots;
+                s->hb_dst.resize(cap);
+                s->hb_src.resize(cap);
+                s->hb_sizes.resize(cap);
+                s->hb_attridx.resize(cap);
+            }
+            std::fprintf(stderr, "[ort] 声明式增量 H2D：%zu 个 append 面"
+                         "（影子 %zuB，stride/depth 见面表%s）\n",
+                         [&] { size_t k = 0;
+                               for (auto& i : s->ins) if (i.meta.append) k++;
+                               return k; }(),
+                         tot, s->delta_dbg ? "；哨兵=开" : "");
+            std::fflush(stderr);
+        }
         // ---- 输出单块 arena ----
         off = 0;
         for (size_t j = 0; j < n_out; j++) {
@@ -1644,6 +1937,10 @@ InferBackend* CreateOrtBackend() { return new OrtBackend(); }
 
 long long OrtFenceEngagedTotal() {
     return g_fence_engaged.load(std::memory_order_relaxed);
+}
+
+long long OrtDeltaDebugViolations() {
+    return g_delta_violations.load(std::memory_order_relaxed);
 }
 
 } // namespace inferfarm

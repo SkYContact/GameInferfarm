@@ -17,6 +17,13 @@
 //   R7 trt refit 真引擎换心（B5，2026-09-24）：refittable 引擎 + RW1 全零
 //      换心必变 + 复采逐位同 + 二次 refit 幂等 + 名单外假名负路径（引擎
 //      不可 refit=SKIP——旧工件需重烤）
+//   R8 声明式增量 H2D（判决25，2026-09-27）：R8a backend 级——append 会话 vs
+//      full 会话同行内容输出逐位（增长段/换局重铸/未声明整行兜底/满深/零深/
+//      零段全路径）；R8a-V sentinel 违约门（FARM_H2D_DELTA_DEBUG=1 + 人为
+//      前缀违约→OrtDeltaDebugViolations 必增，clean 批不增）；R8b farm 级——
+//      包装适配器（own 面深度前缀模式+FaceDepth 申报）append 腿 == 强制
+//      full 腿逐位同（增量漏传必指纹红=哨兵语义验收）+ 复跑 + inline 同
+//      （工件缺席=SKIP）
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
@@ -409,6 +416,195 @@ int main() {
                 delete be;
             }
         }
+    }
+    // ---------------- R8：声明式增量 H2D（判决25）----------------
+    // 深度前缀模式（content=f(k) 与局无关）是 append-only 承诺的结构性成立形态：
+    // 任意行任意局写 [0,d) 都是同一前缀 → 槽轮转/换局下增长段假设恒真。
+    // 掼蛋真负载的接入语义见判决 25 接入指引（承诺不可行时就别声明=full 兜底）。
+    if (have_ort) {
+        // ---- R8a：backend 级（delta 会话 vs full 会话，同写同报）----
+        InferBackend* be8 = CreateOrtBackend();
+        ModelConfig m8a;
+        m8a.backend = "ort";
+        m8a.model_path = kOnnx;
+        m8a.append_inputs.push_back("own");
+        ModelConfig m8f = m8a;
+        m8f.append_inputs.clear();   // 强制 full 对照
+        ModelSpec sp8, sp8f;
+        bool r8_ok = be8 && be8->LoadSpec(m8a, 8, sp8)
+            && be8->LoadSpec(m8f, 8, sp8f);
+        bool own_append = false;
+        for (auto& i : sp8.ins)
+            if (i.name == "own" && i.append) own_append = true;
+        CHECK(r8_ok && own_append, "R8a append 面进 spec（append_inputs→InputMeta）");
+        void* sd = r8_ok ? be8->CreateSession(m8a, sp8, true) : nullptr;
+        void* sf = r8_ok ? be8->CreateSession(m8f, sp8f, true) : nullptr;
+        bool warm8 = sd && sf && be8->Warmup(sd) && be8->Warmup(sf);
+        CHECK(warm8, "R8a delta/full 双会话建+热身");
+        if (warm8) {
+            const int S = sp8.slots;
+            const int D = 225;   // own 面行首维（深度上限）
+            // 深度前缀模式：行内容 [0,d)=pat(k)、[d,D)=0（零基组装的显式版）
+            auto fill_hist = [&](void* sess, int slot, int depth) {
+                size_t rb = 0;
+                float* own = (float*)be8->InputRow(sess, "own", slot, &rb);
+                if (!own) return;
+                for (int k = 0; k < D; k++) {
+                    uint32_t x = 0x9E3779B9u * (uint32_t)(k + 1);
+                    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                    own[k] = k < depth
+                        ? (float)((int)(x & 0xFFFF) - 32768) / 32768.0f : 0.0f;
+                }
+            };
+            auto fill_board = [&](void* sess, int slot, uint32_t seed) {
+                size_t rb = 0;
+                float* opp = (float*)be8->InputRow(sess, "opp", slot, &rb);
+                if (!opp) return;
+                uint32_t x = seed;
+                for (size_t k = 0; k < rb / sizeof(float); k++) {
+                    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                    opp[k] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                }
+            };
+            auto snap = [&](void* sess, int slot) {
+                std::vector<float> v;
+                for (size_t i = 0; i < sp8.outs.size(); i++) {
+                    int w = be8->OutputWidth(sess, sp8.outs[i].name.c_str());
+                    const float* p = w > 0
+                        ? be8->OutputRow(sess, sp8.outs[i].name.c_str(), slot)
+                        : nullptr;
+                    if (p) v.insert(v.end(), p, p + w);
+                }
+                return v;
+            };
+            // 一轮：两会话同写 rows[0,n)，delta 侧按 depths 申报（-1=不申报）
+            // → 各自 SubmitBatch → 逐槽逐位比对
+            auto round = [&](int n, const std::vector<int>& depths,
+                             uint32_t seed, const char* tag) {
+                for (int r = 0; r < n; r++) {
+                    fill_hist(sd, r, depths[(size_t)r]);
+                    fill_hist(sf, r, depths[(size_t)r]);
+                    fill_board(sd, r, seed + (uint32_t)r);
+                    fill_board(sf, r, seed + (uint32_t)r);
+                    if (depths[(size_t)r] >= 0)
+                        be8->NoteFaceDepth(sd, "own", r, depths[(size_t)r]);
+                }
+                unsigned q1 = 0, q2 = 0;
+                bool ok = be8->SubmitBatch(sd, n, q1) && be8->SubmitBatch(sf, n, q2);
+                while (ok && !be8->CompletionReached(sd, q1)) {}
+                while (ok && !be8->CompletionReached(sf, q2)) {}
+                be8->CompletionFence();
+                bool same = ok;
+                for (int r = 0; r < n && same; r++)
+                    same = snap(sd, r) == snap(sf, r);
+                CHECK(same, tag);
+                return same;
+            };
+            bool r8a = true;
+            r8a = round(5, {3, 5, 2, 7, 4}, 111u, "R8a-1 首批增长段（5 行 fresh depth）") && r8a;
+            r8a = round(8, {8, 6, 5, 9, 12, 1, D, 0}, 222u,
+                        "R8a-2 混合批（增长/换局重铸/满深/零深/fresh）") && r8a;
+            // 行 6 在上轮满深（225→kFullSync）：本轮申报 d=1 = kFullSync 重置
+            //（行界钳制回归面——虚增量+整行兜底组合曾在此 4GB memset 越界）
+            r8a = round(8, {10, -1, 4, 5, -1, 2, 1, 3}, 333u,
+                        "R8a-3 未声明行整行兜底+kFullSync 重置（逐行混批）") && r8a;
+            r8a = round(8, {10, -1, 4, 5, -1, 2, 1, 3}, 333u,
+                        "R8a-4 零段批（d==synced 不传）逐位同") && r8a;
+            // 哨兵违约门：debug 会话（env 于建会话前设）+ 人为前缀违约——
+            // [0,4) 换内容后申报 d=6（增长段只传 [4,6)）→ 影子≠宿主必报
+            long long vio0 = OrtDeltaDebugViolations();
+            CHECK(vio0 == 0, "R8a clean 批哨兵零违约（对照面）");
+            TestSetEnv("FARM_H2D_DELTA_DEBUG", "1");
+            void* sv = be8->CreateSession(m8a, sp8, true);
+            bool wv = sv && be8->Warmup(sv);
+            TestSetEnv("FARM_H2D_DELTA_DEBUG", "0");
+            CHECK(wv, "R8a-V debug 哨兵会话建+热身");
+            if (wv) {
+                fill_hist(sv, 0, 4);
+                fill_board(sv, 0, 444u);
+                be8->NoteFaceDepth(sv, "own", 0, 4);
+                unsigned q = 0;
+                bool ok1 = be8->SubmitBatch(sv, 1, q);
+                while (ok1 && !be8->CompletionReached(sv, q)) {}
+                be8->CompletionFence();
+                // 违约：换掉已同步前缀 [0,4) 的内容，再申报增长 d=6
+                size_t rb = 0;
+                float* own = (float*)be8->InputRow(sv, "own", 0, &rb);
+                for (int k = 0; k < 6; k++) {
+                    uint32_t x = 0xDEADBEEFu * (uint32_t)(k + 3);
+                    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                    own[k] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                }
+                be8->NoteFaceDepth(sv, "own", 0, 6);
+                bool ok2 = be8->SubmitBatch(sv, 1, q);
+                while (ok2 && !be8->CompletionReached(sv, q)) {}
+                be8->CompletionFence();
+                CHECK(OrtDeltaDebugViolations() > vio0,
+                      "R8a-V 前缀违约哨兵必报（计数增长；fprintf 第一现场）");
+                be8->DestroySession(sv);
+            }
+            (void)r8a;
+            be8->DestroySession(sd);
+            be8->DestroySession(sf);
+        } else if (sd || sf) {
+            if (sd) be8->DestroySession(sd);
+            if (sf) be8->DestroySession(sf);
+        }
+        delete be8;
+
+        // ---- R8b：farm 级（append 声明腿 == 强制 full 腿，指纹逐位）----
+        struct AppendGomokuAdapter : gomoku::GomokuAdapter {
+            explicit AppendGomokuAdapter(int chain) : GomokuAdapter(chain) {}
+            static float HistPat(int k) {
+                uint32_t x = 0x9E3779B9u * (uint32_t)(k + 1);
+                x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                return (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+            }
+            void AssembleInto(SlotWriter& slot) override {
+                GomokuAdapter::AssembleInto(slot);   // 棋盘两平面照写
+                float* own = (float*)slot.Row("own", nullptr);
+                if (!own) return;
+                const int depth = moves + 1 < kCells ? moves + 1 : kCells;
+                for (int k = 0; k < depth; k++) own[k] = HistPat(k);
+                std::memset(own + depth, 0, (size_t)(kCells - depth) * sizeof(float));
+                slot.FaceDepth("own", depth);   // 声明式增量 H2D 的申报点
+            }
+        };
+        auto append_make = [](int chain, void*) -> GameAdapter* {
+            return new AppendGomokuAdapter(chain);
+        };
+        auto r8_leg = [&](int banks, bool append) {
+            FarmConfig cfg;
+            cfg.name = "gomoku-append";
+            cfg.chains = 8;
+            cfg.games = 32;
+            cfg.seed0 = 20260922u;
+            cfg.banks = banks;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "ort";
+            cfg.model.model_path = kOnnx;
+            if (append) cfg.model.append_inputs.push_back("own");
+            Farm farm;
+            if (!farm.Init(cfg)) { g_fail++; return R{0, 0, 0}; }
+            double sec = farm.RunLeg(append_make, nullptr);
+            return R{farm.tally().fingerprint, farm.tally().games_done, sec};
+        };
+        R a1 = r8_leg(2, true);
+        R a2 = r8_leg(2, true);
+        R af = r8_leg(2, false);
+        R ai = r8_leg(0, true);
+        CHECK(a1.games == 32 && af.games == 32, "R8b append/full 腿完成（32 局）");
+        CHECK(a1.fp == af.fp,
+              "R8b append==强制 full 逐位同（增量漏传必指纹红=主门）");
+        CHECK(a1.fp == a2.fp, "R8b append 复跑逐位同");
+        CHECK(a1.fp == ai.fp,
+              "R8b append 银行 vs inline 逐位同（协议不变量=设备==宿主的端到端）");
+        std::printf("[R8] append 银行 %.0f 局/s / full %.0f 局/s\n",
+                    a1.games / a1.sec, af.games / af.sec);
+    } else {
+        std::printf("SKIP R8: 无 %s\n", kOnnx);
     }
     if (!have_ort && !have_trt) {
         std::printf("（本目录无模型工件——全部 SKIP 属正常）\n");

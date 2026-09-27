@@ -4,7 +4,14 @@
 //   gomoku [--backend cpu|ort|trt] [--model <fb.onnx>] [--engine <plan>]
 //          [--chains 8] [--games 16] [--banks 2] [--workers 4] [--slots 8]
 //          [--cache-log2 16] [--device <spec>]... [--inline] [--threads]
-//          [--census] [--show-board]
+//          [--census] [--show-board] [--append-own]
+//
+//   --append-own 声明式增量 H2D 演示/A/B（判决25）：own 面点名 append +
+//   包装适配器把 own 行改写为"深度前缀模式"（own[k]=HistPat(k), k<moves+1；
+//   行其余=0）并逐行 FaceDepth 申报——content=f(k) 与局无关 ⇒ append-only
+//   承诺在槽轮转下结构性成立。对照腿=同一命令去掉 --append-own（全量）。
+//   配合 FARM_H2D_DELTA=0 / FARM_H2D_BATCH=1 等环境开关做 A/B；dep 三段
+//   打印（h2d kB/批）为段字节测量面。
 //
 //   --device 多设备组（判决15，可重复；首个替换主设备，后续追加设备组）：
 //     spec = backend[,ep=cuda|dml][,dev=N][,banks=K][,share=W][,slots=S][,model=路径][,engine=路径][,dir=运行时目录]
@@ -24,6 +31,9 @@
 using namespace inferfarm;
 using namespace inferfarm::gomoku;
 
+// --append-mode=fill 的旗标（AdapterFactory=函数指针不可捕获——读全局）
+static bool g_append_fill = false;
+
 int main(int argc, char** argv) {
     FarmConfig cfg;
     cfg.name = "gomoku";
@@ -39,6 +49,8 @@ int main(int argc, char** argv) {
     cfg.model.backend = "cpu";
     cfg.model.cpu = GomokuModelDecl(cfg.slots);
     bool show_board = false;
+    bool append_own = false;
+    const char* append_mode = "hist";
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
             cfg.model.backend = argv[++i];
@@ -107,8 +119,21 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--threads")) cfg.fibers = false;
         else if (!std::strcmp(argv[i], "--census")) cfg.census = true;
         else if (!std::strcmp(argv[i], "--show-board")) show_board = true;
+        else if (!std::strcmp(argv[i], "--append-own")) {
+            cfg.model.append_inputs.push_back("own");
+            append_own = true;
+        }
+        else if (!std::strcmp(argv[i], "--append-mode") && i + 1 < argc) {
+            // hist=深度=moves+1（低利用率：增长段个位数字节/行）
+            // fill=深度=kCells（高利用率：每行整行重写=append 退化为 full 的
+            //   最坏情况，考提交税/聚合收益）
+            append_mode = argv[++i];
+        }
         else { std::printf("未知参数 %s\n", argv[i]); return 2; }
     }
+    // --device 组继承 append 声明（与 population_input 同规）
+    for (auto& d : cfg.devices)
+        d.model.append_inputs = cfg.model.append_inputs;
     if (cfg.model.backend == "ort" && cfg.model.model_path.empty()) {
         std::fprintf(stderr, "[gomoku] ort 后端需 --model <fb.onnx>"
                      "（tools/bake_gomoku_mlp.py 烤制）\n");
@@ -121,7 +146,39 @@ int main(int argc, char** argv) {
     }
     Farm farm;
     if (!farm.Init(cfg)) return 1;
-    double sec = farm.RunLeg(MakeGomokuAdapter, nullptr);
+    // --append-own：包装适配器（own 行=深度前缀模式 + FaceDepth 申报）；
+    // 未开=普通 GomokuAdapter（全量路径，零行为差）。A/B 强制 full 对照=
+    // 同命令 + FARM_H2D_DELTA=0（同适配器同游戏，仅后端回落全量）。
+    double sec;
+    if (append_own) {
+        g_append_fill = !std::strcmp(append_mode, "fill");
+        struct AppendAdapter : GomokuAdapter {
+            explicit AppendAdapter(int chain) : GomokuAdapter(chain) {}
+            static float HistPat(int k) {
+                uint32_t x = 0x9E3779B9u * (uint32_t)(k + 1);
+                x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                return (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+            }
+            void AssembleInto(SlotWriter& slot) override {
+                GomokuAdapter::AssembleInto(slot);
+                float* own = (float*)slot.Row("own", nullptr);
+                if (!own) return;
+                // hist=低利用率（depth=moves+1，行动历史语义）；
+                // fill=高利用率（depth=kCells 恒满=整行重写，最坏情况）
+                const int depth = g_append_fill ? kCells
+                    : (moves + 1 < kCells ? moves + 1 : kCells);
+                for (int k = 0; k < depth; k++) own[k] = HistPat(k);
+                std::memset(own + depth, 0,
+                            (size_t)(kCells - depth) * sizeof(float));
+                slot.FaceDepth("own", depth);
+            }
+        };
+        sec = farm.RunLeg([](int chain, void*) -> GameAdapter* {
+            return new AppendAdapter(chain);   // --append-own 的申报点
+        }, nullptr);
+    } else {
+        sec = farm.RunLeg(MakeGomokuAdapter, nullptr);
+    }
     const FarmTally& t = farm.tally();
     std::printf("[gomoku] RunLeg 返回\n");
     std::fflush(stdout);

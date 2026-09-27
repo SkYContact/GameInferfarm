@@ -22,6 +22,11 @@
 //  G15 绑核（FARM_WORKER_AFFINITY/FARM_SCHED_AFFINITY，2026-09-24）：解析器
 //     规格 + 绑核腿指纹逐位同（调度落位不改算术）+ pinned 探针防空过 + 越
 //     界核号软失败
+//  G16 声明式增量 H2D（判决25，2026-09-27）：append 声明腿 vs 强制全量腿
+//     （FARM_H2D_DELTA=0）同种子逐位同（含指纹——增量漏传必然指纹红）；
+//     复跑同；故意少申报腿=指纹必异 + FARM_H2D_DELTA_DEBUG=1 哨兵计数必增
+//     （牙齿+机器断言面双验）。ort CUDA 专属通道：无工件/无运行时=SKIP
+//     （cpu 后端对声明零反应=full 现状，G1-G15 已覆盖该面）
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/affinity.h"
@@ -39,6 +44,9 @@ using namespace inferfarm;
 using namespace inferfarm::toy;
 
 static int g_fail = 0;
+// G16 适配器形态开关（AdapterFactory=函数指针不可捕获）：0=申报=真深度
+//（正确腿）；1=故意少申报（写 [0,d) 报 d-1=声明漏传——牙齿腿）
+static int g_g16_under = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { std::printf("FAIL: %s（%s:%d）\n", msg, __FILE__, __LINE__); g_fail++; } \
     else std::printf("ok: %s\n", msg); \
@@ -807,6 +815,97 @@ int main() {
 
         TestSetEnv("FARM_WORKER_AFFINITY=");
         TestSetEnv("FARM_SCHED_AFFINITY=");
+    }
+
+    // ---------------- G16：声明式增量 H2D（判决25）----------------
+    // append 面声明（SlotWriter::FaceDepth）经 Farm→Bank→后端 NoteFaceDepth
+    // 全链；后端按 [synced,depth) 段增量传输。深度前缀模式（own[k]=Pat(k)
+    // 与局无关）是 append-only 承诺的结构性成立形态：任意局写 [0,d) 都是同
+    // 一前缀 ⇒ 槽轮转/换局下增长段假设恒真（掼蛋真负载=行动历史天然
+    // append-only，见判决 25 接入指引）。ort CUDA 专属：无工件/运行时=SKIP。
+    {
+        const char* kM16 = "models/gomoku_mlp.fb8.onnx";
+        FILE* mf16 = fopen(kM16, "rb");
+        if (!mf16) {
+            std::printf("SKIP G16: 无 %s（tools/bake_gomoku_mlp.py 烤制）\n", kM16);
+        } else {
+            fclose(mf16);
+            auto g16_leg = [&](bool append, bool* ok) -> unsigned long long {
+                *ok = false;
+                FarmConfig cfg;
+                cfg.name = "g16";
+                cfg.chains = 4;
+                cfg.games = 16;
+                cfg.seed0 = 20260927u;
+                cfg.banks = 2;
+                cfg.slots = 8;
+                cfg.workers = 4;
+                cfg.stagger_ms = 1;
+                cfg.model.backend = "ort";
+                cfg.model.model_path = kM16;
+                if (append) cfg.model.append_inputs.push_back("own");
+                Farm farm;
+                if (!farm.Init(cfg)) return 0;   // *ok 保持 false=上层 SKIP
+                struct Adapter16 : gomoku::GomokuAdapter {
+                    explicit Adapter16(int chain) : GomokuAdapter(chain) {}
+                    static float Pat(int k) {
+                        uint32_t x = 0x9E3779B9u * (uint32_t)(k + 1);
+                        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                        return (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                    }
+                    void AssembleInto(SlotWriter& slot) override {
+                        GomokuAdapter::AssembleInto(slot);   // 棋盘两平面照写
+                        float* own = (float*)slot.Row("own", nullptr);
+                        if (!own) return;
+                        const int depth =
+                            moves + 1 < gomoku::kCells ? moves + 1
+                                                       : gomoku::kCells;
+                        for (int k = 0; k < depth; k++) own[k] = Pat(k);
+                        std::memset(own + depth, 0,
+                                    (size_t)(gomoku::kCells - depth)
+                                        * sizeof(float));
+                        slot.FaceDepth("own",
+                                       g_g16_under && depth > 0 ? depth - 1
+                                                                : depth);
+                    }
+                };
+                farm.RunLeg([](int chain, void*) -> GameAdapter* {
+                    return new Adapter16(chain);
+                }, nullptr);
+                *ok = true;
+                return farm.tally().fingerprint;
+            };
+            bool ok16 = false;
+            // G16a 主门：增量开 vs 强制全量（FARM_H2D_DELTA=0 杀手锏=点名面
+            // 一律回落 full）——同种子逐位同（含指纹）
+            TestSetEnv("FARM_H2D_DELTA=0");
+            unsigned long long fp_full = g16_leg(true, &ok16);
+            TestSetEnv("FARM_H2D_DELTA=");
+            if (!ok16) {
+                std::printf("SKIP G16: ort 农场起失败（无 ORT 运行时？"
+                            "查 FARM_ORT_DIR/FARM_CUDA_DIR/FARM_CUDART_DLL）\n");
+            } else {
+            unsigned long long fp_app = g16_leg(true, &ok16);
+            CHECK(ok16 && fp_app == fp_full,
+                  "G16a append 声明腿==强制全量腿逐位同（含指纹；增量漏传必红）");
+            // G16b 复跑：声明路径自身确定
+            unsigned long long fp_app2 = g16_leg(true, &ok16);
+            CHECK(ok16 && fp_app2 == fp_app, "G16b append 腿复跑逐位同");
+            // G16c 牙齿+哨兵：故意少申报 → 指纹必异；FARM_H2D_DELTA_DEBUG=1
+            // 下哨兵计数必增（影子=设备忠实镜像，少传段=设备与宿主漂移）
+            g_g16_under = 1;   // 牙齿腿：写 [0,d) 报 d-1
+            long long vio16 = OrtDeltaDebugViolations();
+            unsigned long long fp_bad = g16_leg(true, &ok16);
+            CHECK(ok16 && fp_bad != fp_app,
+                  "G16c-1 少申报腿指纹必异（声明漏传不静默=门有牙齿）");
+            TestSetEnv("FARM_H2D_DELTA_DEBUG=1");
+            unsigned long long fp_bad2 = g16_leg(true, &ok16);   // 同违约+哨兵
+            TestSetEnv("FARM_H2D_DELTA_DEBUG=");
+            g_g16_under = 0;
+            CHECK(ok16 && fp_bad2 == fp_bad && OrtDeltaDebugViolations() > vio16,
+                  "G16c-2 哨兵计数必增（FARM_H2D_DELTA_DEBUG=1 机器断言面）");
+            }
+        }
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

@@ -35,6 +35,11 @@ struct InputMeta {
                                  // 整张量=[P, flat_w] 种群权重平面——Claim 不清零/
                                  // 缓存不哈希（代次 gen 已在键）/SubmitBatch 脏旗
                                  // 全量拷（cuda）；dim0=P ≠ slots 合法
+    bool append = false;         // 声明式增量 H2D 面（判决25）：模型配置
+                                 // append_inputs 点名的 append-only 面（后端在
+                                 // 枚举期标记；未点名=full 现状行为）。正确性前提
+                                 // =乘客声明即承诺：行内容演化是前缀增长，depth
+                                 // 递减=换局信号（见 SlotWriter::FaceDepth）
 };
 
 struct OutputMeta {
@@ -98,6 +103,12 @@ struct ModelConfig {
     std::string population_input;     // population 路由（演化，判决16）：模型里种群
                                       // 权重平面的输入名（如 "pop"；空=普通单模型）。
                                       // 配套 Farm::SetPopulation 代际换权重
+    std::vector<std::string> append_inputs;   // 声明式增量 H2D（判决25）：append-only
+                                      // 输入面名单（空=全 full=零行为差；点名面须
+                                      // ≥2 维，dim1=行首维=深度单位）。适配器组装期
+                                      // 经 SlotWriter::FaceDepth 逐行申报有效深度，
+                                      // 后端按 [synced, depth) 段增量传输省 PCIe。
+                                      // 承诺与边界见 FaceDepth 注释
     std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
                                       // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效；backend=="ncnn" 时
@@ -123,6 +134,20 @@ public:
     virtual ~SlotWriter() = default;
     // 返回本槽该输入的行首指针；未知名字返回 nullptr（row_bytes 可空）
     virtual void* Row(const char* name, size_t* row_bytes) = 0;
+    // 声明式增量 H2D（判决25）：组装本行时声明该行该输入面的当前有效深度。
+    //   depth 单位=行首维（dims[1]）条目数，值域 [0, dims[1]]；行字节段
+    //   = [depth 元素之前全有效, 之后全零]——零基组装（Claim 清零）下"未写区
+    //   =0"与该声明互为充要。缺省不实现（适配器从不调用）=零开销，该行该面
+    //   按 full 现状处理。逐行也可混批：同批内部分行声明部分行不声明=声明行
+    //   增量、未声明行整行传输。
+    // **append-only 承诺（乘客声明即承诺）**：声明行跨批的 [0, synced) 前缀
+    //   字节不变（同一局的行动历史增长）；depth 递减=换局信号（新内容自
+    //   [0,depth) 重写+尾部清零）。违反承诺=设备侧旧前缀与宿主漂移——输出
+    //   错而指纹门红，且 FARM_H2D_DELTA_DEBUG=1 哨兵当场报非 0。无法承诺的
+    //   行就别声明（full 兜底永远正确）。实践形态见判决 25 接入指引。
+    virtual void FaceDepth(const char* name, int depth) {
+        (void)name; (void)depth;
+    }
 };
 
 // 收割完成后适配器读自有缓冲——无需框架视图；ApplyResult() 直接读成员即可。

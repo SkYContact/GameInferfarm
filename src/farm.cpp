@@ -454,6 +454,11 @@ bool Farm::DriveDecision(GameAdapter* g, int grp) {
             void* Row(const char* name, size_t* row_bytes) override {
                 return bank->InputRow(b, s, name, row_bytes);
             }
+            // 声明式增量 H2D（判决25）：适配器申报的行深度转交银行→后端。
+            // 适配器不调用=永不触发=零开销（虚函数缺省空实现同门）。
+            void FaceDepth(const char* name, int depth) override {
+                bank->FaceDepth(b, s, name, depth);
+            }
         } w;
         w.bank = bank_;
         w.b = bk;

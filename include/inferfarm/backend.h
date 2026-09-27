@@ -90,6 +90,19 @@ public:
         (void)session;
         return nullptr;
     }
+
+    // 声明式增量 H2D（判决25，可选能力）：组装期申报某槽某输入面的有效深度
+    // （单位/承诺见 types.h SlotWriter::FaceDepth）。缺省=忽略（不实现增量的
+    // 后端对声明零反应，行为=full——声明本身永远安全）。只在 config
+    // append_inputs 点名且后端支持的面上生效。
+    virtual void NoteFaceDepth(void* session, const char* name, int slot, int depth) {
+        (void)session; (void)name; (void)slot; (void)depth;
+    }
+    // 声明会话起点复位（Claim 领槽时调用=该槽声明随新组装作废；漏复位会让
+    // 上一任写手的陈旧声明被本批判读=静默漏传）。缺省=无操作。
+    virtual void ClearFaceDepths(void* session, int slot) {
+        (void)session; (void)slot;
+    }
 };
 
 } // namespace inferfarm

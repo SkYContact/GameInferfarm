@@ -105,6 +105,10 @@ public:
     int n_groups() const { return n_groups_; }
     // 组装直写面：该槽该输入的行首指针（零拷贝——大数组组装期直接写这里）
     void* InputRow(int bank, int slot, const char* name, size_t* row_bytes);
+    // 声明式增量 H2D（判决25）：把适配器申报的行深度转交给该槽所属银行会话
+    // （SlotWriter::FaceDepth 的银行侧落地；后端不实现增量=缺省虚函数零反应）。
+    // 无 append 面的农场=适配器从不调用=零开销。
+    void FaceDepth(int bank, int slot, const char* name, int depth);
     // 组装兜底拷贝：小输入从临时缓冲拷进槽行+行尾清零（YGO 的 scal/act_code
     // 后补路径；dst=Row(name)；rb<bytes 时补零）。
     // 提交+等待：登记 dests → inflight--（完工信号）→ 满座自驱判定 →
