@@ -775,3 +775,40 @@ a3535388ff95061c 与 Windows R3 跨日值逐位同）=跨平台逐位等价首�
 libcudart.so.12 直配）；cudnn/cublas 等 EP 依赖经 `LD_LIBRARY_PATH` 供面
 （wheel 不落系统目录）。ORT 1.30 cuda extras=CUDA13 线解析不可达时 pip
 自动回落 1.26（CUDA12 soname 系）——自洽即用，勿强扭。
+
+## 27. TRT/ncnn 后端 Linux 移植 + 同进程共存限制（2026-09-27，GPU 使用协议首日）
+
+**TRT Linux 面首通（f5c9e71 后续同批）**：trt_backend 加载面 dlopen 移植
+（`FARM_TRT_DIR` 指 libnvinfer.so.10 目录，空=裸名；INTERNAL ABI 符号
+Linux .so 同样导出，nm 实证 10.16.1）。库源=pip `tensorrt-cu12==10.16.1.11`
+（NVIDIA 私有索引 pypi.nvidia.com；tuna 只有元包 stub）；头文件=GitHub
+NVIDIA/TensorRT release/10.16 分支 include/；烤引擎=自写 bake 脚本（现成
+ONNX+OnnxParser，fp32/TF32 关/REFIT 开，无需 torch）。**验收全绿**：
+R2 三项+trt R5 批不变性+R7 refit 五项（换心必变/复采逐位同/二次幂等/假名
+负路径）+TRT 单独 CLI 腿；**R3 跨后端指纹 ort==trt==a3535388ff95061c，与
+Windows 历史值逐位同=三平台逐位等价**。
+
+**同进程共存限制（新坑，gomoku_backend_test 全量跑暴露）**：TRT 推理跑过
+之后（邮箱+批图捕获），同进程后续 ORT CUDA 图捕获热身必炸
+（cudaErrorInvalidValue@Concat；R5 ort/R6 fence inline/R8a 三门红；R1 在
+TRT 之前跑则无恙）。Windows 侧未暴露的原因=ORT wheel 走 cu13、TRT 走
+cu12，soname 分裂=两套 CUDA 运行时天然隔离。**处置**：测试加后端过滤参数
+`gomoku_backend_test [ort|trt]`，两面各自 ALL PASS；生产侧同进程混用
+ORT-CUDA+TRT 推理=不支持的形状（按后端分进程，与 Windows 生产实践一致）。
+
+**ncnn Linux 面（同批移植，进行中）**：ncnn_backend 加载面 dlopen 移植
+（libncnn.so.1；本地源码编译 20260526+Vulkan，系统 glslang 路线，递归浅
+克隆绕 submodule——codeload tarball 不含 submodule，系统 glslang 也绕不开
+其 842 行 submodule 检查）。**ABI 变更警示**：新版 c_api
+`mat_create_external_2d_elem(w,h,data,elemsize,elempack,alloc)` 已无 cstep
+参数——后端表中 `(4,1)` 在新语义下=elemsize 4/elempack 1 恰好正确（歪打
+正着），跨 ncnn 版本的调用面兼容性须重审。32 局腿全绿（fp16/fp32 双档、
+0 故障）；**开放问题=按批数累积的 glibc 堆损坏**（8 链 32 局净、4096 局
+必崩 free(): invalid size，检测点在 BankTryRotate 只是发现者；ort 同机制
+4700 批干净=ncnn 路径专属），gdb 栈顶在框架线程、肇事者疑在 ncnn 内部
+（非插桩库），排障续。退出期 smallbin 报警与 Windows 上游 #2733 同族。
+
+**GPU 使用协议（本机新法）**：所有 GPU 作业先 `~/gpu_lock.sh acquire` 拿锁
+（mkdir 原子+时限可夺+60s 宽限），吞吐数字仅"锁内测得"可引用——判决 26
+的数字系协议立前所测（当时卡上无并发进程、风险理论性），入表读数以锁内
+复验为准。

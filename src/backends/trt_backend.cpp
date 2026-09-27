@@ -36,6 +36,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>   // dlopen/dlsym：Linux 面（2026-09-27 移植）
 #endif
 
 #if defined(INFERFARM_WITH_TRT)
@@ -91,7 +93,11 @@ public:
     }
 };
 static TrtLogger g_trt_log;
+#ifdef _WIN32
 static HMODULE g_trt_dll = nullptr;
+#else
+static void* g_trt_dll = nullptr;
+#endif
 
 struct TrtEngineCache {
     std::string path;
@@ -107,7 +113,8 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
         : (td && *td ? td : "");
     if (trt_dir.empty())
         std::fprintf(stderr, "[trt] 未设 ModelConfig.trt_dir / env FARM_TRT_DIR"
-                     "——nvinfer_10.dll 走系统 DLL 搜索（加载失败先查这里）\n");
+                     "——nvinfer 运行库走系统库搜索（加载失败先查这里）\n");
+#ifdef _WIN32
     // PATH 前插（nvinfer 的 cublas/cudart 依赖解析）——与 ORT 同款手法
     {
         char buf[8192];
@@ -118,13 +125,22 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
         if (!cuda_dir.empty()) np = cuda_dir + ";" + np;
         SetEnvironmentVariableA("PATH", np.c_str());
     }
+#else
+    // Linux：运行期改 LD_LIBRARY_PATH 不影响本进程 dlopen 搜索（glibc 启动
+    // 时快照）——nvinfer 依赖（cublas/cudart 等）须经进程启动时的
+    // LD_LIBRARY_PATH（见 farm_env.sh）/ldconfig 缓存供面。
+#endif
     // TF32 纪律：烤制端 NVIDIA_TF32_OVERRIDE=0，运行端必须一致（Myelin 逐字
     // 比对 build/execution 两侧值，不一致拒建 context）。未设=自设 0；显式
     // 设 1=拒绝启动（防静默分叉）。
     {
         const char* tf = getenv("NVIDIA_TF32_OVERRIDE");
         if (!tf || !*tf) {
+#ifdef _WIN32
             _putenv_s("NVIDIA_TF32_OVERRIDE", "0");
+#else
+            setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+#endif
             std::fprintf(stderr, "[trt] NVIDIA_TF32_OVERRIDE 未设，已自设 0（与烤制端一致）\n");
         } else if (std::strcmp(tf, "0") != 0) {
             std::fprintf(stderr, "[trt] NVIDIA_TF32_OVERRIDE=%s 与烤制端(0)不一致，"
@@ -138,6 +154,7 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
     // 目录空：裸名加载（Windows 标准搜索：应用目录→系统32→PATH——语义同
     // cudart_dyn 空 dir）。此前空目录曾拼出 "\nvinfer_10.dll" 根路径必败
     // （对外反馈 2026-09-24）。
+#ifdef _WIN32
     HMODULE h;
     if (trt_dir.empty()) {
         h = LoadLibraryA("nvinfer_10.dll");
@@ -151,7 +168,20 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
             std::fprintf(stderr, "[trt] LoadLibrary %s 失败 GLE=%lu\n",
                          p.c_str(), GetLastError());
     }
+#else
+    // Linux 面（2026-09-27 移植）：dlopen libnvinfer.so.10；目录空=裸名
+    // （ld.so 搜索，语义同 cudart_dyn 空 dir）。INTERNAL ABI 符号 Linux .so
+    // 同样导出（nm -D 实证 10.16.1）。
+    void* h;
+    std::string p = trt_dir.empty() ? std::string("libnvinfer.so.10")
+                                    : trt_dir + "/libnvinfer.so.10";
+    h = ::dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h)
+        std::fprintf(stderr, "[trt] dlopen %s 失败：%s（显式设 FARM_TRT_DIR"
+                     " 指向 libnvinfer.so.10 所在目录）\n", p.c_str(), dlerror());
+#endif
     if (!h) return false;
+#ifdef _WIN32
     g_trt_create_runtime =
         (void* (*)(void*, int32_t))GetProcAddress(h, "createInferRuntime_INTERNAL");
     if (!g_trt_create_runtime) {
@@ -160,6 +190,16 @@ static bool LoadTrtLib(const ModelConfig& cfg) {
     }
     g_trt_create_refitter =
         (void* (*)(void*, void*, int32_t))GetProcAddress(h, "createInferRefitter_INTERNAL");
+#else
+    g_trt_create_runtime =
+        (void* (*)(void*, int32_t))::dlsym(h, "createInferRuntime_INTERNAL");
+    if (!g_trt_create_runtime) {
+        std::fprintf(stderr, "[trt] libnvinfer.so.10 缺导出符号 createInferRuntime_INTERNAL\n");
+        return false;
+    }
+    g_trt_create_refitter =
+        (void* (*)(void*, void*, int32_t))::dlsym(h, "createInferRefitter_INTERNAL");
+#endif
     g_trt_dll = h;
     return true;
 }

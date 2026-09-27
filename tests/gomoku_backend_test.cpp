@@ -85,14 +85,20 @@ static R Leg(const char* backend, const char* model, const char* engine, int ban
     return {farm.tally().fingerprint, farm.tally().games_done, sec};
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::fprintf(stderr, "[test] main 进入\n");
     std::fflush(stderr);
+    // 可选后端过滤（2026-09-27）：gomoku_backend_test [ort|trt]
+    // 缺省=全量（原行为）。动机=Linux 实测同进程 TRT 推理会污染其后的
+    // ORT CUDA 图捕获热身（cudaErrorInvalidValue@Concat，判决 27）——
+    // 两面各跑各的 ALL PASS，共存限制由文档承载。
+    const char* only = (argc > 1) ? argv[1] : nullptr;
+    if (only) std::printf("=== 后端过滤：仅 %s 面 ===\n", only);
     const char* kOnnx = "models/gomoku_mlp.fb8.onnx";
     const char* kTrt = "models/gomoku_mlp.fb8.trt";
     std::printf("=== 真模型可选门（工件缺席=SKIP）===\n");
-    bool have_ort = FileExists(kOnnx);
-    bool have_trt = FileExists(kTrt);
+    bool have_ort = FileExists(kOnnx) && !(only && !std::strcmp(only, "trt"));
+    bool have_trt = FileExists(kTrt) && !(only && !std::strcmp(only, "ort"));
     R ort{}, ort2{}, orti{}, trt{}, trt2{}, trti{};
     if (have_ort) {
         ort = Leg("ort", kOnnx, nullptr, 2);
@@ -265,7 +271,8 @@ int main() {
         } else {
             std::printf("SKIP R5 ort: 无 %s\n", kOnnx);
         }
-        if (InferBackend* trt_be = CreateTrtBackend()) {
+        InferBackend* trt_be = have_trt ? CreateTrtBackend() : nullptr;
+        if (trt_be) {
             ModelConfig m;
             m.backend = "trt";
             m.engine_path = kTrt;
