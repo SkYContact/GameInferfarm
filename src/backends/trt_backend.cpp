@@ -25,7 +25,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(_MSC_VER)
 #include <intrin.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>   // _mm_lfence/_mm_pause 的 GCC/Clang 面（用点=TRT 门内）
+#endif
 #include <mutex>
 #include <string>
 #include <vector>

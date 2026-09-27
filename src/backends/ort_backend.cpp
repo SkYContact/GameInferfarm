@@ -53,6 +53,74 @@
 
 #ifdef _WIN32
 #include <windows.h>
+namespace inferfarm {
+namespace ortplt {
+// ---- 平台垫片（Windows=Win32 原样；POSIX=dlopen/无名信号量，Linux 移植
+// 2026-09-27）。两侧同符号，调用点不设分叉。----
+// CUDA host 回调的调用约定（x64 Win=唯一约定，POSIX=空；两义等价）
+#define FI_STDCALL __stdcall
+using HMODULE = ::HMODULE;
+inline HMODULE LibLoad(const char* p) { return ::LoadLibraryA(p); }
+inline void* LibSym(HMODULE h, const char* n) {
+    return (void*)::GetProcAddress(h, n);
+}
+inline unsigned long LastErr() { return ::GetLastError(); }
+// fence 完成信号量（FARM_ORT_ASYNC=3）：Win32 semaphore 原样
+inline void* FenceSemCreate() {
+    return (void*)::CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
+}
+inline bool FenceSemWait(void* sem, unsigned timeout_ms) {
+    return ::WaitForSingleObject((HANDLE)sem, timeout_ms) == WAIT_OBJECT_0;
+}
+inline void FenceSemPost(void* sem) {
+    ::ReleaseSemaphore((HANDLE)sem, 1, nullptr);
+}
+inline void FenceSemClose(void* sem) { ::CloseHandle((HANDLE)sem); }
+} // namespace ortplt
+} // namespace inferfarm
+#else
+// POSIX 降级面（Linux 移植 2026-09-27）：
+//   · 动态装载=dlopen/dlsym（libonnxruntime.so；Windows 的 PATH 前插/基名
+//     改名双 ORT 共存律是 Windows 专属病——System32 先于 PATH+按基名驻留
+//     去重，POSIX 无此症，双 ORT 共存面暂未上 POSIX，见 LoadLib 注记）
+//   · fence 完成信号量=无名 sem_t 堆置（sem_timedwait 100ms 烟雾等待）
+//   · DML EP=Windows 专属（DirectML），POSIX 面配置级拒绝
+#include <dlfcn.h>
+#include <errno.h>
+#include <semaphore.h>
+#include <time.h>
+namespace inferfarm {
+namespace ortplt {
+#define FI_STDCALL
+using HMODULE = void*;
+inline HMODULE LibLoad(const char* p) {
+    return (HMODULE)::dlopen(p, RTLD_NOW | RTLD_LOCAL);
+}
+inline void* LibSym(HMODULE h, const char* n) { return ::dlsym(h, n); }
+inline unsigned long LastErr() { return (unsigned long)::errno; }
+inline void* FenceSemCreate() {
+    ::sem_t* s = new ::sem_t;
+    if (::sem_init(s, 0, 0) != 0) { delete s; return nullptr; }
+    return s;
+}
+inline bool FenceSemWait(void* sem, unsigned timeout_ms) {
+    ::timespec ts;
+    ::clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(timeout_ms / 1000);
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return ::sem_timedwait((::sem_t*)sem, &ts) == 0;
+}
+inline void FenceSemPost(void* sem) { ::sem_post((::sem_t*)sem); }
+inline void FenceSemClose(void* sem) {
+    ::sem_destroy((::sem_t*)sem);
+    delete (::sem_t*)sem;
+}
+} // namespace ortplt
+} // namespace inferfarm
 #endif
 
 namespace inferfarm {
@@ -61,7 +129,7 @@ static Cudart g_cu;   // 进程一份（cudart 与 ORT 实例无关；DML 实例
 
 // DLL 注册表：双 ORT 共存改名律（基名冲突=拷贝改名再装；依赖 PATH 前插）
 static std::mutex g_ort_dll_mx;
-struct OrtDllRec { std::string base; std::string dir; HMODULE h; };
+struct OrtDllRec { std::string base; std::string dir; ortplt::HMODULE h; };
 static std::vector<OrtDllRec> g_ort_dlls;
 static std::atomic<int> g_ort_dll_seq{0};
 
@@ -214,10 +282,10 @@ struct FenceCbCtx {
     void* sem = nullptr;
     std::atomic<bool>* done = nullptr;
 };
-static void __stdcall FenceReleaseCb(void* p) {
+static void FI_STDCALL FenceReleaseCb(void* p) {
     FenceCbCtx* c = (FenceCbCtx*)p;
     c->done->store(true, std::memory_order_release);
-    ReleaseSemaphore((HANDLE)c->sem, 1, nullptr);
+    ortplt::FenceSemPost(c->sem);
 }
 
 static OrtStatusPtr FenceCreateKernel(const OrtCustomOp*, const OrtApi* api,
@@ -311,7 +379,7 @@ struct OrtOut {
     OrtValue* val = nullptr;   // 交 iob 钉住（进程寿命）
 };
 struct OrtSess {
-    HMODULE dll = nullptr;      // 持引用（进程寿命不卸）
+    ortplt::HMODULE dll = nullptr;   // 持引用（进程寿命不卸；POSIX 面不 dlclose）
     const OrtApi* api = nullptr;   // 所属实例的 api（实例终身不毁=指针终身有效）
     OrtEnv* env = nullptr;
     OrtSession* sess = nullptr;
@@ -475,7 +543,7 @@ public:
                 ok = g_cu.LaunchHostFunc(s->fence_stream, &FenceReleaseCb,
                                          &s->fence_cb_ctx) == 0;
             if (ok) {
-                ok = WaitForSingleObject(s->fence_sem, 100) == WAIT_OBJECT_0;
+                ok = ortplt::FenceSemWait(s->fence_sem, 100);
                 g_cu.DeviceSynchronize();
             }
             if (!ok) {
@@ -553,7 +621,7 @@ public:
         if (s->iob) a->ReleaseIoBinding(s->iob);
         if (s->ro) a->ReleaseRunOptions(s->ro);
         if (s->event && g_cu.EventDestroy) g_cu.EventDestroy(s->event);
-        if (s->fence_sem) CloseHandle(s->fence_sem);   // fence 完成信号量（Win32）
+        if (s->fence_sem) ortplt::FenceSemClose(s->fence_sem);   // fence 完成信号量
         // （=2 用户流与 fence 桥接的事件均 host 自建——此处统一销毁）
         if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
         for (auto& i : s->ins) if (i.val) a->ReleaseValue(i.val);
@@ -565,8 +633,14 @@ public:
         if (s->env && !SharedEnv()) a->ReleaseEnv(s->env);   // 共享 env=进程寿命，不释放
         if (s->bind_mem) a->ReleaseMemoryInfo(s->bind_mem);
         if (s->dml) {
+#ifdef _WIN32
             if (s->in_h_arena) VirtualFree(s->in_h_arena, 0, MEM_RELEASE);
             if (s->out_h_arena) VirtualFree(s->out_h_arena, 0, MEM_RELEASE);
+#else
+            // POSIX 不可达（DML 会话建不出来）；防御面 free 对齐分配
+            if (s->in_h_arena) std::free(s->in_h_arena);
+            if (s->out_h_arena) std::free(s->out_h_arena);
+#endif
         } else {
             if (s->in_h_arena) g_cu.FreeHost(s->in_h_arena);
             if (s->in_d_arena) g_cu.Free(s->in_d_arena);
@@ -838,7 +912,7 @@ public:
     }
 
 private:
-    HMODULE dll_ = nullptr;
+    ortplt::HMODULE dll_ = nullptr;   // 持引用（进程寿命不卸；POSIX 不 dlclose）
     const OrtApi* api_ = nullptr;
     std::string ver_ = "?";
     std::string dll_dir_;
@@ -858,8 +932,11 @@ private:
             : (cd && *cd ? cd : "");
         if (ort_dir.empty())
             std::fprintf(stderr, "[ort] 未设 ModelConfig.ort_dir / env FARM_ORT_DIR"
-                         "——onnxruntime.dll 走系统 DLL 搜索（加载失败先查这里）\n");
+                         "——ORT 动态库走系统库搜索（加载失败先查这里）\n");
         std::lock_guard<std::mutex> lk(g_ort_dll_mx);
+        // 库基名（两平台各自的原生命名；注册表键=基名+目录）
+#ifdef _WIN32
+        std::string base = ToLower("onnxruntime.dll");
         // PATH 前插（每目录一次；onnxruntime 的 cudart/cublas/DML 依赖解析）
         {
             char old_path[8192];
@@ -871,8 +948,7 @@ private:
                 np = cuda_dir + ";" + np;
             SetEnvironmentVariableA("PATH", np.c_str());
         }
-        std::string base = ToLower("onnxruntime.dll");
-        HMODULE h = nullptr;
+        ortplt::HMODULE h = nullptr;
         std::string load_path;
         for (auto& r : g_ort_dlls)
             if (r.base == base) {
@@ -887,7 +963,7 @@ private:
                 if (!CopyFileA((ort_dir + "\\onnxruntime.dll").c_str(),
                                load_path.c_str(), FALSE)) {
                     std::fprintf(stderr, "[ort] 基名冲突改名拷贝失败 GLE=%lu（%s → %s）\n",
-                                 GetLastError(), ort_dir.c_str(), load_path.c_str());
+                                 ortplt::LastErr(), ort_dir.c_str(), load_path.c_str());
                     return false;
                 }
                 std::fprintf(stderr, "[ort] 双 ORT 共存：另一 onnxruntime.dll 已驻留，"
@@ -903,14 +979,36 @@ private:
             if (load_path.empty())
                 load_path = ort_dir.empty() ? "onnxruntime.dll"
                                             : ort_dir + "\\onnxruntime.dll";
-            h = LoadLibraryA(load_path.c_str());
+            h = ortplt::LibLoad(load_path.c_str());
         }
         if (!h) {
             std::fprintf(stderr, "[ort] LoadLibrary %s 失败 GLE=%lu\n",
-                         load_path.c_str(), GetLastError());
+                         load_path.c_str(), ortplt::LastErr());
             return false;
         }
-        auto fn = (const OrtApiBase*(ORT_API_CALL*)())GetProcAddress(h, "OrtGetApiBase");
+#else
+        // POSIX 降级点：无 PATH 前插/基名改名拷贝（Windows 专属病：System32
+        // 先于 PATH + 按基名驻留去重；POSIX 依赖解析走 ld.so 搜索路径/rpath，
+        // FARM_ORT_DIR 即 dlopen 全路径）。CUDA 依赖（libtorch 的 libcudart）
+        // 需已在 ld 搜索路径（pip 包 lib 目录不自动进——CI/部署注意）。
+        std::string base = ToLower("libonnxruntime.so");
+        ortplt::HMODULE h = nullptr;
+        std::string load_path = ort_dir.empty() ? std::string("libonnxruntime.so")
+                                                : ort_dir + "/libonnxruntime.so";
+        for (auto& r : g_ort_dlls)
+            if (r.base == base && ToLower(r.dir) == ToLower(ort_dir)) {
+                h = r.h;
+                break;
+            }
+        if (!h) h = ortplt::LibLoad(load_path.c_str());
+        if (!h) {
+            std::fprintf(stderr, "[ort] dlopen %s 失败：%s（显式设 FARM_ORT_DIR"
+                         " 指向 libonnxruntime.so 所在目录）\n",
+                         load_path.c_str(), ::dlerror());
+            return false;
+        }
+#endif
+        auto fn = (const OrtApiBase*(ORT_API_CALL*)())ortplt::LibSym(h, "OrtGetApiBase");
         if (!fn) {
             std::fprintf(stderr, "[ort] DLL 无 OrtGetApiBase\n");
             return false;
@@ -1076,6 +1174,7 @@ private:
         a->SetInterOpNumThreads(opts, 1);
         a->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL);
         if (dml) {
+#ifdef _WIN32
             // ---- DML EP（AMD/核显路线）：挂 DirectML，device_id=适配器序号 ----
             OrtDmlAppendFn dml_append = (OrtDmlAppendFn)GetProcAddress(
                 dll_, "OrtSessionOptionsAppendExecutionProvider_DML");
@@ -1098,6 +1197,15 @@ private:
                 return nullptr;
             }
             s->graph_on = false;
+#else
+            // POSIX 降级点：DML EP=DirectML=Windows 专属（dlopen 面无此导出），
+            // 配置级 fail fast 指路，不静默降级到 CPU（后端选型是调用方的决定）。
+            std::fprintf(stderr, "[ort] ort_ep=dml 仅 Windows 构建可用（DirectML "
+                         "是 Windows 专属 EP）；本面请选 cpu/cuda 路线\n");
+            a->ReleaseSessionOptions(opts);
+            DestroySession(s);
+            return nullptr;
+#endif
         } else {
             // ---- CUDA EP（+CUDA Graph——KV 串与 python providers=
             // {"enable_cuda_graph":"1"} 同义）。图仅银行会话开（PerThreadContext
@@ -1130,7 +1238,7 @@ private:
                 // 事件族符号缺席=回落同步。
                 if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
                 s->fence = true;
-                s->fence_sem = CreateSemaphoreA(nullptr, 0, 0x7FFFFFFF, nullptr);
+                s->fence_sem = ortplt::FenceSemCreate();
                 if (s->fence_sem) {
                     s->fence_cb_ctx.sem = s->fence_sem;
                     s->fence_cb_ctx.done = &s->flight_done;
@@ -1383,6 +1491,7 @@ private:
             s->hb_attridx.resize(s->ins.size());
         }
         if (dml) {
+#ifdef _WIN32
             s->in_d_bytes = 0;
             s->in_h_arena = VirtualAlloc(nullptr, s->in_h_bytes ? s->in_h_bytes : 1,
                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1392,6 +1501,11 @@ private:
                 DestroySession(s);
                 return nullptr;
             }
+#else
+            // POSIX 不可达（DML 配置级拒绝于上方）——防御性留位
+            DestroySession(s);
+            return nullptr;
+#endif
         } else {
             s->in_d_bytes = off;
             if (g_cu.SetDevice) g_cu.SetDevice(cfg.device_id);
@@ -1435,6 +1549,7 @@ private:
         }
         s->out_h_bytes = off;
         if (dml) {
+#ifdef _WIN32
             s->out_d_bytes = 0;
             s->out_h_arena = VirtualAlloc(nullptr, s->out_h_bytes ? s->out_h_bytes : 1,
                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1444,6 +1559,11 @@ private:
                 DestroySession(s);
                 return nullptr;
             }
+#else
+            // POSIX 不可达（DML 配置级拒绝于上方）——防御性留位
+            DestroySession(s);
+            return nullptr;
+#endif
         } else {
             s->out_d_bytes = off;
             if (g_cu.HostAlloc(&s->out_h_arena, s->out_h_bytes, 0)

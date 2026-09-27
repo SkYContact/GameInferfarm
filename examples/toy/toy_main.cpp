@@ -2,6 +2,7 @@
 // env 旋钮全可用（FARM_CENSUS=1 看取证层）。
 #include "toy_adapter.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 using namespace inferfarm;

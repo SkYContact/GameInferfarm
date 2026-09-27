@@ -822,6 +822,7 @@ static void BankLoop(BankScheduler::Impl& I) {
                     if (rem < 0.02) rem = 0.02;
                     if (rem < wait_ms) wait_ms = rem;
                 }
+#ifdef _WIN32
                 if (I.hr_mode) {
                     // HR 路径：WMO 等 [HR 定时器(相对 due=wait_ms) + 唤醒事件]。
                     // 醒因不重要——循环体自带全量状态复查，假唤醒无害；
@@ -849,6 +850,12 @@ static void BankLoop(BankScheduler::Impl& I) {
                 } else {
                     cv_long_wait(wait_ms);
                 }
+#else
+                // POSIX 降级点：HR waitable timer 等待面（FARM_BANK_HRTIMER，
+                // 判决 20）未上非 Windows——hr_mode 恒 false（Init 创建段
+                // 同旗标守卫），恒走 cv 量子路（判决 3 缺省档原样）。
+                cv_long_wait(wait_ms);
+#endif
             } else if (I.spin == 1) {
                 SpinPause();   // 纯轮询：量子彻底不沾，忙时独烧调度台核
             } else {
@@ -1117,16 +1124,22 @@ void BankScheduler::Shutdown() {
         I.stop.store(true);
         I.cv.notify_all();
     }
+#ifdef _WIN32
     if (I.notify_sem) ReleaseSemaphore(I.notify_sem, 1, nullptr);   // 唤醒 WMO
+#endif
     if (I.disp.joinable()) I.disp.join();
     for (auto& b : I.banks)
         if (b.sess) {
             b.be->DestroySession(b.sess);
             b.sess = nullptr;
         }
+#ifdef _WIN32
+    // 内核等待对象（通知信号量/HR 定时器/唤醒事件）=Windows 面专属；POSIX
+    // 面这些指针恒 null（Init 创建段同旗标守卫），段整体不参与编译。
     if (I.notify_sem) { CloseHandle(I.notify_sem); I.notify_sem = nullptr; }
     if (I.hr_timer) { CloseHandle(I.hr_timer); I.hr_timer = nullptr; }
     if (I.wake_ev) { CloseHandle(I.wake_ev); I.wake_ev = nullptr; }
+#endif
     delete impl_;
     impl_ = nullptr;
     banks_ = 0;

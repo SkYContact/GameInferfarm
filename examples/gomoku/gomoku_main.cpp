@@ -16,6 +16,7 @@
 // 生成——确定性）。三后端同架构；指纹只在与自身同后端双腿间可比。
 #include "gomoku_adapter.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 

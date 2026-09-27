@@ -66,9 +66,20 @@ add_library(inferfarm STATIC
     src/backends/ncnn_backend.cpp
 )
 if (MSVC)
-    # fcontext 后端切换体（MASM64）；非 MSVC=工厂返回 nullptr 回退 winfiber
+    # fcontext 后端切换体（MASM64；Windows x64 ABI 面，src/fcontext.asm）
     enable_language(ASM_MASM)
     target_sources(inferfarm PRIVATE src/fcontext.asm)
+elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    # fcontext 后端切换体（GNU as；SysV AMD64 ELF 面，src/fcontext_sysv.S
+    # ——Linux x64 移植路，判决 24 POSIX 路线）。.S 需预处理（__CET__ 门）
+    # ⇒ ASM 编译器钉到 C 编译器（gcc/clang 驱动对 .S 先跑 cpp；裸 as 会把
+    # 预处理行当注释吞掉）。其余平台（含 macOS Mach-O）不编译切换体，
+    # 工厂返回 nullptr → 后端选择层回退报错（见 fiber_backend.cpp）。
+    if(NOT CMAKE_ASM_COMPILER)
+        set(CMAKE_ASM_COMPILER "${CMAKE_C_COMPILER}")
+    endif()
+    enable_language(ASM)
+    target_sources(inferfarm PRIVATE src/fcontext_sysv.S)
 endif()
 if (INFERFARM_CORO20)
     target_compile_definitions(inferfarm PRIVATE INFERFARM_CORO20=1)
@@ -84,6 +95,9 @@ if (WIN32)
     target_link_libraries(inferfarm PRIVATE winmm)   # timeBeginPeriod(1)
 endif()
 target_link_libraries(inferfarm PRIVATE Threads::Threads)
+if (NOT WIN32)
+    target_link_libraries(inferfarm PRIVATE ${CMAKE_DL_LIBS})   # ort dlopen 面
+endif()
 if (MSVC)
     target_compile_options(inferfarm PRIVATE /W3)
 else()
@@ -102,8 +116,12 @@ if (INFERFARM_BUILD_EXAMPLES)
     add_executable(gomoku examples/gomoku/gomoku_main.cpp)
     target_link_libraries(gomoku PRIVATE inferfarm)
 
-    add_executable(othello examples/othello/othello_main.cpp)
-    target_link_libraries(othello PRIVATE inferfarm)
+    # othello：源码用 Win32 控制台 I/O（io.h/_kbhit），且在途维护中——
+    # 构建面先门到 Windows（源码零改动，2026-09-27 Linux 移植批注记）
+    if (WIN32)
+        add_executable(othello examples/othello/othello_main.cpp)
+        target_link_libraries(othello PRIVATE inferfarm)
+    endif()
 endif()
 
 if (INFERFARM_BUILD_TESTS)

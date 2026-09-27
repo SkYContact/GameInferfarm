@@ -1,17 +1,43 @@
 // census.cpp — 取证层实现（fiber_census_contract 2026-09-21 的通用化抽取）
 // 纪律：全原子计数器+专职低频打印线程（100ms/行），不在热路径加锁。
 #include "inferfarm/census.h"
+#include "platform_compat.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#else
+#include <sys/resource.h>
+#include <sys/time.h>
 #endif
 
 namespace inferfarm {
+
+// 进程 CPU 累计（打印线程 pcpu 差分尺；Windows=GetProcessTimes 内核+用户，
+// POSIX=getrusage(RUSAGE_SELF) 用户+系统——同口径）。返回秒。
+static double ProcCpuSeconds() {
+#ifdef _WIN32
+    FILETIME ft, fe, fk, fu;
+    if (!GetProcessTimes(GetCurrentProcess(), &ft, &fe, &fk, &fu)) return 0;
+    ULARGE_INTEGER k, u;
+    k.LowPart = fk.dwLowDateTime; k.HighPart = fk.dwHighDateTime;
+    u.LowPart = fu.dwLowDateTime; u.HighPart = fu.dwHighDateTime;
+    return (double)(k.QuadPart + u.QuadPart) / 1e7;   // 100ns → 秒
+#else
+    rusage ru;
+    std::memset(&ru, 0, sizeof ru);
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+    return (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6
+         + (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+#endif
+}
 
 static Census* g_census = nullptr;
 
@@ -19,10 +45,8 @@ Census* CensusGlobal() {
     if (!g_census) {
         static Census c;
         g_census = &c;
-#ifdef _WIN32
         // 默认关；env 选通（各宿主也可显式置 on）
         if (const char* e = getenv("FARM_CENSUS")) c.on = atoi(e) == 1;
-#endif
     }
     return g_census;
 }
@@ -104,24 +128,15 @@ struct CensusPrinter {
 
 static void CensusPrinterLoop(Census* c, std::chrono::steady_clock::time_point t0,
                               std::atomic<bool>* stop, int n_workers) {
-    c->tid_printer = GetCurrentThreadId();
+    c->tid_printer = CurrentTid();
     long long prev[Census::kHistN] = {};
     std::vector<uint64_t> prev_busy, prev_idle;
     prev_busy.assign((size_t)n_workers, 0);
     prev_idle.assign((size_t)n_workers, 0);
-    double prev_pcpu = 0;
-    {
-        FILETIME ft, fe, fk, fu;
-        if (GetProcessTimes(GetCurrentProcess(), &ft, &fe, &fk, &fu)) {
-            ULARGE_INTEGER k, u;
-            k.LowPart = fk.dwLowDateTime; k.HighPart = fk.dwHighDateTime;
-            u.LowPart = fu.dwLowDateTime; u.HighPart = fu.dwHighDateTime;
-            prev_pcpu = (double)(k.QuadPart + u.QuadPart) / 10000.0;
-        }
-    }
+    double prev_pcpu = ProcCpuSeconds();
     int line = 0;
     while (!stop->load()) {
-        Sleep(100);
+        FiSleepMs(100);
         if (stop->load()) break;
         line++;
         const int lv = c->live.load();
@@ -168,19 +183,11 @@ static void CensusPrinterLoop(Census* c, std::chrono::steady_clock::time_point t
                 bp.push_back(db + di > 0 ? 100.0 * (double)db / (double)(db + di) : 0.0);
             }
             std::sort(bp.begin(), bp.end());
-            double pcpu = 0;
-            {
-                FILETIME ft, fe, fk, fu;
-                if (GetProcessTimes(GetCurrentProcess(), &ft, &fe, &fk, &fu)) {
-                    ULARGE_INTEGER k, u;
-                    k.LowPart = fk.dwLowDateTime; k.HighPart = fk.dwHighDateTime;
-                    u.LowPart = fu.dwLowDateTime; u.HighPart = fu.dwHighDateTime;
-                    pcpu = (double)(k.QuadPart + u.QuadPart) / 10000.0;
-                }
-            }
+            const double pcpu = ProcCpuSeconds();
             std::printf("[fibq] busy%%[min..max/med]=%.0f..%.0f/%.0f pcpu=%.1fms/100ms "
                         "(srv-lat 边界: submit→回信完成；rev=投递→工人取走)\n",
-                        bp.front(), bp.back(), bp[bp.size() / 2], pcpu - prev_pcpu);
+                        bp.front(), bp.back(), bp[bp.size() / 2],
+                        (pcpu - prev_pcpu) * 1000.0);
             prev_pcpu = pcpu;
             std::fflush(stdout);
         }
@@ -323,6 +330,11 @@ void Census::DumpThreads() {
                     (unsigned long)r.tid, r.grp, r.cpu);
     }
     std::fflush(stdout);
+#else
+    // POSIX 降级点：线程级 CPU 普查（CreateToolhelp32Snapshot 通道）未上
+    // 非 Windows——进程级 pcpu（getrusage）与工人忙闲账仍在（StartPrinter
+    // 打印行）；分组普查（驱动/EP 线程识别）待接 /proc/<pid>/task 统计。
+    (void)0;
 #endif
 }
 

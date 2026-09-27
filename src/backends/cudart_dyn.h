@@ -1,11 +1,18 @@
 // cudart_dyn.h — cudart 动态通道（ort/trt 后端共用；ai_infer.cpp LoadCudart
-// 的抽取）。只借 memcpy 家+分配+流+图；全部 GetProcAddress，零链接依赖。
+// 的抽取）。只借 memcpy 家+分配+流+图；全部动态符号查找，零链接依赖。
 // kind: 1=H2D 2=D2H（cudaMemcpyKind 值）。
+// 两平台装载面（2026-09-27 Linux 移植）：Windows=LoadLibraryA/GetProcAddress；
+// POSIX=dlopen/dlsym（libcudart.so；目录语义 / 拼接，缺省基名 libcudart.so.12
+// ——env FARM_CUDART_DLL 可覆写，同 Windows 面）。符号绑定块两平台共用。
 #pragma once
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #ifdef _WIN32
 #include <windows.h>
-#include <cstdio>
-#include <string>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace inferfarm {
 
@@ -53,23 +60,10 @@ struct Cudart {
 
     bool ok = false;
 
-    // cuda_dir: cudart 所在目录（空=PATH 解析）；dll 文件名=env FARM_CUDART_DLL
-    // （缺省 cudart64_12.dll——ORT wheel 可能是 CUDA13 构建，与 torch/lib 的
-    // cudart12 混跑=双 runtime 进程，流归属/捕获行为会失真；复验时指 13）
-    bool Load(const std::string& cuda_dir) {
-        if (ok) return true;
-        const char* dll_env = getenv("FARM_CUDART_DLL");
-        std::string dll = dll_env && *dll_env ? dll_env : "cudart64_12.dll";
-        std::string p = cuda_dir.empty() ? dll : cuda_dir + "\\" + dll;
-        HMODULE h = cuda_dir.empty() ? LoadLibraryA(p.c_str())
-                                     : LoadLibraryExA(p.c_str(), NULL,
-                                                      LOAD_WITH_ALTERED_SEARCH_PATH);
-        if (!h) {
-            std::fprintf(stderr, "[cudart] LoadLibrary %s 失败 GLE=%lu\n",
-                         p.c_str(), GetLastError());
-            return false;
-        }
-        auto g = [&](const char* n) { return (void*)GetProcAddress(h, n); };
+    // 符号绑定块（两平台共用；g=按名取符号的原语——模板形参以兼容
+    // Windows/POSIX 各自的 GetProcAddress/dlsym 捕获 lambda）
+    template <class G>
+    void Bind(G g) {
         Malloc = (void* (*)(void**, size_t))g("cudaMalloc");
         Free = (int (*)(void*))g("cudaFree");
         HostAlloc = (int (*)(void**, size_t, unsigned int))g("cudaHostAlloc");
@@ -102,6 +96,27 @@ struct Cudart {
             g("cudaMemcpyBatchAsync");
         LaunchHostFunc = (int (*)(void*, void (*)(void*), void*))g("cudaLaunchHostFunc");
         StreamIsCapturing = (int (*)(void*, int*))g("cudaStreamIsCapturing");
+    }
+
+#ifdef _WIN32
+    // cuda_dir: cudart 所在目录（空=PATH 解析）；dll 文件名=env FARM_CUDART_DLL
+    // （缺省 cudart64_12.dll——ORT wheel 可能是 CUDA13 构建，与 torch/lib 的
+    // cudart12 混跑=双 runtime 进程，流归属/捕获行为会失真；复验时指 13）
+    bool Load(const std::string& cuda_dir) {
+        if (ok) return true;
+        const char* dll_env = getenv("FARM_CUDART_DLL");
+        std::string dll = dll_env && *dll_env ? dll_env : "cudart64_12.dll";
+        std::string p = cuda_dir.empty() ? dll : cuda_dir + "\\" + dll;
+        HMODULE h = cuda_dir.empty() ? LoadLibraryA(p.c_str())
+                                     : LoadLibraryExA(p.c_str(), NULL,
+                                                      LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!h) {
+            std::fprintf(stderr, "[cudart] LoadLibrary %s 失败 GLE=%lu\n",
+                         p.c_str(), GetLastError());
+            return false;
+        }
+        auto g = [&](const char* n) { return (void*)GetProcAddress(h, n); };
+        Bind(g);
         if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
             || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
             std::fprintf(stderr, "[cudart] 缺导出符号\n");
@@ -111,7 +126,33 @@ struct Cudart {
         std::fprintf(stderr, "[cudart] loaded %s\n", p.c_str());   // 归属审计
         return true;
     }
+#else
+    // POSIX 面（2026-09-27）：dlopen/dlsym，语义与 Windows 面对齐（目录空=
+    // ld.so 搜索路径；FARM_CUDART_DLL 缺省 libcudart.so.12——pip 包
+    // nvidia/cuda_runtime/lib 下，部署时设 FARM_CUDA_DIR 指它）
+    bool Load(const std::string& cuda_dir) {
+        if (ok) return true;
+        const char* dll_env = getenv("FARM_CUDART_DLL");
+        std::string dll = dll_env && *dll_env ? dll_env : "libcudart.so.12";
+        std::string p = cuda_dir.empty() ? dll : cuda_dir + "/" + dll;
+        void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            std::fprintf(stderr, "[cudart] dlopen %s 失败：%s\n",
+                         p.c_str(), dlerror());
+            return false;
+        }
+        auto g = [&](const char* n) { return (void*)dlsym(h, n); };
+        Bind(g);
+        if (!Malloc || !Free || !HostAlloc || !FreeHost || !Memcpy || !DeviceSynchronize
+            || !StreamCreate || !StreamDestroy || !MemcpyAsync) {
+            std::fprintf(stderr, "[cudart] 缺导出符号\n");
+            return false;
+        }
+        ok = true;
+        std::fprintf(stderr, "[cudart] loaded %s\n", p.c_str());   // 归属审计
+        return true;
+    }
+#endif
 };
 
 } // namespace inferfarm
-#endif // _WIN32

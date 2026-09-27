@@ -11,7 +11,9 @@
 //
 // 每决策成本 = 挂起次数 × (A + B + C) + D/每局决策数。
 // 本基准不建模 bank 协议（那是 census 真负载的活）——只给原语单价。
-#include <windows.h>
+// Windows-only（WinFiber 原语直测=本基准的目的；非 Windows 构建面留位
+// 编译过，打印一句指路——A2 档 fcontext 原语在 POSIX 面可经 farm_test
+// 全门行为验证，单价微基准未移植，降级点注明 2026-09-27）。
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -21,6 +23,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+
+#include <windows.h>
 
 static double g_inv_freq_ns = 0;
 static double NowNs() {
@@ -290,7 +296,10 @@ static void BenchCreateDelete(int rounds) {
     ConvertFiberToThread();
 }
 
+#endif // _WIN32
+
 int main() {
+#ifdef _WIN32
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     g_inv_freq_ns = 1e9 / (double)f.QuadPart;
@@ -309,5 +318,9 @@ int main() {
     BenchPostOpOnly(200000);
     BenchCreateDelete(20000);
     std::printf("== 完 ==\n");
+#else
+    std::printf("== fiber_bench：Windows-only 微基准（WinFiber/切换体单价账）；"
+                "非 Windows 面不适用，留位=编译过 ==\n");
+#endif
     return 0;
 }
