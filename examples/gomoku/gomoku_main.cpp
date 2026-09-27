@@ -48,6 +48,9 @@ int main(int argc, char** argv) {
     cfg.stagger_ms = 1;
     cfg.model.backend = "cpu";
     cfg.model.cpu = GomokuModelDecl(cfg.slots);
+    // --device 组的 ncnn 声明继承源：首个 --device 会整体替换 cfg.model（含
+    // cpu decl）——后续组再从 cfg.model.cpu 继承=拿到空声明（LoadSpec 必败）。
+    const CpuModelDecl gomoku_decl = cfg.model.cpu;
     bool show_board = false;
     bool append_own = false;
     const char* append_mode = "hist";
@@ -106,7 +109,7 @@ int main(int argc, char** argv) {
             }
             d.model.population_input = cfg.model.population_input;   // 路由模式组继承
             if (d.model.backend == "cpu") d.model.cpu = GomokuModelDecl(cfg.slots);
-            if (d.model.backend == "ncnn") d.model.cpu = cfg.model.cpu;   // ncnn 声明式 spec 同样继承（否则 --device 组 LoadSpec 空声明必败）
+            if (d.model.backend == "ncnn") d.model.cpu = gomoku_decl;   // ncnn 声明式 spec 同样继承（否则 --device 组 LoadSpec 空声明必败）
             if (cfg.devices.empty()) {   // 首个：替换主设备
                 cfg.model = d.model;
                 cfg.banks = d.banks;

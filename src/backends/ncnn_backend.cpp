@@ -27,6 +27,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>   // dlopen/dlsym：Linux 面（2026-09-27 移植）
 #endif
 
 namespace inferfarm {
@@ -80,6 +82,20 @@ struct NcnnApi {
             return false;
         }
         auto g = [&](const char* n) { return (void*)GetProcAddress(h, n); };
+#else
+        // Linux 面（2026-09-27 移植）：dlopen libncnn.so.1（目录空=裸名走
+        // ld.so 搜索；语义同 ort/trt 后端）。符号表与 Windows 面共用。
+        std::string sp = dir.empty() ? std::string("libncnn.so.1")
+                                     : dir + "/libncnn.so.1";
+        void* h = ::dlopen(sp.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            std::fprintf(stderr, "[ncnn] dlopen %s 失败：%s（显式设 FARM_NCNN_DIR"
+                         " 指向 libncnn.so.1 所在目录）\n", sp.c_str(), dlerror());
+            return false;
+        }
+        auto g = [&](const char* n) { return ::dlsym(h, n); };
+        p = sp;   // 尾部 loaded 打印用真实路径
+#endif
         auto req = [&](void* pfn, const char* n) {
             if (!pfn) {
                 std::fprintf(stderr, "[ncnn] 缺导出符号 %s\n", n);
@@ -132,10 +148,6 @@ struct NcnnApi {
         std::fprintf(stderr, "[ncnn] loaded %s（%s）\n", version ? version() : "?",
                      p.c_str());
         return true;
-#else
-        (void)dir; (void)p; (void)dll;
-        return false;
-#endif
     }
     // 注：不做会话归零 FreeLibrary——实测 ncnn.dll 卸载 detach 在本机挂死
     // （vk 清理等齐队列死锁）；保持进程尾随 loader 卸载，退出期 AV 见判决 23。
@@ -213,12 +225,22 @@ public:
             m.name = in.name;
             m.et = in.et;
             m.esize = 4;
-            m.dims = in.row_dims;
-            if (!m.dims.empty()) m.dims[0] = slots;   // dim0=槽数（fb 语义）
+            // 行形状语义=cpu 后端同款（2026-09-27 堆损坏定谳）：dim0=槽数
+            // 前置，row_dims 全部是行内容维。旧实现错把 dims[0] 覆盖成 slots
+            // 且行宽从 dims[1] 起乘——一维声明 {kCells} 被算成 4B 行，适配器
+            // 每批越界写 896B（Linux glibc 千批级引爆；Windows 无检测器=
+            // 历史上一直无声越界，当时 ncnn 吞吐数字的输入面实为垃圾）。
+            m.dims.push_back(slots);
             size_t row_elems = 1;
-            for (size_t d = 1; d < in.row_dims.size(); d++)
-                row_elems *= (size_t)in.row_dims[d];
-            if (in.row_dims.empty()) row_elems = 1;
+            for (int64_t dd : in.row_dims) {
+                m.dims.push_back(dd);
+                row_elems *= (size_t)dd;
+            }
+            if (row_elems == 0) {
+                std::fprintf(stderr, "[ncnn] 输入 %s 行形状非法\n",
+                             in.name.c_str());
+                return false;
+            }
             m.row_bytes = row_elems * 4;   // 声明面恒 f32（ncnn 输入 Mat f32）
             m.population = false;
             out.ins.push_back(m);

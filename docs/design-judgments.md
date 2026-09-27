@@ -845,3 +845,19 @@ FARM_H2D_DELTA=0；默认不开声明时指纹必须仍是基线（零行为差�
 api.h 桩=自有文件，保留）。TRT 头走外部指路：-DINFERFARM_TRT_INCLUDE_DIR
 或 FARM_TRT_INCLUDE_DIR env 指向 GitHub NVIDIA/TensorRT release 分支的
 include/；上游 TRT 更新=换外部目录，仓库零跟随成本。
+
+**判决 27 ncnn 段改口（2026-09-27 深夜，根因改判+修复落地）**：
+"按批数累积的 glibc 堆损坏"真凶**不是 ncnn**——ASAN 一发定位
+`gomoku_adapter.h:163 AssembleInto` heap-buffer-overflow：ncnn LoadSpec
+把一维声明 {kCells} 错按 fb 语义 dims[0]=slots 覆盖、行宽从 dims[1] 起乘
+→ row_bytes=4B，适配器每批越界 896B，千批量级引爆 glibc（Windows 无检测
+器=历史上无声越界，判决 22/23 时代的 ncnn gomoku 读数输入面实为垃圾，
+速率数字作废）。修复=LoadSpec 行形状语义对齐 cpu 后端（slots 前置，
+row_dims 全为行维）。连带修 gomoku_main --device 组的 decl 继承
+（首个设备替换 cfg.model 后续组拿空声明的时序坑）。
+独立探针（ncnn_test/probe_ncnn_linux.cpp，dlopen 面复刻后端用法）
+单 net/双 net 并发 ×2000 批 radv 全净=调用模式无罪。
+**修复后全矩阵**：ASAN 8×1024 净；radv 4096 局净（1137 局/s，指纹
+2eeba5aa9f4bb5d2）；cuda+ncnn 异构 32 局净（Linux 面 R4 对应能力首证）；
+farm_test+gomoku ort 面回归 ALL PASS。设备枚举：Vulkan dev0=RADV
+RENOIR（核显）/dev1=3060M——ncnn 掼蛋核显路线在本机可用。
