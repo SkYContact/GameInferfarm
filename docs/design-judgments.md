@@ -839,3 +839,9 @@ headlive=true/append=false）；同深度内容全换（newest-first 移位，ap
 min(动作数,256))`（行尾恒零已由现有 memset+重写满足）；③验收：先
 FARM_H2D_DELTA_DEBUG=1 哨兵零违约，再压吞吐；A/B=同命令
 FARM_H2D_DELTA=0；默认不开声明时指纹必须仍是基线（零行为差）。
+
+**头文件边界判决（用户 09-27，判决 27 补记）**：不 vendor 第三方头文件
+入库——仓库只保持自有干净代码（现有 third_party/tensorrt/cuda_runtime_
+api.h 桩=自有文件，保留）。TRT 头走外部指路：-DINFERFARM_TRT_INCLUDE_DIR
+或 FARM_TRT_INCLUDE_DIR env 指向 GitHub NVIDIA/TensorRT release 分支的
+include/；上游 TRT 更新=换外部目录，仓库零跟随成本。
