@@ -33,6 +33,13 @@
 using namespace inferfarm;
 using namespace inferfarm::gomoku;
 
+// MSVC _putenv_s 的可移植等价（POSIX=setenv；R6 切档用，2026-09-27）
+#ifdef _WIN32
+static void TestSetEnv(const char* k, const char* v) { _putenv_s(k, v); }
+#else
+static void TestSetEnv(const char* k, const char* v) { setenv(k, v, 1); }
+#endif
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { std::printf("FAIL: %s\n", msg); g_fail++; } \
@@ -276,7 +283,7 @@ int main() {
             std::printf("SKIP R6: 无 %s（python tools/patch_fence.py %s "
                         "--out %s）\n", kFence, kOnnx, kFence);
         } else {
-            _putenv_s("FARM_ORT_ASYNC", "3");
+            TestSetEnv("FARM_ORT_ASYNC", "3");
             long long f0 = OrtFenceEngagedTotal();
             R f1 = Leg("ort", kFence, nullptr, 2);
             R f2 = Leg("ort", kFence, nullptr, 2);
@@ -285,7 +292,7 @@ int main() {
             long long f_bank = OrtFenceEngagedTotal() - f0;
             CHECK(f_bank == 4, "R6 fence 真启用=4 会话（静默回落=此门红）");
             R fi = Leg("ort", kFence, nullptr, 0);
-            _putenv_s("FARM_ORT_ASYNC", "0");
+            TestSetEnv("FARM_ORT_ASYNC", "0");
             CHECK(OrtFenceEngagedTotal() - f0 == f_bank,
                   "R6 inline 腿不误登记（armed 票号握手）");
             CHECK(f1.games == 32, "R6 fence 银行腿完成（32 局）");
