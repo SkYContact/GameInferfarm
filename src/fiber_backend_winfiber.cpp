@@ -2,8 +2,10 @@
 // （ConvertThreadToFiberEx/CreateFiberEx/SwitchToFiber/DeleteFiber/
 //   ConvertFiberToThread，FIBER_FLAG_FLOAT_SWITCH 原样）。
 // 行为零差：fiber_pool.cpp 走本后端=与提取前的直调逐句同源。
-#ifdef _WIN32
+// （头包含无条件化——非 Windows 面的 nullptr 工厂也引用 IFiberBackend 名，
+//  2026-09-27 Linux 移植批首编译抓出。）
 #include "fiber_backend.h"
+#ifdef _WIN32
 #include <windows.h>
 
 namespace inferfarm {

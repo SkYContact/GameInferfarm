@@ -134,8 +134,8 @@ std::vector<int> ParseCpuList(const char* spec) {
 
 bool PinThread(const std::vector<int>& cpus, int id, const char* role) {
     if (cpus.empty()) return false;
-    const int cpu = cpus[(size_t)id % cpus.size()];
 #ifdef _WIN32
+    const int cpu = cpus[(size_t)id % cpus.size()];
     ULONG_PTR proc_mask = 0, sys_mask = 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask)) {
         std::fprintf(stderr, "[affinity] %s#%d GetProcessAffinityMask 失败 GLE=%lu\n",
