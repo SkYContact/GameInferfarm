@@ -94,7 +94,8 @@ namespace ortplt {
 #define FI_STDCALL
 using HMODULE = void*;
 inline HMODULE LibLoad(const char* p) {
-    return (HMODULE)::dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    void* h = ::dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    return h;
 }
 inline void* LibSym(HMODULE h, const char* n) { return ::dlsym(h, n); }
 inline unsigned long LastErr() { return (unsigned long)::errno; }
@@ -1317,10 +1318,16 @@ private:
             }
             s->graph_on = graph;
         }
+        if (s->fence) s->fence_ticket = FenceTicketArm();   // 武装窗口=CreateSession 一段
+#ifdef _WIN32
         wchar_t wpath[1024];
         MultiByteToWideChar(CP_UTF8, 0, cfg.model_path.c_str(), -1, wpath, 1024);
-        if (s->fence) s->fence_ticket = FenceTicketArm();
         OrtStatus* stc = a->CreateSession(s->env, wpath, opts, &s->sess);
+#else
+        // POSIX 面 ORTCHAR_T=char：UTF-8 路径直传（Windows 面才需宽字符转换）
+        OrtStatus* stc = a->CreateSession(s->env, cfg.model_path.c_str(),
+                                          opts, &s->sess);
+#endif
         if (s->fence) FenceTicketDisarm();   // 武装窗口=CreateSession 一段；
                                              // 窗口外其他会话的 kernel 一律无主
         a->ReleaseSessionOptions(opts);
