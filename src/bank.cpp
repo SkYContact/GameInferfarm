@@ -39,7 +39,14 @@ static inline void SpinPause() {
 
 // 自旋/诊断节拍（原 4000/0x3FFFF 魔法数命名；来源=本机扫描：短自旋覆盖
 // 调度台 µs 级还池的绝大多数，溢出才走挂起路径）
-static constexpr int kClaimSpins = 4000;        // Claim 短自旋上限
+// Claim 短自旋上限（FARM_CLAIM_SPINS 可调，缺省 4000）。掼蛋 DATA2：满载争抢
+// 下一次 spin-out ≈560µs 纯烧（256 在飞/512 链≈半数决策的纤维在自旋里对撞）
+// ——高并发大行负载应扫描下调（4000→1000/250/64；0=领号失败即挂起走轮转唤醒）。
+// 只改时序不改算术=指纹门必然逐位同。
+static const int kClaimSpins = [] {
+    const char* e = std::getenv("FARM_CLAIM_SPINS");
+    return e ? std::atoi(e) : 4000;
+}();
 static constexpr long long kDrainDiagMask = 0x3FFFF;   // drain 长等诊断打印分频
 static constexpr int kInlineSpinBeforeYield = 4000;    // inline 完成等待转让出
 
@@ -131,6 +138,11 @@ struct BankScheduler::Impl {
     bool any_append = false;             // 声明式增量 H2D 面（判决25）存在性：
                                          // Claim 清声明/热路径的门（无 append 面
                                          // =零开销，"数组写点与默认关=零开销同门"）
+    std::vector<std::string> fw_names;   // 恒全量覆写声明暂存（InitGroups 收集各组
+                                         // model.fullwrite_inputs 并集——组间 IO 同
+                                         // 契约；spec 终态点解析）
+    std::vector<char> fw;                // 解析结果（与 spec.ins 同序；空=未声明=
+                                         // 全行清零现状，Claim 快路径零额外判断）
     // init 握手（会话建在调度台线程上：ORT 图会话 PerThreadContext 铁律）
     std::mutex init_mx;
     std::condition_variable init_cv;
@@ -199,6 +211,7 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
             const long long tz0 = I.cen && I.cen->on ? NowNsI() : 0;
             for (size_t i = 0; i < I.spec.ins.size(); i++) {
                 if (I.spec.ins[i].population) continue;   // population 面不清零
+                if (!I.fw.empty() && I.fw[i]) continue;   // 恒全量覆写声明行（快刀一）
                 if (b.in_rows.empty()) {   // 预解未就绪防御：退回直查（语义同）
                     size_t rb = 0;
                     void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
@@ -961,7 +974,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     }
     if (groups.empty() || groups.size() > (size_t)Impl::kMaxGrp) {
         std::fprintf(stderr, "[bank] 设备组数 %zu ∉ [1,%d]\n",
-                     groups.size(), Impl::kMaxGrp);
+                     groups.size(), (size_t)Impl::kMaxGrp);
         return false;
     }
     int total = 0;
@@ -989,6 +1002,9 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     }
     impl_ = new Impl();
     Impl& I = *impl_;
+    for (const auto& g : groups)   // 恒全量覆写声明：各组并集（IO 同契约；
+        for (const auto& n : g.model.fullwrite_inputs)   // 重复名解析幂等）
+            I.fw_names.push_back(n);
     I.cen = cen_;
     I.cfg = cfg;
     I.spin = cfg.spin;
@@ -1100,6 +1116,26 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
         // 声明分支零占用。
         for (auto& m : I.spec.ins)
             if (m.append || m.headlive) { I.any_append = true; break; }
+        // 恒全量覆写行旗（掼蛋 DATA2 快刀一）：声明行 Claim/inline 跳过清零
+        //（适配器承诺每次 AssembleInto 全量覆写该行——状态行大户每决策立省
+        // 槽行 memset；违诺=槽残留旧字节静默错推理，执法面=乘客指纹门）。
+        // 未命中名=拼写错误，零行为差但要嚷出来。
+        if (!I.fw_names.empty()) {
+            I.fw.assign(I.spec.ins.size(), 0);
+            int nhit = 0;
+            for (const auto& n : I.fw_names) {
+                bool hit = false;
+                for (size_t ii = 0; ii < I.spec.ins.size(); ii++)
+                    if (I.spec.ins[ii].name == n) { I.fw[ii] = 1; hit = true; break; }
+                if (hit) nhit++;
+                else
+                    std::fprintf(stderr, "[bank] fullwrite 声明 %s 未命中任何输入"
+                                 "（零行为差；查拼写）\n", n.c_str());
+            }
+            std::fprintf(stderr, "[bank] fullwrite 行旗生效: %d/%zu 输入行跳过"
+                         " Claim 清零（承诺=每次 AssembleInto 全量覆写）\n",
+                         nhit, I.spec.ins.size());
+        }
         // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
         // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）
         for (int i = 0; ok && i < built; i++) {
@@ -1193,6 +1229,7 @@ struct InlineRunner::Session {
     InferBackend* be = nullptr;
     void* sess = nullptr;
     const ModelSpec* spec = nullptr;
+    std::vector<char> fw;   // 恒全量覆写行旗（Init 期解析；空=全行清零现状）
     std::mutex mx;
     // row0 写面（SlotWriter 实现：整批照发=垃圾行无害）
     struct Writer0 : SlotWriter {
@@ -1210,6 +1247,17 @@ bool InlineRunner::Init(InferBackend& be, const ModelConfig& cfg, const ModelSpe
     s_ = new Session();
     s_->be = &be;
     s_->spec = &spec;
+    for (const auto& n : cfg.fullwrite_inputs) {   // 恒全量覆写声明（快刀一）
+        bool hit = false;
+        for (size_t i = 0; i < spec.ins.size(); i++)
+            if (spec.ins[i].name == n) {
+                if (s_->fw.empty()) s_->fw.assign(spec.ins.size(), 0);
+                s_->fw[i] = 1; hit = true; break;
+            }
+        if (!hit)
+            std::fprintf(stderr, "[inline] fullwrite 声明 %s 未命中任何输入"
+                         "（零行为差；查拼写）\n", n.c_str());
+    }
     s_->sess = be.CreateSession(cfg, spec, /*for_bank=*/false);
     if (!s_->sess) { Shutdown(); return false; }
     if (!be.Warmup(s_->sess)) { Shutdown(); return false; }
@@ -1229,8 +1277,10 @@ void InlineRunner::Shutdown() {
 bool InlineRunner::Run(GameAdapter* g) {
     if (!s_) return false;
     std::lock_guard<std::mutex> lk(s_->mx);
-    // 零基：row0 清零（与银行路径 claim 清零对齐——逐位一致性前提）
+    // 零基：row0 清零（与银行路径 claim 清零对齐——逐位一致性前提；fw 声明
+    // 行同跳过=两路径契约对称，Init 期一次解析）
     for (size_t i = 0; i < s_->spec->ins.size(); i++) {
+        if (!s_->fw.empty() && s_->fw[i]) continue;
         size_t rb = 0;
         void* row = s_->be->InputRow(s_->sess, s_->spec->ins[i].name.c_str(), 0, &rb);
         if (row) memset(row, 0, rb);

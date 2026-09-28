@@ -25,6 +25,9 @@
 //  G16 声明式增量 H2D（判决25，2026-09-27）：append 声明腿 vs 强制全量腿
 //     （FARM_H2D_DELTA=0）同种子逐位同（含指纹——增量漏传必然指纹红）；
 //     复跑同；故意少申报腿=指纹必异 + FARM_H2D_DELTA_DEBUG=1 哨兵计数必增
+//  G17 恒全量覆写行（fullwrite，掼蛋 DATA2 快刀一，2026-09-28）：声明腿
+//     （Claim/inline 跳过清零）== 清零基线腿逐位同；复跑同。负向门不可
+//     确定性构造（违约可观性依赖槽历史）——执法面=乘客指纹纪律
 //     （牙齿+机器断言面双验）。ort CUDA 专属通道：无工件/无运行时=SKIP
 //     （cpu 后端对声明零反应=full 现状，G1-G15 已覆盖该面）
 #include "../examples/toy/toy_adapter.h"
@@ -906,6 +909,41 @@ int main() {
                   "G16c-2 哨兵计数必增（FARM_H2D_DELTA_DEBUG=1 机器断言面）");
             }
         }
+    }
+
+    // ---------------- G17：恒全量覆写行（fullwrite，掼蛋 DATA2 快刀一）----------------
+    // 声明行 Claim/inline 跳过清零（省槽行 memset；状态化大行受益）。gomoku
+    // own/opp 每格恒写 0/1=承诺结构性成立。主门：声明腿==清零基线腿逐位同
+    //（适配器若漏写=槽残留旧字节必红——执法面=指纹门）；cpu 后端=CI 可跑。
+    {
+        auto g17_leg = [&](bool fw) -> unsigned long long {
+            FarmConfig cfg;
+            cfg.name = "g17";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 20260928u;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+            if (fw) {
+                cfg.model.fullwrite_inputs.push_back("own");
+                cfg.model.fullwrite_inputs.push_back("opp");
+            }
+            Farm farm;
+            if (!farm.Init(cfg)) { g_fail++; return 0; }
+            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            return farm.tally().fingerprint;
+        };
+        unsigned long long fp_zero = g17_leg(false);
+        CHECK(fp_zero != 0, "G17 清零基线腿完成（16 局）");
+        unsigned long long fp_fw = g17_leg(true);
+        CHECK(fp_fw != 0 && fp_fw == fp_zero,
+              "G17a fullwrite 声明腿==清零基线腿逐位同（含指纹；漏写残留必红）");
+        unsigned long long fp_fw2 = g17_leg(true);
+        CHECK(fp_fw2 == fp_fw, "G17b 声明腿复跑逐位同");
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

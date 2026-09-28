@@ -122,6 +122,12 @@ struct ModelConfig {
                                       // 每批只传 [0,depth)，缩深走设备侧 memset
                                       // （零 PCIe）。与 append_inputs 同面互斥。
                                       // 承诺=宿主行尾槽 [depth,slots) 恒零
+    std::vector<std::string> fullwrite_inputs; // 恒全量覆写行名单（掼蛋 DATA2 快刀一）：
+                                      // 适配器承诺该输入行每次 AssembleInto 全量
+                                      // 覆写——Claim/inline 跳过槽行清零（省每决策
+                                      // memset；状态化大行受益最大）。违诺=槽残留
+                                      // 旧字节静默错推理，执法面=乘客指纹门（零基
+                                      // 契约对未声明区不变；声明是加速非门槛）
     std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
                                       // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效；backend=="ncnn" 时
