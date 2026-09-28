@@ -5,6 +5,17 @@
 > 掼蛋仓 gd/notes/，判决原文在 docs/design-judgments.md 与
 > docs/state-residency-design.md。
 
+> **清账补记（2026-09-29 晨会话，无 GPU 批）**：§2 挂账 B/D/E 的 CPU 可解
+> 面已清——W2 组路由+异 IO+固批按组+G19 门（a87e4ac，接口冻结，掼蛋
+> W4=RouteGroup return 1 即接）/CI 五笔实为全绿（当时漏查）/refit 空转
+> fail-fast（e271290；DATA11 §2 报修=旧快照误读，重试本体 7a48eef 已有）/
+> segvcatch 入仓（1bb506b）/patch_fence population 支持（7013cd3）/
+> /tmp 易失件已归档 ~/inferfarm-project/archive/gd-tmp-forensics-20260929
+> .tar.gz。A 项三刀全要 TRT 维持挂起；C 项无触发维持按需。明细=
+> gd:notes/FRAMEWORK_REPLY14.md。遗留：ort/trt 面 R 门复验待 GPU 窗
+> （本机锁被占）；G19 前置变体挂死案（框架码两态相同、测试侧共聚）
+> 17 连净后挂低优先复验账。
+
 ## 1. 速度谱终账（gd 复合图 fb64，4096 链）
 
 | 站 | dec/s | 提交 |
