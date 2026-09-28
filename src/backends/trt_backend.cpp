@@ -8,7 +8,8 @@
 //     ③in-flight≤1/会话（staging 无覆写竞争，单调序号无 ABA）。
 //  2. CUDA Graph 批捕获：[4B seq H2D→enqueueV3→输出 D2H→盖章] 四段一张图=
 //     每批一次 WDDM 提交替代 3-4 次。图回放执行时读 staging/arena 当前值
-//     （地址烧死≠值烧死——启动期 ProbeGraph 实验验证）。
+//     （地址烧死≠值烧死——启动期 ProbeGraph 实验验证）。大输出模型非满批
+//     另走计算图（前两段）+ 图外逐输出前缀 D2H（部分行档，见 MbSubmit）。
 //  3. refit 换心：refittable engine + RW1 blob，毫秒级权重热换；已捕获图
 //     replay 读同一设备内存=新值（A4 门的性质支点）。
 //
@@ -358,6 +359,8 @@ struct TrtSession {
     // CUDA Graph 批捕获
     void* graph = nullptr;
     bool graph_ok = false;
+    void* graph_c = nullptr;   // 计算图（seq H2D→enqueueV3，无回拷/盖章）：
+    bool graph_c_ok = false;   // 部分行 D2H 档的前缀图（大输出模型专用）
     int slots = 64;
     int dev = 0;      // 会话设备（多卡：分配/流/图/邮箱全落此设备）
     int last_n = 0;
@@ -545,7 +548,7 @@ public:
             CaptureGraph(s);
             if (!s->graph_ok) {   // 在线邮箱冒烟（链路坏=回退流同步，不让首批挂）
                 unsigned seq = 0;
-                if (!MbSubmit(s, seq)) { s->mb_ok = false; return false; }
+                if (!MbSubmit(s, s->slots, seq)) { s->mb_ok = false; return false; }
                 if (!WaitFlag(s, seq, 5000.0)) { s->mb_ok = false; return true; }
             }
         }
@@ -583,7 +586,7 @@ public:
             }
             unsigned seq = 0;
             double spin = 0;
-            if (!MbSubmit(s, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
+            if (!MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
                 v.clear();
                 return;
             }
@@ -611,6 +614,7 @@ public:
         TrtSession* s = (TrtSession*)session;
         if (!s) return;
         if (s->graph && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph);
+        if (s->graph_c && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph_c);
         if (s->ctx) delete s->ctx;
         if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
         if (s->in_h_arena) g_cu.FreeHost(s->in_h_arena);
@@ -648,7 +652,7 @@ public:
                                      1, s->stream))
                     return false;
         }
-        return MbSubmit(s, seq_out);
+        return MbSubmit(s, n_rows, seq_out);
     }
 
     bool CompletionReached(void* session, unsigned seq) override {
@@ -656,7 +660,13 @@ public:
         if (!s->mb_ok) {   // 降级流同步路径：发射即等完（SubmitBatch 已同步）
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
             g_cu.DeviceSynchronize();
-            g_cu.Memcpy(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2);
+            if (PartialD2hOn(s, s->last_n)) {
+                for (const auto& o : s->outs)
+                    g_cu.Memcpy(o.host, o.dev,
+                                (size_t)s->last_n * (size_t)o.meta.width * sizeof(float), 2);
+            } else {
+                g_cu.Memcpy(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2);
+            }
             return true;
         }
         volatile unsigned* flag = (volatile unsigned*)s->mb_host;
@@ -745,17 +755,62 @@ private:
         return true;   // 换心走 RefitWeights()（Farm 在 context 创建前调）
     }
 
+    // 部分行输出 D2H（掼蛋线 §4-② 回传）：状态化/大输出模型每批全量回拷
+    // out_arena（MB 级，与行数无关）是设计税——各输出段内行连续，逐输出只
+    // 拷前 n_rows 行等价正确（收割只读本批行，尾行旧数据=行独立无害）。
+    // 档位自动门控：仅全量回拷 ≥256KB 且非满批时启用（小输出模型走图外
+    // 逐段拷的每段提交税 WDDM 5-10µs 大于省下的字节；满批走原四段图零扰动）。
+    // FARM_D2H_PARTIAL=0 杀手锏回全量（A/B 口径）。
+    static constexpr size_t kD2hPartialMinBytes = 256 * 1024;
+    static bool PartialD2hOn(const TrtSession* s, int n_rows) {
+        static const int mode = [] {
+            const char* e = std::getenv("FARM_D2H_PARTIAL");
+            return e ? std::atoi(e) : 1;
+        }();
+        if (mode <= 0 || n_rows <= 0 || n_rows >= s->slots) return false;
+        return s->out_h_bytes >= kD2hPartialMinBytes;
+    }
+    // 图外逐输出前缀 D2H + 盖章殿后（盖章在 D2H 之后=旗标到即输出驻留，
+    // 流序契约与图内四段完全一致）
+    static bool EnqueuePartialD2H(TrtSession* s, int n_rows) {
+        for (const auto& o : s->outs)
+            if (g_cu.MemcpyAsync(o.host, o.dev, (size_t)n_rows * (size_t)o.meta.width * sizeof(float),
+                                 2, s->stream))
+                return false;
+        if (g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream))
+            return false;
+        return true;
+    }
+
     // 邮箱提交：序号 +1 写 staging → [图=graphLaunch（H2D 节点执行时读 staging
-    // 当前值）] / [在线=4B H2D→enqueueV3→输出 D2H→盖章 逐个入队 stream]
-    static bool MbSubmit(TrtSession* s, unsigned& seq_out) {
+    // 当前值）] / [在线=4B H2D→enqueueV3→输出 D2H→盖章 逐个入队 stream]；
+    // 大输出模型非满批 → 计算图/在线 enqueue + 图外部分行 D2H
+    static bool MbSubmit(TrtSession* s, int n_rows, unsigned& seq_out) {
         seq_out = ++s->mb_seq;
-        if (!s->mb_ok) {   // 流同步降级：enqueue+同步（提交税同步税都在）
+        if (!s->mb_ok) {   // 流同步降级：发射即等完（提交税同步税都在）
             if (!s->ctx->enqueueV3((cudaStream_t)s->stream)) return false;
             g_cu.StreamSynchronize(s->stream);
-            g_cu.Memcpy(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2);
+            if (PartialD2hOn(s, n_rows)) {
+                for (const auto& o : s->outs)
+                    g_cu.Memcpy(o.host, o.dev,
+                                (size_t)n_rows * (size_t)o.meta.width * sizeof(float), 2);
+            } else {
+                g_cu.Memcpy(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2);
+            }
             return true;
         }
         *(volatile unsigned*)((char*)s->mb_host + 64) = seq_out;
+        if (PartialD2hOn(s, n_rows)) {
+            if (s->graph_c_ok && s->graph_c) {
+                if (g_cu.GraphLaunch(s->graph_c, s->stream)) return false;
+            } else {
+                if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4,
+                                     1, s->stream))
+                    return false;
+                if (!s->ctx->enqueueV3((cudaStream_t)s->stream)) return false;
+            }
+            return EnqueuePartialD2H(s, n_rows);
+        }
         if (s->graph_ok && s->graph)
             return g_cu.GraphLaunch(s->graph, s->stream) == 0;
         if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4, 1, s->stream))
@@ -814,51 +869,69 @@ private:
         }
     }
 
-    // CUDA Graph 批捕获（[4B seq H2D→enqueueV3→输出 D2H→盖章] 四段一张图）
+    // CUDA Graph 批捕获：四段图 [4B seq H2D→enqueueV3→输出 D2H→盖章]（满批/
+    // 小输出的正路）+ 计算图 [4B seq H2D→enqueueV3]（大输出模型部分行 D2H 档
+    // 的前缀图——D2H/盖章由 MbSubmit 图外按 n_rows 动态入队，图内静态形状拷
+    // 不了"前 n 行"）
     static void CaptureGraph(TrtSession* s) {
         if (!s->mb_ok || !g_cu.StreamBeginCapture || !g_cu.StreamEndCapture
             || !g_cu.GraphInstantiate || !g_cu.GraphLaunch || !g_cu.GraphDestroy) {
             std::fprintf(stderr, "[trt] 图捕获前置不满足（邮箱/符号缺失）——降级仅邮箱\n");
             return;
         }
-        if (g_cu.StreamBeginCapture(s->stream, 0 /*cudaStreamCaptureModeGlobal*/) != 0) {
-            std::fprintf(stderr, "[trt] cudaStreamBeginCapture 失败——降级仅邮箱\n");
-            return;
-        }
         // 注：staging 不在捕获期写——H2D 节点在**执行时**读其当前值，MbSubmit
         // 每次发射前写好（in-flight≤1=无覆写竞争）。
-        bool ok = true;
-        if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4, 1, s->stream)) ok = false;
-        if (ok && !s->ctx->enqueueV3((cudaStream_t)s->stream)) ok = false;
-        if (ok && g_cu.MemcpyAsync(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2, s->stream))
-            ok = false;
-        if (ok && g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream)) ok = false;
-        void* g = nullptr;
-        int ec = g_cu.StreamEndCapture(s->stream, &g);
-        if (!ok || ec != 0 || !g) {
-            std::fprintf(stderr, "[trt] CUDA Graph 捕获失败（ok=%d ec=%d）——降级仅邮箱\n",
-                         (int)ok, ec);
-            if (g) g_cu.GraphDestroy(g);
-            return;
-        }
-        void* ge = nullptr;
-        if (g_cu.GraphInstantiate(&ge, g, 0) != 0 || !ge) {
-            std::fprintf(stderr, "[trt] cudaGraphInstantiate 失败——降级仅邮箱\n");
+        auto capture_one = [&](bool with_copy, void** gout) -> bool {
+            if (g_cu.StreamBeginCapture(s->stream, 0 /*Global*/) != 0) return false;
+            bool ok = true;
+            if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4,
+                                 1, s->stream))
+                ok = false;
+            if (ok && !s->ctx->enqueueV3((cudaStream_t)s->stream)) ok = false;
+            if (ok && with_copy
+                && g_cu.MemcpyAsync(s->out_h_arena, s->out_d_arena, s->out_h_bytes,
+                                    2, s->stream))
+                ok = false;
+            if (ok && with_copy
+                && g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream))
+                ok = false;
+            void* g = nullptr;
+            int ec = g_cu.StreamEndCapture(s->stream, &g);
+            if (!ok || ec != 0 || !g) {
+                if (g) g_cu.GraphDestroy(g);
+                return false;
+            }
+            void* ge = nullptr;
+            if (g_cu.GraphInstantiate(&ge, g, 0) != 0 || !ge) {
+                g_cu.GraphDestroy(g);
+                return false;
+            }
             g_cu.GraphDestroy(g);
+            *gout = ge;
+            return true;
+        };
+        if (!capture_one(true, &s->graph)) {
+            std::fprintf(stderr, "[trt] CUDA Graph 捕获失败——降级仅邮箱\n");
             return;
         }
-        g_cu.GraphDestroy(g);
-        s->graph = ge;
         s->graph_ok = true;
+        // 计算图只在大输出（部分行档潜在用户）才捕；失败=部分行档回在线路径
+        if (s->out_h_bytes >= kD2hPartialMinBytes) {
+            if (capture_one(false, &s->graph_c)) s->graph_c_ok = true;
+            else std::fprintf(stderr, "[trt] 计算图捕获失败——部分行 D2H 档走在线\n");
+        }
         unsigned seq = 0;
         double spin = 0;
-        if (!MbSubmit(s, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
+        if (!MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
             std::fprintf(stderr, "[trt] 图验证发射/旗标超时——降级仅邮箱\n");
-            s->graph = nullptr;
+            g_cu.GraphDestroy(s->graph); s->graph = nullptr;
             s->graph_ok = false;
+            if (s->graph_c) { g_cu.GraphDestroy(s->graph_c); s->graph_c = nullptr; }
+            s->graph_c_ok = false;
             return;
         }
-        std::fprintf(stderr, "[trt] CUDA Graph 批捕获成功（验证自旋 %.3fms）\n", spin);
+        std::fprintf(stderr, "[trt] CUDA Graph 批捕获成功（验证自旋 %.3fms%s）\n",
+                     spin, s->graph_c_ok ? "，含计算图（部分行 D2H 档）" : "");
     }
 };
 
