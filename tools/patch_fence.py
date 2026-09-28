@@ -36,11 +36,14 @@ def main() -> int:
 
     # slots 取自输入 dim0（fb 图输入必钉死；torch export 的输出 ValueInfo 常
     # 留符号 'batch'，但 ORT 建会话时按图推断具体化——fence 输出钉死数字与
-    # 之同形）
+    # 之同形）。population 图（FARM_ORT_ASYNC=3 路由）：跳过 pop 面（dim0=P
+    # 个体数非批维）与 1-D mid 路由键——批维取其余输入的第一个 dim0。
     slots = None
     for i in m.graph.input:
+        if i.name == "pop":
+            continue
         dims = i.type.tensor_type.shape.dim
-        if dims and dims[0].dim_value:
+        if dims and len(dims) >= 2 and dims[0].dim_value:
             slots = dims[0].dim_value
             break
     if not slots:
