@@ -643,7 +643,7 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
             {
                 const BankCtl& nb = I.banks[(size_t)i];
                 const size_t want = (size_t)nb.slots + (size_t)nb.slots / 2 + 1;
-                const size_t take = std::min(I.waiters_g[g].size(), want);
+                const size_t take = (std::min)(I.waiters_g[g].size(), want);
                 for (size_t k = 0; k < take; ++k) {
                     wake.push_back(I.waiters_g[g].front());
                     I.waiters_g[g].pop_front();
@@ -1002,7 +1002,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
         return false;
     }
     if (groups.empty() || groups.size() > (size_t)Impl::kMaxGrp) {
-        std::fprintf(stderr, "[bank] 设备组数 %zu ∉ [1,%d]\n",
+        std::fprintf(stderr, "[bank] 设备组数 %zu ∉ [1,%zu]\n",
                      groups.size(), (size_t)Impl::kMaxGrp);
         return false;
     }
