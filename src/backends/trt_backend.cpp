@@ -577,11 +577,15 @@ public:
                     StatePool p;
                     p.row_bytes = rb_in;
                     p.rows = cfg.state_pool_rows;
-                    if (g_cu.Malloc(&p.dev, p.row_bytes * (size_t)p.rows)
-                        || g_cu.Memset(p.dev, 0, p.row_bytes * (size_t)p.rows)) {
+                    p.zero_pending = new std::atomic<char>[(size_t)p.rows];
+                    for (int t = 0; t < p.rows; t++) p.zero_pending[t].store(0);
+                    if (g_cu.Malloc(&p.dev, p.row_bytes * (size_t)(p.rows + 1))
+                        || g_cu.Memset(p.dev, 0,
+                                       p.row_bytes * (size_t)(p.rows + 1))) {
                         std::fprintf(stderr, "[trt] 状态池分配/零基失败（%d 行 × %zuB）\n",
                                      p.rows, p.row_bytes);
                         if (p.dev) g_cu.Free(p.dev);
+                        delete[] p.zero_pending;
                         DestroySession(s);
                         return nullptr;
                     }
@@ -752,20 +756,27 @@ public:
                     char* dst = (char*)s->ins[i].dev;
                     char* pool = (char*)s->pool_devs[(size_t)pi];
                     const size_t rb = s->ins[i].meta.row_bytes;
-                    const size_t prows = st_pools_[(size_t)pi].rows;
+                    const StatePool& pol = st_pools_[(size_t)pi];
+                    const size_t prows = (size_t)pol.rows;
                     const bool batch = StBatchOn();
                     for (int r = 0; r < n_rows; r++) {
                         const int pid = s->st_pids[r].load(std::memory_order_relaxed);
                         if (pid < 0 || (size_t)pid >= prows)
                             continue;   // 幻影行（轮转归 -1：cursor 虚增未领
                                         // 号）——行内容垃圾无害，填充跳过
+                        // DATA8 竞态修复：pending 行读池末保留零行（NewGame
+                        // 语义=状态归零；散射随批覆写）——消费即清旗
+                        const char* srcp = pool + (size_t)pid * rb;
+                        if (pol.zero_pending[pid].load(std::memory_order_acquire)) {
+                            srcp = pool + prows * rb;   // 保留零行
+                            pol.zero_pending[pid].store(0, std::memory_order_relaxed);
+                        }
                         if (batch) {
                             s->sb.dst.push_back(dst + (size_t)r * rb);
-                            s->sb.src.push_back(pool + (size_t)pid * rb);
+                            s->sb.src.push_back((void*)srcp);
                             s->sb.sz.push_back(rb);
                             s->sb.ai.push_back(0);
-                        } else if (g_cu.MemcpyAsync(dst + (size_t)r * rb,
-                                                    pool + (size_t)pid * rb, rb,
+                        } else if (g_cu.MemcpyAsync(dst + (size_t)r * rb, srcp, rb,
                                                     3 /*D2D*/, s->stream)) {
                             return false;
                         }
@@ -829,9 +840,12 @@ private:
     // ③状态池（backend 实例级——组内银行共享设备池；链→组钉扎=无跨组状态。
     // 首个带 state_pairs 的会话创建时分配一次，零基一次；析构释放）
     struct StatePool {
-        void* dev = nullptr;      // 设备池 [rows × row_bytes]
+        void* dev = nullptr;      // 设备池 [(rows+1) × row_bytes]——末行=保留
+                                  // 零行（init 清一次永不散射：pid<rows 恒真）
         size_t row_bytes = 0;
-        int rows = 0;
+        int rows = 0;             // 逻辑行数（pool 行下标域）
+        std::atomic<char>* zero_pending = nullptr;   // [rows] 行待清零旗
+                                  // （NewGame 置 1=填充改读零行；DATA8 竞态修）
     };
     std::vector<StatePool> st_pools_;
     std::vector<void*> st_streams_;   // 全部银行会话流（ResetStatePool 全流
@@ -840,19 +854,24 @@ private:
 
 public:
     ~TrtBackend() {
-        for (auto& p : st_pools_)
+        for (auto& p : st_pools_) {
             if (p.dev && g_cu.Free) g_cu.Free(p.dev);
+            delete[] p.zero_pending;
+        }
     }
     // ③池行清零（NewGame）：链串行⇒该行无并发读者/写者；每条流各 memset
     // 一次⇒该行在任意银行的后续读（自流有序）之前完成
+    // NewGame 池行清零（DATA8 竞态修复）：旧实现=全部会话流 memsetAsync——
+    // 跨流无序，某流迟到 memset 会在新局首散射之后执行=清掉新状态（状态
+    // 丢失→轨迹翻转；单银行全序安全/hands 高频 NewGame 放大窗口=DATA8 的
+    // A/B/C 矩阵全解释）。修=延迟零行（设计文档 §5-2 备案方案）：置
+    // pending 旗（无 CUDA 调用——worker 线程不再碰驱动），该行下次填充改
+    // 读池末保留零行（散射随批覆写新态=语义等价旧 memset 且流序天然正确）
     bool ResetStatePool(int row) override {
         if (st_pools_.empty()) return false;
-        if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);
         for (auto& p : st_pools_) {
             if (row < 0 || row >= p.rows) return false;
-            char* dst = (char*)p.dev + (size_t)row * p.row_bytes;
-            for (void* st_ : st_streams_)
-                if (g_cu.MemsetAsync(dst, 0, p.row_bytes, st_)) return false;
+            p.zero_pending[row].store(1, std::memory_order_release);
         }
         return true;
     }
