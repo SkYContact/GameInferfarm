@@ -597,7 +597,23 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
         if (!I.pool_g[g].empty()) {
             i = I.pool_g[g].front();
             I.pool_g[g].pop_front();
-            wake.swap(I.waiters_g[g]);
+            // 惊群修复（掼蛋线回传）：轮转一次只出池一家银行，能吃下的写手
+            // 上限=其 slots——全量 swap 唤醒在等待者堆积场景=O(等待者) 的
+            // 醒-挂风暴（醒者抢不到槽再回队挂起）。只唤醒 slots+slots/2+1
+            // 个（填本航班+50% 余量抵消抢先失败），其余留队由后续轮转 FIFO
+            // 取走（每组同时仅一家 FILL，留队者不会被跳过；停机路径仍全量
+            // swap）。注：到货率<服务率的负载（如当前掼蛋农场）waiters 常空、
+            // 本修复休眠——属高并发突发场景的防御件（实测零吞吐变化，正确性
+            // 面保留）。
+            {
+                const BankCtl& nb = I.banks[(size_t)i];
+                const size_t want = (size_t)nb.slots + (size_t)nb.slots / 2 + 1;
+                const size_t take = std::min(I.waiters_g[g].size(), want);
+                for (size_t k = 0; k < take; ++k) {
+                    wake.push_back(I.waiters_g[g].front());
+                    I.waiters_g[g].pop_front();
+                }
+            }
             I.cv.notify_all();
 #ifdef _WIN32
             if (I.wake_ev) SetEvent((HANDLE)I.wake_ev);   // HR 路径镜像（持锁点
