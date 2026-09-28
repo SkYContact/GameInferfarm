@@ -659,6 +659,13 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
     if (i < 0) return;
     BankCtl& b = I.banks[(size_t)i];
     b.cursor.store(0, std::memory_order_release);   // 新集会游标（图/地址一夫一妻）
+    // ③池下标随游标归位（单写者窗口=调度台出池后、任何领号前）：本航班内
+    // -1=幻影行标记（迟来领号者 cursor 虚增后二次检查败退、未写 pid——发车
+    // n=cursor 会含此行；后端填充/散射跳过 -1 行，与收割侧 reqs==null 的
+    // "作废槽跳过"教义对齐。不归位=陈旧 pid 把幻影行垃圾散射进他链池行=投毒）
+    if (b.sp_ids)
+        for (int t = 0; t < b.slots; t++)
+            b.sp_ids[t].store(-1, std::memory_order_relaxed);
     b.state.store(BK_FILL, std::memory_order_release);
     I.fill_idx[g].store(i, std::memory_order_release);
     for (void* fib : wake) FiberPost(fib);

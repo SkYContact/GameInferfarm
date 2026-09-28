@@ -366,6 +366,7 @@ struct TrtSession {
     bool has_state = false;              // 任一配对成立（恒图外尾段形态）
     std::vector<int> st_in, st_out;      // 输入/输出下标→池号（-1=非状态）
     std::vector<void*> pool_devs;        // 池号→设备池基址
+    std::vector<int> pool_rows;          // 池号→池行数（幻影行卫的 static 面用）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（Claim 写/
                                                   // 发车读；未绑=Init 期冒烟走旧路）
     int slots = 64;
@@ -592,7 +593,11 @@ public:
                     if (spec.outs[k].name == pr.out) s->st_out[k] = (int)pi;
             }
             s->pool_devs.clear();
-            for (auto& p : st_pools_) s->pool_devs.push_back(p.dev);
+            s->pool_rows.clear();
+            for (auto& p : st_pools_) {
+                s->pool_devs.push_back(p.dev);
+                s->pool_rows.push_back(p.rows);
+            }
             s->has_state = true;
             std::fprintf(stderr, "[trt] 状态池生效: %zu 对 × %d 行"
                          "（提交侧 D2D 填充+批尾 D2D 散射，状态不过主机）\n",
@@ -739,8 +744,12 @@ public:
                     char* dst = (char*)s->ins[i].dev;
                     char* pool = (char*)s->pool_devs[(size_t)pi];
                     const size_t rb = s->ins[i].meta.row_bytes;
+                    const size_t prows = st_pools_[(size_t)pi].rows;
                     for (int r = 0; r < n_rows; r++) {
                         const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+                        if (pid < 0 || (size_t)pid >= prows)
+                            continue;   // 幻影行（轮转归 -1：cursor 虚增未领
+                                        // 号）——行内容垃圾无害，填充跳过
                         if (g_cu.MemcpyAsync(dst + (size_t)r * rb,
                                              pool + (size_t)pid * rb, rb,
                                              3 /*D2D*/, s->stream))
@@ -930,8 +939,12 @@ private:
             if (pi >= 0) {
                 char* pool = (char*)s->pool_devs[(size_t)pi];
                 const char* src = (const char*)s->outs[oi].dev;
+                const size_t prows = (size_t)s->pool_rows[(size_t)pi];
                 for (int r = 0; r < n_rows; r++) {
                     const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+                    if (pid < 0 || (size_t)pid >= prows)
+                        continue;   // 幻影行：不散射（陈旧 pid 会把垃圾写进
+                                    // 他链池行=状态投毒；与填充侧同卫）
                     if (g_cu.MemcpyAsync(pool + (size_t)pid * rb,
                                          src + (size_t)r * rb, rb, 3, s->stream))
                         return false;
@@ -963,10 +976,14 @@ private:
                     if (pi >= 0) {
                         char* pool = (char*)s->pool_devs[(size_t)pi];
                         const char* src = (const char*)s->outs[oi].dev;
-                        for (int r = 0; r < n_rows; r++)
-                            g_cu.Memcpy(pool + (size_t)s->st_pids[r].load(
-                                            std::memory_order_relaxed) * rb,
+                        const size_t prows = (size_t)s->pool_rows[(size_t)pi];
+                        for (int r = 0; r < n_rows; r++) {
+                            const int pid = s->st_pids[r].load(
+                                std::memory_order_relaxed);
+                            if (pid < 0 || (size_t)pid >= prows) continue;
+                            g_cu.Memcpy(pool + (size_t)pid * rb,
                                         src + (size_t)r * rb, rb, 3);
+                        }
                     } else {
                         g_cu.Memcpy(s->outs[oi].host, s->outs[oi].dev,
                                     (size_t)n_rows * rb, 2);
