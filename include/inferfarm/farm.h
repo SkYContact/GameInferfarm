@@ -54,7 +54,11 @@ struct DeviceConfig {
                           // 配比（如主卡 share=4 核显 share=1）；0=该组不接链。
                           // 缺省 1=均分（两组时≡c%n_groups 老行为）
     int slots = 0;        // 0=统一形状（cfg.slots）；>0=本组批形状（异构小图，
-                          // 仅非主组有意义；行宽/输入名/输出宽须与主组一致）
+                          // 仅非主组有意义；异 IO 组行宽/输入名可自异，见下）
+    int fixed_batch = -1; // 本组固批（W3 按组化，REPLY10 §2）：-1=跟随全局
+                          // FARM_FIXED_BATCH env；0=本组显式关；N=恒 N 行。
+                          // 双模型场景主组恒大批、池组小批固形=各自 tactic
+                          // 世界稳定（判决：n<8 与 n≥8 是不同浮点世界）
 };
 
 struct FarmConfig {
@@ -75,9 +79,11 @@ struct FarmConfig {
     int cache_log2 = 0;          // 推理缓存：0=关（缺省零行为差）；如 16=64K 条
     PopulationConfig population;   // 多权重路由负载（models>0=启用；与 population_input 家族对齐）
     // 多设备组（判决15；空=单设备老行为=cfg.model+cfg.banks）。链 c 钉扎到
-    // 组 c%devices.size()——异构设备（如 NVIDIA+AMD）下保跨跑逐位的关键。
-    // 各组模型结构须一致（输入名/行宽、输出名/宽、slots）；权重可不同
-    // （int8/fp16 各卡一档）——钉扎保证每链恒用同组。
+    // 组 c%devices.size()（share 加权轮询）——异构设备（如 NVIDIA+AMD）下保
+    // 跨跑逐位的关键。各组模型结构缺省须一致（输入名/行宽、输出名/宽）；
+    // **模型配置不同的组允许异 IO**（W2 组间解禁，REPLY10 §2：双模型主/池
+    // 组各带各的 spec——同配置组间 spec 不一致仍 fail fast=装配事故）。
+    // 决策级路由=GameAdapter::RouteGroup()（缺省 -1=链钉扎零改动）。
     std::vector<DeviceConfig> devices;
     ModelConfig model;
 };
@@ -176,7 +182,10 @@ private:
     uint64_t infer_gen_ = 1;      // 权重代次：换心成功即 ++
     FarmTally tally_;
     bool has_state_ = false;   // ③成对状态行声明存在（NewGame 池行重置门）
-    std::vector<std::string> state_out_names_;   // ③配对输出名（dest 安全网过滤）
+    std::vector<int> state_grps_;   // 声明 state_pairs 的组号（NewGame 全组清零
+                                    // ——决策级路由下链可访多组，状态组各自重置）
+    std::vector<std::vector<std::string>> state_outs_grp_;   // 各组配对输出名
+                                    // （③dest 安全网过滤面，按路由组查）
     std::mutex tally_mx_;
     void NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,
                       long long fingerprint, int chain_id, int game_id);

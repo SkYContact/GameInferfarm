@@ -42,6 +42,33 @@ static bool SpecStructurallyEqual(const ModelSpec& a, const ModelSpec& b) {
     return true;
 }
 
+// 组间异 IO 解禁判据（W2，REPLY10 §2）：模型**身份配置**相同（同后端同工件）
+// 的组间 spec 不一致=装配事故，维持 fail fast；配置不同的组（双模型主/池组）
+// 本就意图异 IO——放行（决策级路由按组各说各话）。判据按"声明面"比较：
+// 后端/工件路径 + cpu 声明（权重种子不参与——同结构异权重仍算同模型）。
+static bool ModelIdentitySame(const ModelConfig& a, const ModelConfig& b) {
+    if (a.backend != b.backend || a.model_path != b.model_path
+        || a.engine_path != b.engine_path)
+        return false;
+    if (a.backend == "cpu") {
+        if (a.cpu.ins.size() != b.cpu.ins.size()
+            || a.cpu.outs.size() != b.cpu.outs.size()
+            || a.cpu.hidden != b.cpu.hidden || a.cpu.poly_k != b.cpu.poly_k
+            || a.cpu.pop_p != b.cpu.pop_p)
+            return false;
+        for (size_t i = 0; i < a.cpu.ins.size(); i++)
+            if (a.cpu.ins[i].name != b.cpu.ins[i].name
+                || a.cpu.ins[i].et != b.cpu.ins[i].et
+                || a.cpu.ins[i].row_dims != b.cpu.ins[i].row_dims)
+                return false;
+        for (size_t j = 0; j < a.cpu.outs.size(); j++)
+            if (a.cpu.outs[j].name != b.cpu.outs[j].name
+                || a.cpu.outs[j].width != b.cpu.outs[j].width)
+                return false;
+    }
+    return true;
+}
+
 // ---------------- env 覆盖 ----------------
 static int EnvInt(const char* key, int def) {
     const char* e = getenv(key);
@@ -125,7 +152,10 @@ bool Farm::Init(FarmConfig cfg) {
     // ③成对状态行前置校验（docs/state-residency-design.md）：v1 限 trt 后端
     // +银行制（inline/cpu/ort 声明即拒）；池行数=chains（池下标 v1=chain_id）
     has_state_ = false;
-    for (auto& d : devs) {
+    state_grps_.clear();
+    state_outs_grp_.assign(devs.size(), {});
+    for (size_t di = 0; di < devs.size(); di++) {
+        DeviceConfig& d = devs[di];
         if (d.model.state_pairs.empty()) continue;
         if (d.banks < 1) {
             std::fprintf(stderr, "[farm] state_pairs 须银行制（banks=0 inline 无"
@@ -140,8 +170,9 @@ bool Farm::Init(FarmConfig cfg) {
         }
         d.model.state_pool_rows = cfg_.chains;
         has_state_ = true;
+        state_grps_.push_back((int)di);
         for (const auto& pr : d.model.state_pairs)
-            state_out_names_.push_back(pr.out);   // dest 安全网过滤面
+            state_outs_grp_[di].push_back(pr.out);   // dest 安全网过滤面（按组查）
         // 护栏①：推理缓存与状态池互斥——池路径的主机状态行恒陈旧（D2D 不过
         // 主机），HashSlot 键不再反映真实状态=错命中；护栏②：append/headlive
         // 增量 H2D 与状态行 D2D 填充同输入并存=两套 H2D 语义打架
@@ -245,13 +276,23 @@ bool Farm::Init(FarmConfig cfg) {
         if (gi == 0) {
             spec_ = s;
         } else if (!g0_deferred && !SpecStructurallyEqual(spec_, s)) {
-            std::fprintf(stderr, "[farm] 设备 %zu 模型结构与设备 0 不一致"
-                         "（输入名/行宽/dtype、输出名/宽须全同；dim0 可异"
-                         "[异构批形状]）\n", gi);
-            for (auto* x : group_bes_) delete x;
-            group_bes_.clear();
-            group_specs_.clear();
-            return false;
+            if (!ModelIdentitySame(devs[0].model, devs[gi].model)) {
+                // 组间异 IO 解禁（W2）：模型配置不同的组允许各带各的 spec
+                //（双模型主/池组；决策级路由按组组装）。同配置组间仍 fail fast。
+                std::fprintf(stderr, "[farm] 组 %zu 异 IO 解禁（模型与组 0 不同："
+                             "%s/%s）\n", gi, devs[gi].model.backend.c_str(),
+                             devs[gi].model.model_path.empty()
+                                 ? devs[gi].model.engine_path.c_str()
+                                 : devs[gi].model.model_path.c_str());
+            } else {
+                std::fprintf(stderr, "[farm] 设备 %zu 模型结构与设备 0 不一致"
+                             "（输入名/行宽/dtype、输出名/宽须全同；dim0 可异"
+                             "[异构批形状]）\n", gi);
+                for (auto* x : group_bes_) delete x;
+                group_bes_.clear();
+                group_specs_.clear();
+                return false;
+            }
         }
         group_specs_.push_back(s);
     }
@@ -313,6 +354,9 @@ bool Farm::Init(FarmConfig cfg) {
             g.banks = devs[gi].banks;
             g.spec = group_specs_[gi];   // 组规格（slots=组实际形状）
             g.slots = group_specs_[gi].slots;
+            // 固批按组解析（W3）：显式配置优先，env FARM_FIXED_BATCH 兜底
+            g.fixed_batch = devs[gi].fixed_batch >= 0
+                ? devs[gi].fixed_batch : EnvInt("FARM_FIXED_BATCH", 0);
             groups.push_back(g);
         }
         if (!bank_obj_.InitGroups(bc, groups, &spec_)) {
@@ -320,12 +364,16 @@ bool Farm::Init(FarmConfig cfg) {
             return false;
         }
         bank_ = &bank_obj_;
+        if (g0_deferred) group_specs_[0] = spec_;   // 延迟收割回填组 0 spec
+                                                    //（HashSlot 按组查的面）
         if (g0_deferred) {
             // 探测砍除通道的后置校验（原 LoadSpec 期检查后移）：slots/组间
-            // 结构/population——失败=显式关银行（Init 只建未跑，安全）再退
+            // 结构/population——失败=显式关银行（Init 只建未跑，安全）再退。
+            // 组间结构核对带 W2 解禁判据（模型配置不同的组允许异 IO）。
             bool bad = spec_.slots != cfg_.slots;
             for (size_t gi = 1; gi < group_specs_.size() && !bad; gi++)
-                bad = !SpecStructurallyEqual(spec_, group_specs_[gi]);
+                bad = !SpecStructurallyEqual(spec_, group_specs_[gi])
+                      && ModelIdentitySame(devs[0].model, devs[gi].model);
             if (!bad && !cfg_.model.population_input.empty()) {
                 bool has_pop = false;
                 for (auto& m : spec_.ins)
@@ -468,10 +516,12 @@ CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
     CacheHasher h;
     uint32_t gn = (uint32_t)grp * 0x1B873593u;   // 设备命名空间：异构组同字节
     h.Update(&gn, sizeof gn);                     // 行输出逐位可异，不共享条目
-    for (size_t i = 0; i < spec_.ins.size(); i++) {
-        if (spec_.ins[i].population) continue;   // pop 面不哈希（代次 gen 已管）
+    // 按路由组自己的 spec 走（W2 组间异 IO：各组的面名/行宽各说各话）
+    const ModelSpec& gs = group_specs_[(size_t)grp];
+    for (size_t i = 0; i < gs.ins.size(); i++) {
+        if (gs.ins[i].population) continue;      // pop 面不哈希（代次 gen 已管）
         size_t rb = 0;
-        void* row = bank_->InputRow(bk, sl, spec_.ins[i].name.c_str(), &rb);
+        void* row = bank_->InputRow(bk, sl, gs.ins[i].name.c_str(), &rb);
         if (row && rb) h.Update(row, rb);
     }
     return h.Finalize();
@@ -490,10 +540,12 @@ bool Farm::DriveDecision(GameAdapter* g, int grp, int chain_id) {
             nd = BankScheduler::kMaxOutputDests;
         }
         // ③安全网：配对输出的 dest 过滤——池模式该输出不过 D2H，主机行恒
-        // 陈旧，回填=静默垃圾。适配器不该申报（契约），申报了=忽略+一次性警告
+        // 陈旧，回填=静默垃圾。适配器不该申报（契约），申报了=忽略+一次性警告。
+        // 按路由组查（W2 组间异 IO：状态面是各组的声明，非全局）。
         if (has_state_ && nd > 0) {
             auto is_state_out = [&](const char* nm) {
-                for (const auto& so : state_out_names_)
+                if (grp < 0 || grp >= (int)state_outs_grp_.size()) return false;
+                for (const auto& so : state_outs_grp_[(size_t)grp])
                     if (so == nm) return true;
                 return false;
             };
@@ -592,15 +644,20 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
     if (cfg_.population.models > 0)   // 链→模型映射（框架喂，适配器免工厂闭包）
         g->SetModelId((int64_t)((uint32_t)chain_id
                                 % (uint32_t)cfg_.population.models));
-    const int grp = chain_grp_.empty() ? 0
+    const int pinned_grp = chain_grp_.empty() ? 0
         : chain_grp_[(size_t)((uint32_t)chain_id % (uint32_t)chain_grp_.size())];
                                           // 链→组（加权轮询表；表长=chains）
-    if (has_state_ && !bank_->ResetStatePool(grp, chain_id)) {
-        std::fprintf(stderr, "[farm] 状态池行 %d 清零失败（组 %d）——手起清零是"
-                     "正确性前提，判负退出\n", chain_id, grp);
-        g->OnInferFail();
-        NoteGameDone(false, -1, 0, true, -1, chain_id, game_id);
-        return;
+    // ③状态池行清零：声明 state_pairs 的**全部组**（决策级路由下链可访多组，
+    // 各状态组行都要干净起局；非状态组无池不查）
+    if (has_state_) {
+        for (int sg : state_grps_) {
+            if (bank_->ResetStatePool(sg, chain_id)) continue;
+            std::fprintf(stderr, "[farm] 状态池行 %d 清零失败（组 %d）——手起"
+                         "清零是正确性前提，判负退出\n", chain_id, sg);
+            g->OnInferFail();
+            NoteGameDone(false, -1, 0, true, -1, chain_id, game_id);
+            return;
+        }
     }
     long long dec = 0;
     bool infer_fail = false;
@@ -615,6 +672,23 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
         if (!g->AdvanceToDecision()) break;
         if (census_.on) census_.OnAdv(Census::NowNsI() - tv0);
         dec++;
+        // 决策级组路由（W2，REPLY10 §2）：适配器逐决策申报组号，缺省 -1=
+        // 链钉扎（零改动零行为差）。越界=适配器违约（判负纪律，不静默钳位）。
+        int grp = pinned_grp;
+        if (bank_) {
+            const int rg = g->RouteGroup();
+            if (rg >= 0) {
+                if (rg >= n_dev_) {
+                    std::fprintf(stderr, "[farm] RouteGroup()=%d 越界"
+                                 "（n_groups=%d）——本局判负（适配器违约）\n",
+                                 rg, n_dev_);
+                    g->OnInferFail();
+                    infer_fail = true;
+                    break;
+                }
+                grp = rg;
+            }
+        }
         if (!DriveDecision(g, grp, chain_id)) {
             g->OnInferFail();   // 判负纪律：不静默重试（会撕裂确定性）
             infer_fail = true;

@@ -65,6 +65,8 @@ struct BankGroupCfg {
     int banks = 2;               // 本组银行数
     int slots = 0;               // 0=统一形状（BankConfig.slots）；>0=本组形状
     ModelSpec spec;              // 组模型规格（Farm LoadSpec 填；会话建于此）
+    int fixed_batch = -1;        // 本组固批（W3 按组化）：Farm 已解析（env 兜底
+                                 // 后恒 ≥0）；0=关；N=提交行数恒定放大到 N
 };
 
 class BankScheduler {

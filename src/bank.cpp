@@ -103,12 +103,14 @@ struct alignas(64) BankCtl {            // 64B 对齐：相邻银行的 cursor/i
     // 槽基址预解（热路径去虚调用+名字串扫，2026-09-24 审计 P0）：行指针=
     // 基址+slot×row_bytes（InputRow 线性契约，三后端同式）。population 面
     //=nullptr（不走预解，回退后端直查）
-    std::vector<char*> in_rows;                       // 下标=I.spec.ins 下标
+    std::vector<char*> in_rows;                       // 下标=本组 gspec.ins 下标
     std::vector<std::pair<const char*, size_t>> in_idx;   // 名字指针→ins 下标
     // ③槽→池下标（成对状态行）：Claim 写（槽独占期单写者，release）/
     // 发车读（drain 握手给 happens-before）；后端 Init 期 BindStatePids 取
     // 数组地址——每批零接口流量。生命周期=银行池（会话销毁前有效）。
     std::atomic<int>* sp_ids = nullptr;   // [slots]（建池 new/Shutdown delete）
+    int fixed_batch = 0;                  // 本组固批（W3 按组化；InitGroups 从
+                                          // 组配置拷入；0=关）
     // 在途航班（单发=线性生命周期）。非原子字段，同步边=state：
     // 写侧（发车者）先写 flight_* 再 state.store(FLIGHT, release)；
     // 读侧（收割）state.load(FLIGHT, acquire) 后读——release/acquire 配对。
@@ -144,13 +146,11 @@ struct BankScheduler::Impl {
     bool any_append = false;             // 声明式增量 H2D 面（判决25）存在性：
                                          // Claim 清声明/热路径的门（无 append 面
                                          // =零开销，"数组写点与默认关=零开销同门"）
-    std::vector<std::string> fw_names;   // 恒全量覆写声明暂存（InitGroups 收集各组
-                                         // model.fullwrite_inputs 并集——组间 IO 同
-                                         // 契约；spec 终态点解析）
-    std::vector<char> fw;                // 解析结果（与 spec.ins 同序；空=未声明=
-                                         // 全行清零现状，Claim 快路径零额外判断）
-    std::vector<std::string> st_in_names;   // ③状态输入行名暂存（同上收集/解析）
-    std::vector<char> st_in;                // 解析结果（Claim 清零豁免；空=无状态）
+    // W2 组间异 IO（REPLY10 §2）：各组自己的 spec 与声明旗（Claim 清零/槽基址
+    // 预解/fullwrite/状态行豁免全按本组走；单组农场与旧全局面同值同语义）
+    ModelSpec gspec[kMaxGrp];             // 各组 spec（含组 0 延迟收割回填）
+    std::vector<char> fw_g[kMaxGrp];      // 恒全量覆写旗（每组解析）
+    std::vector<char> st_in_g[kMaxGrp];   // ③状态输入豁免旗（每组）
     // init 握手（会话建在调度台线程上：ORT 图会话 PerThreadContext 铁律）
     std::mutex init_mx;
     std::condition_variable init_cv;
@@ -218,23 +218,27 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
         if (pool_pid >= 0 && b.sp_ids)
             b.sp_ids[v].store(pool_pid, std::memory_order_release);
         // 全行清零（零基契约）：未写区与"零垫基线"逐位同——适配器的清零类
-        // 组装（高水位清零式）依赖"行起点为零"。基址走预解表（空=回退直查）
+        // 组装（高水位清零式）依赖"行起点为零"。基址走预解表（空=回退直查）。
+        // 按本银行所属组的 spec/声明旗走（W2 组间异 IO：各组的面名/行宽各说各话）
         {
             const long long tz0 = I.cen && I.cen->on ? NowNsI() : 0;
-            for (size_t i = 0; i < I.spec.ins.size(); i++) {
-                if (I.spec.ins[i].population) continue;   // population 面不清零
-                if (!I.fw.empty() && I.fw[i]) continue;   // 恒全量覆写声明行（快刀一）
-                if (!I.st_in.empty() && I.st_in[i]) continue;   // ③状态行（D2D 填充）
+            const ModelSpec& gs = I.gspec[b.grp];
+            const std::vector<char>& gfw = I.fw_g[b.grp];
+            const std::vector<char>& gst = I.st_in_g[b.grp];
+            for (size_t i = 0; i < gs.ins.size(); i++) {
+                if (gs.ins[i].population) continue;   // population 面不清零
+                if (!gfw.empty() && gfw[i]) continue;   // 恒全量覆写声明行（快刀一）
+                if (!gst.empty() && gst[i]) continue;   // ③状态行（D2D 填充）
                 if (b.in_rows.empty()) {   // 预解未就绪防御：退回直查（语义同）
                     size_t rb = 0;
-                    void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
+                    void* row = b.be->InputRow(b.sess, gs.ins[i].name.c_str(), v, &rb);
                     if (row) memset(row, 0, rb);
                     continue;
                 }
                 char* base = b.in_rows[i];
                 if (base)
-                    memset(base + (size_t)v * I.spec.ins[i].row_bytes, 0,
-                           I.spec.ins[i].row_bytes);
+                    memset(base + (size_t)v * gs.ins[i].row_bytes, 0,
+                           gs.ins[i].row_bytes);
             }
             if (I.cen && I.cen->on) {
                 I.cen->claim_zero_ns.fetch_add(NowNsI() - tz0, std::memory_order_relaxed);
@@ -582,16 +586,13 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     // 固批旋钮（掼蛋 DATA7 §1 判决落地）：TRT 引擎按批形状选 tactic——
     // n<8 与 n≥8 浮点微差（探针定谳：变批改结果/行位置无关/同 shape 逐位
     // 定），碎批负载（hands 模式）跨跑批形状跳动=近平局 argmax 翻面
-    // （~0.4% 局级噪声）。FARM_FIXED_BATCH=N：提交行数恒定放大到 N（缺省
+    // （~0.4% 局级噪声）。FARM_FIXED_BATCH=N（全局 env）/DeviceConfig.
+    // fixed_batch（W3 按组化，显式优先）：提交行数恒定放大到 N（缺省
     // 0=关=现状）——垃圾行（cursor 到 N 间未领号）=幻影行机制现成
     // （reqs null 跳收割/sp_ids=-1 跳 D2D），行独立+行位置无关契约下不
     // 扰真行；代价=小批多算+批分布直方图恒 N。确定性验收=固批腿复跑逐位同。
-    static const int kFixedBatch = [] {
-        const char* e = std::getenv("FARM_FIXED_BATCH");
-        return e ? std::atoi(e) : 0;
-    }();
-    if (kFixedBatch > 0 && n > 0) {
-        int fn = kFixedBatch > b.slots ? b.slots : kFixedBatch;
+    if (b.fixed_batch > 0 && n > 0) {
+        int fn = b.fixed_batch > b.slots ? b.slots : b.fixed_batch;
         if (n < fn) n = fn;
     }
     if (n <= 0) {   // 空舱（不可达防御）：直接回池
@@ -1046,13 +1047,9 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     }
     impl_ = new Impl();
     Impl& I = *impl_;
-    for (const auto& g : groups)   // 恒全量覆写声明：各组并集（IO 同契约；
-        for (const auto& n : g.model.fullwrite_inputs)   // 重复名解析幂等）
-            I.fw_names.push_back(n);
-    I.st_in_names.clear();   // ③状态输入行名并集（Claim 清零豁免面——
-    for (const auto& g : groups)   // 框架 D2D 填充恒覆盖，清零白清）
-        for (const auto& pr : g.model.state_pairs)
-            I.st_in_names.push_back(pr.in);
+    // 恒全量覆写/③状态行声明：**按组**解析（W2 组间异 IO——旧并集在异 IO 下
+    // 会把 A 组的声明错配进 B 组的 ins 序）。解析点=调度台线程会话建成后
+    //（gspec 落位处，groups 捕获可用）。
     I.cen = cen_;
     I.cfg = cfg;
     I.spin = cfg.spin;
@@ -1109,6 +1106,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 b.grp = g;
                 b.be = gc.be;
                 b.slots = gslots;
+                b.fixed_batch = gc.fixed_batch;   // 组固批（Farm 已解析 ≥0）
                 if (g == 0 && gc.spec.ins.empty()) {
                     // 探测砍除通道（能力位 ProbeFreeSpec）：首个真实银行会话
                     // 顺带产出组 0 spec——省一次建探测会话即毁（YGO 清单模式
@@ -1129,7 +1127,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                     }
                     gspec = g0_harvest;
                     gspec.slots = gslots;
-                    I.spec = g0_harvest;      // Claim 清零面立即可用
+                    I.spec = g0_harvest;      // 全局兼容面（inline/spec()）立即可用
                     *spec_out = g0_harvest;   // Farm 侧 spec_ 回填
                 } else {
                     b.sess = b.be->CreateSession(gc.model, gspec, /*for_bank=*/true);
@@ -1153,6 +1151,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                     break;
                 }
             }
+            if (ok) I.gspec[g] = gspec;   // 组 spec 落位（g0 延迟收割后已终态）
         }
         int built = id;
         // 槽基址预解（P0-2，2026-09-24 审计）：全部会话建好后一次性解析
@@ -1161,46 +1160,52 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
         // 运行期 push_back=堆损坏（首版间歇段错误案，2026-09-24）
         for (int i = 0; i < built; i++) {
             BankCtl& b = I.banks[(size_t)i];
-            b.in_rows.assign(I.spec.ins.size(), nullptr);
-            b.in_idx.reserve(I.spec.ins.size());
-            for (size_t ii = 0; ii < I.spec.ins.size(); ii++) {
-                if (I.spec.ins[ii].population) continue;
+            const ModelSpec& bs = I.gspec[b.grp];   // 本组 spec（W2 组间异 IO）
+            b.in_rows.assign(bs.ins.size(), nullptr);
+            b.in_idx.reserve(bs.ins.size());
+            for (size_t ii = 0; ii < bs.ins.size(); ii++) {
+                if (bs.ins[ii].population) continue;
                 size_t rb = 0;
-                b.in_rows[ii] = (char*)b.be->InputRow(b.sess, I.spec.ins[ii].name.c_str(), 0, &rb);
-                b.in_idx.push_back({I.spec.ins[ii].name.c_str(), ii});
+                b.in_rows[ii] = (char*)b.be->InputRow(b.sess, bs.ins[ii].name.c_str(), 0, &rb);
+                b.in_idx.push_back({bs.ins[ii].name.c_str(), ii});
             }
         }
         // 声明式增量 H2D（判决25）：delta 面（append|headlive）存在性门
         //（spec 此刻已终态——组 0 延迟收割也已完成）。无 delta 面=Claim 清
-        // 声明分支零占用。
-        for (auto& m : I.spec.ins)
-            if (m.append || m.headlive) { I.any_append = true; break; }
+        // 声明分支零占用。按组扫（W2 异 IO：各组的面各查各的）
+        for (int g = 0; g < I.n_groups; g++)
+            for (auto& m : I.gspec[g].ins)
+                if (m.append || m.headlive) { I.any_append = true; break; }
         // 恒全量覆写行旗（掼蛋 DATA2 快刀一）：声明行 Claim/inline 跳过清零
         //（适配器承诺每次 AssembleInto 全量覆写该行——状态行大户每决策立省
         // 槽行 memset；违诺=槽残留旧字节静默错推理，执法面=乘客指纹门）。
-        // 未命中名=拼写错误，零行为差但要嚷出来。
-        if (!I.fw_names.empty()) {
-            I.fw.assign(I.spec.ins.size(), 0);
-            int nhit = 0;
-            for (const auto& n : I.fw_names) {
-                bool hit = false;
-                for (size_t ii = 0; ii < I.spec.ins.size(); ii++)
-                    if (I.spec.ins[ii].name == n) { I.fw[ii] = 1; hit = true; break; }
-                if (hit) nhit++;
-                else
-                    std::fprintf(stderr, "[bank] fullwrite 声明 %s 未命中任何输入"
-                                 "（零行为差；查拼写）\n", n.c_str());
+        // 未命中名=拼写错误，零行为差但要嚷出来。**按组解析**（W2：声明跟
+        // 组走，不再并集——异 IO 下并集会把 A 组声明错配进 B 组 ins 序）
+        for (int g = 0; g < I.n_groups; g++) {
+            const ModelSpec& gs = I.gspec[g];
+            const auto& fwn = groups[(size_t)g].model.fullwrite_inputs;
+            if (!fwn.empty()) {
+                I.fw_g[g].assign(gs.ins.size(), 0);
+                int nhit = 0;
+                for (const auto& n : fwn) {
+                    bool hit = false;
+                    for (size_t ii = 0; ii < gs.ins.size(); ii++)
+                        if (gs.ins[ii].name == n) { I.fw_g[g][ii] = 1; hit = true; break; }
+                    if (hit) nhit++;
+                    else
+                        std::fprintf(stderr, "[bank] 组 %d fullwrite 声明 %s 未命中"
+                                     "任何输入（零行为差；查拼写）\n", g, n.c_str());
+                }
+                std::fprintf(stderr, "[bank] 组 %d fullwrite 行旗生效: %d/%zu 输入行"
+                             "跳过 Claim 清零（承诺=每次 AssembleInto 全量覆写）\n",
+                             g, nhit, gs.ins.size());
             }
-            std::fprintf(stderr, "[bank] fullwrite 行旗生效: %d/%zu 输入行跳过"
-                         " Claim 清零（承诺=每次 AssembleInto 全量覆写）\n",
-                         nhit, I.spec.ins.size());
-        }
-        // ③状态输入行旗（成对状态行）：Claim 清零豁免——框架 D2D 填充恒覆盖
-        if (!I.st_in_names.empty()) {
-            I.st_in.assign(I.spec.ins.size(), 0);
-            for (const auto& n : I.st_in_names)
-                for (size_t ii = 0; ii < I.spec.ins.size(); ii++)
-                    if (I.spec.ins[ii].name == n) { I.st_in[ii] = 1; break; }
+            // ③状态输入行旗（成对状态行）：Claim 清零豁免——框架 D2D 填充恒覆盖
+            for (const auto& pr : groups[(size_t)g].model.state_pairs) {
+                if (I.st_in_g[g].empty()) I.st_in_g[g].assign(gs.ins.size(), 0);
+                for (size_t ii = 0; ii < gs.ins.size(); ii++)
+                    if (gs.ins[ii].name == pr.in) { I.st_in_g[g][ii] = 1; break; }
+            }
         }
         // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
         // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）

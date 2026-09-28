@@ -30,6 +30,12 @@
 //     确定性构造（违约可观性依赖槽历史）——执法面=乘客指纹纪律
 //     （牙齿+机器断言面双验）。ort CUDA 专属通道：无工件/无运行时=SKIP
 //     （cpu 后端对声明零反应=full 现状，G1-G15 已覆盖该面）
+//  G18 固批旋钮（FARM_FIXED_BATCH，掼蛋 DATA7 §1，2026-09-29）：固批腿==
+//     基线腿逐位同（cpu 面行独立+shape 无关）；复跑同
+//  G19 决策级组路由+组间异 IO+固批按组（W2/W5，REPLY10 §2 双模型门，
+//     2026-09-30）：双模型双组（真异 IO），分裂腿每链==对应专组腿逐位同
+//     （指纹/结局/先后手粒度）；分裂+缓存同（HashSlot 按组）；局内变道腿
+//     复跑逐位同（决策级路由确定性）；固批按组==分裂腿同；越界组号判负
 #include "../examples/toy/toy_adapter.h"
 #include "../examples/gomoku/gomoku_adapter.h"
 #include "inferfarm/affinity.h"
@@ -977,6 +983,201 @@ int main() {
               "G18a 固批腿（FARM_FIXED_BATCH=8）==基线腿逐位同（含指纹）");
         unsigned long long fpf2 = g18_leg(true);
         CHECK(fpf2 == fpf, "G18b 固批腿复跑逐位同");
+    }
+
+    // ---------------- G19：决策级组路由 + 组间异 IO + 固批按组（W2/W5，
+    // REPLY10 §2 双模型门）----------------
+    // 双模型双组（模型 A=obs[8] 线性 / 模型 B=obsB[4] 异权重——IO 真异）：
+    //  a) 专组腿（RouteGroup=0，单组农场各跑 A/B）= 每链基准指纹
+    //  b) 分裂腿（链奇偶各路由到 A/B 组）每链逐位等于对应专组腿（含先后手/
+    //     结局粒度）——路由不改任何一链的数学
+    //  c) 分裂+缓存腿逐位同（HashSlot 按路由组 spec 走的机器门）
+    //  d) 变道腿（局内前半 A 组后半 B 组）复跑逐位同（决策级路由的确定性）
+    //  e) 固批按组（组 0=8/组 1=0）== 分裂腿逐位同（cpu 形状无关=按组旋钮
+    //     端到端；env 全局路径=G18）
+    //  f) 越界组号=判负纪律（infer_fails 全额，农场不崩）
+    {
+        struct RouteCtx {
+            std::vector<long long> fp;      // 每链末局指纹（GameFingerprint 登记面）
+            std::vector<int> out, wf;       // 每链末局结局/先后手
+            void reset(int chains) {
+                fp.assign((size_t)chains, -12345);
+                out.assign((size_t)chains, -999);
+                wf.assign((size_t)chains, -1);
+            }
+        };
+        struct RouteCfg { RouteCtx* ctx; int mode; int face; };   // mode: 0=专组
+        // 1=链奇偶 2=局内变道 3=越界坏路由；face=专组腿的模型面（0=A/1=B——
+        // 单组农场里组号恒 0，组装面必须跟模型配对走而非组号）
+        struct RouteToyAdapter : inferfarm::toy::ToyAdapter {
+            using Base = inferfarm::toy::ToyAdapter;
+            RouteCtx* ctx = nullptr;
+            int mode = 0;
+            int face = 0;
+            RouteToyAdapter(int chain, RouteCtx* c, int m, int f) : Base(chain),
+                ctx(c), mode(m), face(f) {}
+            int cur_grp() const {
+                if (mode == 3) return 99;                  // 越界（n_groups=2）
+                if (mode == 2) return turn < 4 ? 0 : 1;    // 局内变道
+                if (mode == 0) return 0;                   // 专组（唯一组）
+                return chain_tls.chain & 1;                // 链奇偶分裂
+            }
+            int RouteGroup() override { return cur_grp(); }
+            void AssembleInto(SlotWriter& slot) override {
+                // 组装面：专组腿=固定 face；双组腿=本决策路由组（面=组配对）
+                const int tgt = (mode == 0) ? face : cur_grp();
+                if (tgt == 0) { Base::AssembleInto(slot); return; }
+                float* obs = (float*)slot.Row("obsB", nullptr);
+                float* mask = (float*)slot.Row("mask", nullptr);
+                int64_t* codes = (int64_t*)slot.Row("codes", nullptr);
+                if (!obs || !mask || !codes) return;   // 写不进=判负可见
+                uint32_t r = rng;
+                for (int i = 0; i < 4; i++) {
+                    obs[i] = (float)(toy::ToyLcg(r) % 97) / 97.0f;
+                    obs[i] += (float)(score_us + score_them + turn) * 0.001f
+                              * (float)(i + 1);
+                }
+                for (int a = 0; a < toy::kActN; a++)
+                    mask[a] = (a == 3 && turn < toy::kTurns - 2) ? 0.0f : 1.0f;
+                codes[0] = turn;
+                codes[1] = we_first_ ? 1 : 0;
+                codes[2] = (int64_t)(toy::t_toy_tls
+                                     ? toy::t_toy_tls->decisions_this_chain : 0) % 7;
+            }
+            int Outcome() override {
+                int o = Base::Outcome();
+                if (ctx) ctx->out[(size_t)chain_tls.chain] = o;
+                return o;
+            }
+            bool WeAreFirst() override {
+                bool w = Base::WeAreFirst();
+                if (ctx) ctx->wf[(size_t)chain_tls.chain] = w ? 1 : 0;
+                return w;
+            }
+            long long GameFingerprint() override {
+                long long fp = Base::GameFingerprint();
+                if (ctx) ctx->fp[(size_t)chain_tls.chain] = fp;
+                return fp;
+            }
+        };
+        auto declA = [](int slots) { return toy::ToyModelDecl(slots); };
+        auto declB = [](int slots) {
+            CpuModelDecl d;
+            d.slots = slots;
+            d.ins.push_back({"obsB", DTYPE_F32, {4}});
+            d.ins.push_back({"mask", DTYPE_F32, {toy::kActN}});
+            d.ins.push_back({"codes", DTYPE_I64, {toy::kCodes}});
+            d.outs.push_back({"policy", toy::kActN});
+            d.outs.push_back({"value", 1});
+            d.weight_seed = 0x9E3779B9u;   // 异权重=异引擎世界（ins 名/宽也异：
+            return d;                      // IO 真异，非同构仿真）
+        };
+        const int kCh = 4, kGames = 16;
+        RouteCtx cA, cB, cS, cSc, cV1, cV2, cF;
+        cA.reset(kCh); cB.reset(kCh); cS.reset(kCh); cSc.reset(kCh);
+        cV1.reset(kCh); cV2.reset(kCh); cF.reset(kCh);
+        // use_b：单组腿的模型选择（专组 B 腿=异 IO 模型当单组起农场）
+        auto leg = [&](RouteCtx* rc, int mode, bool dual, bool use_b,
+                       int cache_log2, int fb0, int fb1) -> FarmTally {
+            const int face = use_b ? 1 : 0;   // 专组腿的组装面=所配模型
+            RouteCfg rcfg{rc, mode, face};
+            FarmConfig cfg;
+            cfg.name = "g19";
+            cfg.chains = kCh;
+            cfg.games = kGames;
+            cfg.seed0 = 20260930u;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.cache_log2 = cache_log2;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = use_b ? declB(cfg.slots) : declA(cfg.slots);
+            if (dual) {
+                DeviceConfig a, b;
+                a.model.backend = "cpu";
+                a.model.cpu = declA(8);
+                a.banks = 1;
+                a.fixed_batch = fb0;
+                b.model.backend = "cpu";
+                b.model.cpu = declB(8);
+                b.banks = 1;
+                b.fixed_batch = fb1;
+                cfg.devices = {a, b};
+            }
+            Farm farm;
+            AdapterFactory make = [](int chain, void* user) -> GameAdapter* {
+                RouteCfg* p = (RouteCfg*)user;
+                return new RouteToyAdapter(chain, p->ctx, p->mode, p->face);
+            };
+            if (!farm.Init(cfg)) { g_fail++; return FarmTally{}; }
+            farm.RunLeg(make, &rcfg);
+            return farm.tally();
+        };
+        FarmTally tA = leg(&cA, 0, false, false, 0, -1, -1);   // 专组 A（单组）
+        FarmTally tB = leg(&cB, 0, false, true, 0, -1, -1);    // 专组 B（单组，异 IO 模型）
+        CHECK(tA.decisions > 0 && tB.decisions == tA.decisions,
+              "G19 专组 A/B 腿完成（异 IO 单组农场可跑；决策数同）");
+        FarmTally tS = leg(&cS, 1, true, false, 0, -1, -1);    // 分裂：偶链→A 组 奇链→B 组
+        CHECK(tS.decisions == tA.decisions && tS.infer_fails == 0,
+              "G19 分裂腿完成（决策数=专组；零推理故障）");
+        bool split_ok = true;
+        for (int c = 0; c < kCh; c++) {
+            const RouteCtx& ref = (c & 1) ? cB : cA;           // 奇链走 B 组
+            if (cS.fp[(size_t)c] != ref.fp[(size_t)c]
+                || cS.out[(size_t)c] != ref.out[(size_t)c]
+                || cS.wf[(size_t)c] != ref.wf[(size_t)c])
+                split_ok = false;
+        }
+        CHECK(split_ok,
+              "G19a 分裂腿每链==对应专组腿逐位同（指纹+结局+先后手粒度；"
+              "路由不改链数学，组间异 IO 行协议成立）");
+        leg(&cSc, 1, true, false, 12, -1, -1);                 // 分裂+缓存
+        CHECK(cSc.fp == cS.fp && cSc.out == cS.out,
+              "G19b 分裂+缓存腿逐位同（HashSlot 按路由组 spec 取行——异 IO 键不串组）");
+        FarmTally tV1 = leg(&cV1, 2, true, false, 0, -1, -1);  // 变道：局内前半 A 后半 B
+        leg(&cV2, 2, true, false, 0, -1, -1);
+        CHECK(tV1.decisions > 0 && tV1.infer_fails == 0
+              && cV1.fp == cV2.fp && cV1.out == cV2.out,
+              "G19c 变道腿复跑逐位同（决策级路由确定性；一局横跨两组）");
+        leg(&cF, 1, true, false, 0, 8, 0);                     // 固批按组：组 0=8 组 1=0
+        CHECK(cF.fp == cS.fp && cF.out == cS.out,
+              "G19d 固批按组（组0=8/组1=0）==分裂腿逐位同（W3 旋钮按组生效；"
+              "cpu 形状无关）");
+        {   // 越界组号=判负纪律
+            RouteCtx cBad; cBad.reset(1);
+            RouteCfg rcfg{&cBad, 3, 0};
+            FarmConfig cfg;
+            cfg.name = "g19bad";
+            cfg.chains = 1;
+            cfg.games = 2;
+            cfg.seed0 = 7u;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 2;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = declA(cfg.slots);
+            DeviceConfig a, b;
+            a.model.backend = "cpu";
+            a.model.cpu = declA(8);
+            a.banks = 1;
+            b.model.backend = "cpu";
+            b.model.cpu = declB(8);
+            b.banks = 1;
+            cfg.devices = {a, b};
+            Farm farm;
+            AdapterFactory make = [](int chain, void* user) -> GameAdapter* {
+                RouteCfg* p = (RouteCfg*)user;
+                return new RouteToyAdapter(chain, p->ctx, p->mode, p->face);
+            };
+            CHECK(farm.Init(cfg), "G19 越界门农场起");
+            farm.RunLeg(make, &rcfg);
+            const FarmTally& t = farm.tally();
+            // dec 在路由校验前已计数=违约决策也算尝试；判负纪律=每局故障+收卷
+            CHECK(t.infer_fails == 2 && t.games_done == 2,
+                  "G19e 越界组号判负纪律（每局判负，农场不崩）");
+        }
     }
 
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
