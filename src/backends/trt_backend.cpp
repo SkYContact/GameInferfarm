@@ -273,13 +273,22 @@ static bool ApplyRefitWeights(nvinfer1::ICudaEngine* eng, const char* path) {
                 n_skip++;
                 continue;
             }
-            if (!known(e.name.c_str())) {
-                std::fprintf(stderr, "[trt] 名单外跳过 %s\n", e.name.c_str());
-                n_skip++;
-                continue;
+            // 名字归一（掼蛋 API 直建图，2026-09-30）：TRT 网络 API 的
+            // add_constant 在 REFIT 模式下成为可换权重，引擎名单名=层名+
+            // " CONSTANT"（角色限定）；onnx 导入流=裸名。RW1 统一写裸名
+            //（state_dict 键），此处先裸名后补后缀重试——两流同门。
+            std::string eff = e.name;
+            if (!known(eff.c_str())) {
+                std::string with_role = e.name + " CONSTANT";
+                if (known(with_role.c_str())) eff = with_role;
+                else {
+                    std::fprintf(stderr, "[trt] 名单外跳过 %s\n", e.name.c_str());
+                    n_skip++;
+                    continue;
+                }
             }
             // 原型校验（TRT 10.x：一参版返回 Weights，dtype/numel 都在里面）
-            nvinfer1::Weights proto = ref->getWeightsPrototype(e.name.c_str());
+            nvinfer1::Weights proto = ref->getWeightsPrototype(eff.c_str());
             if (e.dtype < 4
                 && (proto.type != kDtypeMap[e.dtype]
                     || (uint64_t)proto.count != (uint64_t)e.numel)) {
@@ -295,9 +304,9 @@ static bool ApplyRefitWeights(nvinfer1::ICudaEngine* eng, const char* path) {
             w.type = kDtypeMap[e.dtype];
             w.values = e.data;
             w.count = (int64_t)e.numel;
-            if (!ref->setNamedWeights(e.name.c_str(), w)) {
+            if (!ref->setNamedWeights(eff.c_str(), w)) {
                 std::fprintf(stderr, "[trt] setNamedWeights(%s) 失败（dtype/numel 与引擎"
-                             "原型不一致？numel=%u）\n", e.name.c_str(), e.numel);
+                             "原型不一致？numel=%u）\n", eff.c_str(), e.numel);
                 failed = true;
                 break;
             }
