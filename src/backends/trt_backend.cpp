@@ -102,10 +102,17 @@ static void* g_trt_dll = nullptr;
 
 struct TrtEngineCache {
     std::string path;
-    nvinfer1::IRuntime* rt = nullptr;      // 全进程一份（create/deserialize 线程安全）
-    nvinfer1::ICudaEngine* eng = nullptr;  // 一份权重；多会话各建 context
+    nvinfer1::ICudaEngine* eng = nullptr;  // 一份权重；多会话各建 context。
+                                          // 生命周期=进程（不释放——会话/context
+                                          // 引用其设备权重；多引擎常驻=④/双模型
+                                          // 的显存代价由调用方控制引擎数）
 };
-static TrtEngineCache g_trt_eng;
+// W1 一进程多引擎（2026-09-30）：单例→按路径缓存。E/D 分频与双模型共根。
+// runtime 全进程一份（create/deserialize 线程安全）；引擎指针归 backend 实例
+// （LoadSpec 定 path，RefitWeights 随实例——多组各持不同引擎互不串）。
+static nvinfer1::IRuntime* g_trt_rt_shared = nullptr;
+static std::mutex g_engs_mx;
+static std::vector<TrtEngineCache>* g_engs_ptr = nullptr;
 
 static bool LoadTrtLib(const ModelConfig& cfg) {
     if (g_trt_create_runtime) return true;
@@ -405,7 +412,7 @@ public:
         dev_id_ = cfg.device_id;   // 多卡：engine 反序列化落定设备（同架构双卡
         if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);   // 可共享 engine；>0 本机未测）
         if (!EnsureEngine(cfg)) return false;
-        nvinfer1::ICudaEngine* eng = g_trt_eng.eng;
+        nvinfer1::ICudaEngine* eng = eng_->eng;
         out.backend = "trt";
         out.slots = slots;
         int n_io = eng->getNbIOTensors();
@@ -467,8 +474,8 @@ public:
 
     void* CreateSession(const ModelConfig& cfg, const ModelSpec& spec, bool for_bank) override {
         (void)for_bank;
-        if (!g_trt_eng.eng) return nullptr;
-        nvinfer1::ICudaEngine* eng = g_trt_eng.eng;
+        if (!eng_ || !eng_->eng) return nullptr;
+        nvinfer1::ICudaEngine* eng = eng_->eng;
         TrtSession* s = new TrtSession();
         s->slots = spec.slots;
         s->dev = cfg.device_id;
@@ -836,16 +843,18 @@ public:
     }
 
     bool RefitWeights(const char* rw1_path) override {
-        if (!g_trt_eng.eng) {
+        if (!eng_ || !eng_->eng) {
             std::fprintf(stderr, "[trt] engine 未载——换心不可用\n");
             return false;
         }
         if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);
-        return ApplyRefitWeights(g_trt_eng.eng, rw1_path);
+        return ApplyRefitWeights(eng_->eng, rw1_path);
     }
 
 private:
     int dev_id_ = 0;   // 实例设备（LoadSpec 落定；多卡守卫用）
+    TrtEngineCache* eng_ = nullptr;   // W1：本实例引擎（EnsureEngine 落定；
+                                      // RefitWeights/会话建 context 随实例）
     // ③状态池（backend 实例级——组内银行共享设备池；链→组钉扎=无跨组状态。
     // 首个带 state_pairs 的会话创建时分配一次，零基一次；析构释放）
     struct StatePool {
@@ -890,31 +899,40 @@ public:
     }
 
 private:
-    static bool EnsureEngine(const ModelConfig& cfg) {
-        if (g_trt_eng.eng) {
-            if (!cfg.engine_path.empty() && g_trt_eng.path != cfg.engine_path) {
-                std::fprintf(stderr, "[trt] 一进程只支持一个 engine（已载 %s，又要 %s）\n",
-                             g_trt_eng.path.c_str(), cfg.engine_path.c_str());
-                return false;
-            }
+    bool EnsureEngine(const ModelConfig& cfg) {   // 实例方法：eng_ 落定
+        // 已绑定本实例引擎且路径一致=幂等快路
+        if (eng_ && eng_->eng
+            && (cfg.engine_path.empty() || eng_->path == cfg.engine_path))
             return true;
+        if (cfg.engine_path.empty()) {
+            std::fprintf(stderr, "[trt] 缺 engine 路径\n");
+            return false;
         }
         // ScheduleSpin：enqueueV3 异步返回后的设备等待恒忙等（Auto 策略会睡
-        // 1-3ms/批——唤醒税）。须在首个 CUDA 调用（ctx 创建）前设。
-        if (g_cu.GetDeviceFlags && g_cu.SetDeviceFlags) {
+        // 1-3ms/批——唤醒税）。须在首个 CUDA 调用（ctx 创建）前设（一次）。
+        if (g_cu.GetDeviceFlags && g_cu.SetDeviceFlags && !g_trt_rt_shared) {
             unsigned fl = 0;
             if (g_cu.GetDeviceFlags(&fl) == 0)
                 g_cu.SetDeviceFlags(fl | 0x01 /*cudaDeviceScheduleSpin*/);
         }
-        void* rt = g_trt_create_runtime(&g_trt_log, TrtVersionInt());
-        if (!rt)
-            rt = g_trt_create_runtime(&g_trt_log, (int32_t)NV_TENSORRT_VERSION);
-        if (!rt) {
-            std::fprintf(stderr, "[trt] createInferRuntime 失败（版本整型 %d，DLL 与"
-                         " engine 不同代？）\n", (int)TrtVersionInt());
-            return false;
+        if (!g_trt_rt_shared) {
+            void* rt = g_trt_create_runtime(&g_trt_log, TrtVersionInt());
+            if (!rt)
+                rt = g_trt_create_runtime(&g_trt_log, (int32_t)NV_TENSORRT_VERSION);
+            if (!rt) {
+                std::fprintf(stderr, "[trt] createInferRuntime 失败（版本整型 %d，DLL 与"
+                             " engine 不同代？）\n", (int)TrtVersionInt());
+                return false;
+            }
+            g_trt_rt_shared = (nvinfer1::IRuntime*)rt;
         }
-        g_trt_eng.rt = (nvinfer1::IRuntime*)rt;
+        std::lock_guard<std::mutex> lk(g_engs_mx);
+        if (!g_engs_ptr) g_engs_ptr = new std::vector<TrtEngineCache>();
+        for (auto& e : *g_engs_ptr)
+            if (e.path == cfg.engine_path && e.eng) {
+                eng_ = &e;
+                return true;   // 同路径复用（多组同引擎：权重共享，refit 随实例）
+            }
         const std::string& p = cfg.engine_path;
         FILE* f = fopen(p.c_str(), "rb");
         if (!f) {
@@ -936,13 +954,15 @@ private:
             std::fprintf(stderr, "[trt] engine 读取不完整: %s\n", p.c_str());
             return false;
         }
-        g_trt_eng.eng = g_trt_eng.rt->deserializeCudaEngine(blob.data(), blob.size());
-        if (!g_trt_eng.eng) {
+        nvinfer1::ICudaEngine* eng =
+            g_trt_rt_shared->deserializeCudaEngine(blob.data(), blob.size());
+        if (!eng) {
             std::fprintf(stderr, "[trt] 反序列化失败: %s（TF32 环境不一致会拒建 context）\n",
                          p.c_str());
             return false;
         }
-        g_trt_eng.path = p;
+        g_engs_ptr->push_back(TrtEngineCache{p, eng});
+        eng_ = &g_engs_ptr->back();
         return true;   // 换心走 RefitWeights()（Farm 在 context 创建前调）
     }
 

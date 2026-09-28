@@ -808,9 +808,10 @@ int main(int argc, char** argv) {
     // 玩具引擎 S_next=S_prev+x 跨决策累加+每链多局（换局池行清零验证）。
     // 主门：池路径（state_pairs 声明）==主机路径（影子累加）同 seed 逐位同
     //（池错/粘滞错/清零漏必指纹红）+复跑同。trt 面（工件缺席=SKIP）。
-    // 独立子档跑（`trt r9`）：trt 后端一进程一引擎（全局缓存），与 R2-R7 的
-    // gomoku 引擎互斥——有 gomoku 工件在场的完整面自动 SKIP R9。
-    if ((!only || !std::strcmp(only, "trt")) && !have_trt) {
+    // W1 后一进程多引擎：R9 玩具引擎与 R2-R7 的 gomoku 引擎**同进程共存**
+    //（这正是 W1 的验收门——两引擎并发=④/双模型共根能力）。`trt r9` 子档
+    // 保留（无 gomoku 工件环境的最小跑法）。
+    if (!only || !std::strcmp(only, "trt")) {
         const char* kToy = "models/state_toy.fb8.trt";
         if (!FileExists(kToy)) {
             std::printf("SKIP R9: 无 %s（tools/bake_state_toy.py + bake_fb8_trt.py）\n",
