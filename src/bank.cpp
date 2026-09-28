@@ -39,13 +39,15 @@ static inline void SpinPause() {
 
 // 自旋/诊断节拍（原 4000/0x3FFFF 魔法数命名；来源=本机扫描：短自旋覆盖
 // 调度台 µs 级还池的绝大多数，溢出才走挂起路径）
-// Claim 短自旋上限（FARM_CLAIM_SPINS 可调，缺省 4000）。掼蛋 DATA2：满载争抢
-// 下一次 spin-out ≈560µs 纯烧（256 在飞/512 链≈半数决策的纤维在自旋里对撞）
-// ——高并发大行负载应扫描下调（4000→1000/250/64；0=领号失败即挂起走轮转唤醒）。
-// 只改时序不改算术=指纹门必然逐位同。
+// Claim 短自旋上限（FARM_CLAIM_SPINS 可调，缺省 1000）。缺省 4000→1000
+//（2026-09-28 掼蛋 DATA3 判决）：掼蛋 512 链实测平台无尖峰（1000 最优，
+// 4000/250/64/0 全在 ±2%）+gomoku 512 链高争抢单调向好（4000→1000→0 =
+// 4842→4933→5035 局/s）——1000=两负载共同安全点（0 在掼蛋反亏 1.4%）。
+// 机理：满载争抢下自旋预算烧完≈纯浪费（一次 spin-out≈0.5ms），短自旋
+// 只保"µs 级即释槽"的近邻命中。只改时序不改算术=指纹门必然逐位同。
 static const int kClaimSpins = [] {
     const char* e = std::getenv("FARM_CLAIM_SPINS");
-    return e ? std::atoi(e) : 4000;
+    return e ? std::atoi(e) : 1000;
 }();
 static constexpr long long kDrainDiagMask = 0x3FFFF;   // drain 长等诊断打印分频
 static constexpr int kInlineSpinBeforeYield = 4000;    // inline 完成等待转让出
