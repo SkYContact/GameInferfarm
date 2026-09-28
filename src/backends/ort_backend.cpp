@@ -288,17 +288,7 @@ static void* FenceTicketClaim(uint64_t t) {
     return st;
 }
 
-// P1-5 批拷贝通道：镜像 cudaMemcpyAttributes（CUDA v13.0 driver_types.h:2345；
-// 本仓不引 CUDA 头，布局手核：int enum + 2×cudaMemLocation{enum,uint} + uint
-// = 24B @align4，static_assert 防 Layout 漂移）
-struct HbAttr {
-    int srcAccessOrder;        // 0x3=SrcAccessOrderAny（host 锚写稳、无在先流触碰）
-    unsigned srcLocHint[2];    // cudaMemLocation（非托管/忽略场景全零）
-    unsigned dstLocHint[2];
-    unsigned flags;
-};
-static_assert(sizeof(HbAttr) == 24, "cudaMemcpyAttributes 布局漂移");
-
+// HbAttr 已提升 cudart_dyn.h（ort/trt 批拷贝共用；③批量 D2D）
 // fence 完成回调（cudaLaunchHostFunc；CUDA 回调线程执行）：只发 OS 信号量
 // ——回调内禁调 CUDA API（官方契约），ReleaseSemaphore 足够
 // fence 完成回调（cudaLaunchHostFunc；CUDA 回调线程执行）：置 done 旗标 +
@@ -810,7 +800,7 @@ public:
                     std::fflush(stderr);
                 }
                 for (size_t i = 0; i < nb; i++) s->dep_h2d_bytes += s->hb_sizes[i];
-                if (g_cu.MemcpyBatchAsync(s->hb_dst.data(), s->hb_src.data(),
+                if (g_cu.MemcpyBatchAsyncV(s->hb_dst.data(), s->hb_src.data(),
                                           s->hb_sizes.data(), nb, &attr,
                                           s->hb_attridx.data(), 1,
                                           s->fence_stream))
@@ -982,7 +972,7 @@ public:
                     HbAttr attr;
                     std::memset(&attr, 0, sizeof attr);
                     attr.srcAccessOrder = 0x3;   // SrcAccessOrderAny（同 P1-5）
-                    if (g_cu.MemcpyBatchAsync(s->hb_dst.data(),
+                    if (g_cu.MemcpyBatchAsyncV(s->hb_dst.data(),
                                               s->hb_src.data(),
                                               s->hb_sizes.data(), nb, &attr,
                                               s->hb_attridx.data(), 1,
@@ -1525,7 +1515,7 @@ private:
                            const char* e = getenv("FARM_H2D_BATCH");
                            return e && *e && atoi(e) == 1;
                        }()
-                    && g_cu.MemcpyBatchAsync != nullptr;   // 符号缺席=回退逐输入
+                    && g_cu.MemcpyBatchOk();   // 符号缺席=回退逐输入
                 std::fprintf(stderr, "[ort] FARM_ORT_ASYNC=3：fence 桥接启用"
                              "（H2D 同步锚+信号量完成通知）%s\n",
                              s->h2d_async ? "+H2D 异步（FARM_H2D_ASYNC=1，YGO 实测"

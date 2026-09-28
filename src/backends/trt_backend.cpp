@@ -369,6 +369,14 @@ struct TrtSession {
     std::vector<int> pool_rows;          // 池号→池行数（幻影行卫的 static 面用）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（Claim 写/
                                                   // 发车读；未绑=Init 期冒烟走旧路）
+    // ③批量 D2D scratch（填充/散射逐行小拷合并为单次 cudaMemcpyBatchAsync
+    //——发车段 API 税∝提交次数；判决25 同机器。调度台线程独占=无锁）
+    struct StBatch {
+        std::vector<void*> dst, src;
+        std::vector<size_t> sz, ai;
+        void clear() { dst.clear(); src.clear(); sz.clear(); ai.clear(); }
+        bool empty() const { return dst.empty(); }
+    } sb;
     int slots = 64;
     int dev = 0;      // 会话设备（多卡：分配/流/图/邮箱全落此设备）
     int last_n = 0;
@@ -745,15 +753,22 @@ public:
                     char* pool = (char*)s->pool_devs[(size_t)pi];
                     const size_t rb = s->ins[i].meta.row_bytes;
                     const size_t prows = st_pools_[(size_t)pi].rows;
+                    const bool batch = StBatchOn();
                     for (int r = 0; r < n_rows; r++) {
                         const int pid = s->st_pids[r].load(std::memory_order_relaxed);
                         if (pid < 0 || (size_t)pid >= prows)
                             continue;   // 幻影行（轮转归 -1：cursor 虚增未领
                                         // 号）——行内容垃圾无害，填充跳过
-                        if (g_cu.MemcpyAsync(dst + (size_t)r * rb,
-                                             pool + (size_t)pid * rb, rb,
-                                             3 /*D2D*/, s->stream))
+                        if (batch) {
+                            s->sb.dst.push_back(dst + (size_t)r * rb);
+                            s->sb.src.push_back(pool + (size_t)pid * rb);
+                            s->sb.sz.push_back(rb);
+                            s->sb.ai.push_back(0);
+                        } else if (g_cu.MemcpyAsync(dst + (size_t)r * rb,
+                                                    pool + (size_t)pid * rb, rb,
+                                                    3 /*D2D*/, s->stream)) {
                             return false;
+                        }
                     }
                     continue;
                 }
@@ -763,6 +778,7 @@ public:
                     return false;
             }
         }
+        if (!StBatchFlush(s)) return false;   // 状态填充批：单次提交
         return MbSubmit(s, n_rows, seq_out);
     }
 
@@ -917,6 +933,26 @@ private:
         if (mode <= 0 || n_rows <= 0 || n_rows >= s->slots) return false;
         return s->out_h_bytes >= kD2hPartialMinBytes;
     }
+    // ③批量 D2D 档（FARM_STATE_D2D_BATCH=0 杀手锏回逐行=A/B 口径；符号
+    // 缺席自动回逐行——批 API 为 CUDA12.8+ 可选符号）
+    static bool StBatchOn() {
+        static const int mode = [] {
+            const char* e = std::getenv("FARM_STATE_D2D_BATCH");
+            return e ? std::atoi(e) : 1;
+        }();
+        return mode > 0 && g_cu.MemcpyBatchOk();
+    }
+    // flush 批 scratch（单 attr 复用全条目；失败=scratch 清空后 false）
+    static bool StBatchFlush(TrtSession* s) {
+        if (s->sb.empty()) return true;
+        HbAttr attr{};
+        attr.srcAccessOrder = 0x3;
+        int rc = g_cu.MemcpyBatchAsyncV(s->sb.dst.data(), s->sb.src.data(),
+                                       s->sb.sz.data(), s->sb.dst.size(),
+                                       &attr, s->sb.ai.data(), 1, s->stream);
+        s->sb.clear();
+        return rc == 0;
+    }
     // 图外逐输出前缀 D2H + 盖章殿后（盖章在 D2H 之后=旗标到即输出驻留，
     // 流序契约与图内四段完全一致）
     static bool EnqueuePartialD2H(TrtSession* s, int n_rows) {
@@ -933,6 +969,8 @@ private:
     // D2D 散射回池（不过主机）+非状态输出前缀 D2H+盖章殿后（流序契约不变：
     // 旗标到=散射与 D2H 均已执行）
     static bool EnqueueStateTail(TrtSession* s, int n_rows) {
+        s->sb.clear();   // 防御：早退不留陈旧条目（填充批已在 Submit 清空）
+        const bool batch = StBatchOn();
         for (size_t oi = 0; oi < s->outs.size(); oi++) {
             const int pi = oi < s->st_out.size() ? s->st_out[oi] : -1;
             const size_t rb = (size_t)s->outs[oi].meta.width * sizeof(float);
@@ -945,15 +983,23 @@ private:
                     if (pid < 0 || (size_t)pid >= prows)
                         continue;   // 幻影行：不散射（陈旧 pid 会把垃圾写进
                                     // 他链池行=状态投毒；与填充侧同卫）
-                    if (g_cu.MemcpyAsync(pool + (size_t)pid * rb,
-                                         src + (size_t)r * rb, rb, 3, s->stream))
+                    if (batch) {
+                        s->sb.dst.push_back(pool + (size_t)pid * rb);
+                        s->sb.src.push_back((void*)(src + (size_t)r * rb));
+                        s->sb.sz.push_back(rb);
+                        s->sb.ai.push_back(0);
+                    } else if (g_cu.MemcpyAsync(pool + (size_t)pid * rb,
+                                                src + (size_t)r * rb, rb, 3,
+                                                s->stream)) {
                         return false;
+                    }
                 }
             } else if (g_cu.MemcpyAsync(s->outs[oi].host, s->outs[oi].dev,
                                         (size_t)n_rows * rb, 2, s->stream)) {
                 return false;
             }
         }
+        if (!StBatchFlush(s)) return false;   // 散射批：单次提交
         if (g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream))
             return false;
         return true;

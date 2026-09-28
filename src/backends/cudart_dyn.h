@@ -8,6 +8,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+
+// 批拷贝属性（判决25 P1-5）：镜像 cudaMemcpyAttributes（CUDA v13.0
+// driver_types.h；本仓不引 CUDA 头，布局手核：int enum + 2×cudaMemLocation
+// {enum,uint} + uint = 24B @align4，static_assert 防布局漂移）。ort/trt 共用
+struct HbAttr {
+    int srcAccessOrder;        // 0x3=SrcAccessOrderAny（host 锚写稳、无在先流触碰）
+    unsigned srcLocHint[2];    // cudaMemLocation（非托管/忽略场景全零）
+    unsigned dstLocHint[2];
+    unsigned flags;
+};
+static_assert(sizeof(HbAttr) == 24, "cudaMemcpyAttributes 布局漂移");
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -51,11 +62,32 @@ struct Cudart {
     // 3=Relaxed（cudaStreamCaptureStatus）
     int (*StreamIsCapturing)(void*, int*) = nullptr;
     // CUDA 12.8+ 批拷贝（P1-5 稀疏批 H2D 判决实验；可选符号——缺席/失败自动
-    // 回退逐输入路径）。签名（cuda_runtime_api.h:6435, v13.0）：
-    //   cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrsIdxs,
-    //                        numAttrs, stream)
-    int (*MemcpyBatchAsync)(void* const*, const void* const*, const size_t*,
-                            size_t, void*, size_t*, size_t, void*) = nullptr;
+    // 回退逐输入路径）。**ABI 双形态（2026-09-29 坑律入档，③D2D 批量化首跑
+    // 段错误定谳）**：cu12(12.8/12.9)=9 参——numAttrs 后带 size_t* failIdx
+    //（OUT 参数，须真实可写地址；cu12.9 头 cuda_runtime_api.h:7333）；
+    // cu13=8 参（failIdx 移除；v13.0 头 6435）。单形态 typedef 跨版本=参数
+    // 错位→stream 槽吃栈垃圾（驱动段错误/InvalidValue 双态——Linux cu12.9
+    // 运行时+13.0 头镜像即中招）。MemcpyBatchAsyncV 按 cudaRuntimeGetVersion
+    // 选形态调（ABI 归运行时库版本，非驱动版本）。
+    int (*MemcpyBatch12)(void**, void**, size_t*, size_t, void*, size_t*,
+                         size_t, size_t*, void*) = nullptr;
+    int (*MemcpyBatch13)(void* const*, const void* const*, const size_t*,
+                         size_t, void*, size_t*, size_t, void*) = nullptr;
+    int (*RuntimeGetVersion)(int*) = nullptr;
+    bool MemcpyBatchOk() const { return MemcpyBatch13 != nullptr; }
+    int MemcpyBatchAsyncV(void* const* dsts, const void* const* srcs,
+                          const size_t* sizes, size_t count, void* attrs,
+                          size_t* attrIdxs, size_t numAttrs, void* stream) {
+        int ver = 0;
+        if (RuntimeGetVersion) RuntimeGetVersion(&ver);
+        if (ver >= 13000)
+            return MemcpyBatch13(dsts, srcs, sizes, count, attrs, attrIdxs,
+                                 numAttrs, stream);
+        size_t fail_idx = (size_t)-1;   // cu12：failIdx=OUT，须真实地址
+        return MemcpyBatch12((void**)dsts, (void**)srcs,
+                             const_cast<size_t*>(sizes), count, attrs,
+                             attrIdxs, numAttrs, &fail_idx, stream);
+    }
     // 宿主函数入流（CUDA 10+；P1 决策延迟链通知驱动，可选符号）：流到达该点
     // 时宿主回调执行（CUDA 回调线程）——回调内禁调 CUDA API，只发 OS 信号量
     int (*LaunchHostFunc)(void*, void (*)(void*), void*) = nullptr;
@@ -95,9 +127,12 @@ struct Cudart {
         EventQuery = (int (*)(void*))g("cudaEventQuery");
         EventSynchronize = (int (*)(void*))g("cudaEventSynchronize");
         EventDestroy = (int (*)(void*))g("cudaEventDestroy");
-        MemcpyBatchAsync = (int (*)(void* const*, const void* const*, const size_t*,
-                                    size_t, void*, size_t*, size_t, void*))
+        MemcpyBatch13 = (int (*)(void* const*, const void* const*, const size_t*,
+                                 size_t, void*, size_t*, size_t, void*))
             g("cudaMemcpyBatchAsync");
+        MemcpyBatch12 = (int (*)(void**, void**, size_t*, size_t, void*, size_t*,
+                                 size_t, size_t*, void*))g("cudaMemcpyBatchAsync");
+        RuntimeGetVersion = (int (*)(int*))g("cudaRuntimeGetVersion");
         LaunchHostFunc = (int (*)(void*, void (*)(void*), void*))g("cudaLaunchHostFunc");
         StreamIsCapturing = (int (*)(void*, int*))g("cudaStreamIsCapturing");
     }
