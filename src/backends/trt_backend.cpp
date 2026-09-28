@@ -320,6 +320,15 @@ static bool ApplyRefitWeights(nvinfer1::ICudaEngine* eng, const char* path) {
             n_set++;
         }
     }
+    if (!failed && n_set == 0 && !ents.empty()) {
+        // 换心空转=名字契约失配（RW1 项裸名与"+ CONSTANT"后缀均未命中名单）
+        // ——静默返回成功是陷阱，掼蛋 DATA11 §2 实测：子代与父代逐决策全同
+        // 才暴露。fail fast 拒当成功。
+        std::fprintf(stderr, "[trt] refit 空转拒载：RW1 %d 项全部名单外"
+                     "——名字契约失配，请核对引擎名单/RW1 名字\n",
+                     (int)ents.size());
+        failed = true;
+    }
     if (!failed && !ref->refitCudaEngine()) {
         std::fprintf(stderr, "[trt] refit 失败: refitCudaEngine 返回 false");
         int n_miss = ref->getMissingWeights(0, nullptr);
