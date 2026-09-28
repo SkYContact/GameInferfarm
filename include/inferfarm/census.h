@@ -35,6 +35,12 @@ public:
     // ---- per-worker（工人线程单写；打印线程原子读）----
     static const int kMaxWorkers = 512;
     std::atomic<int> q_len[kMaxWorkers];          // 就绪数快照
+    std::atomic<int> q_peak[kMaxWorkers];         // 就绪数峰值（投递点 CAS 抬升
+                                                  // ——100ms 快照会漏峰，复活
+                                                  // 滞留=队深×回合的队深证据）
+    std::atomic<int> ready_peak{0};               // 全局 READY 峰值（OnPost 维护）
+    static const int kQHistN = 8;                 // 取走时剩余队深分布桶
+    std::atomic<long long> qhist[kQHistN];        // 0/1/2/3/4-7/8-15/16-31/32+
     std::atomic<uint64_t> busy_ns[kMaxWorkers];   // 忙累计
     std::atomic<uint64_t> idle_ns[kMaxWorkers];   // 闲累计
     // ---- 线程普查登记（tid 表：SetThreadDescription 实测本机不生效，tid 零依赖）----
@@ -70,6 +76,8 @@ public:
     void OnSuspend();                  // RUNNING→WAIT
     void OnPost(uint64_t& ts_post_out);// WAIT→READY（写投递时刻）
     void OnDone();                     // RUNNING→DONE + live--
+    void NoteQLen(int worker);         // q_len++ 后调：CAS 抬本工人峰值（多投递
+                                      // 线程并发，非单写者——必须 CAS）
     void OnArrPush() { if (on) arr.fetch_add(1); }
     void OnArrPop(int n) { if (on) { arr.fetch_sub(n); pipe.fetch_add(n); } }
     void OnPipeDone(int n) { if (on) pipe.fetch_sub(n); }

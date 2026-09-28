@@ -89,6 +89,7 @@ void FiberPost(void* cookie) {
     if (g_fps.cen && g_fps.cen->on) {
         g_fps.cen->OnPost(t->ts_post);   // WAIT→READY + 投递时刻
         g_fps.cen->q_len[t->worker].fetch_add(1);
+        g_fps.cen->NoteQLen(t->worker);  // 峰值 CAS（投递线程并发）
     }
     FiWorker& w = g_fps.fiw[(size_t)t->worker];
     {
@@ -164,6 +165,7 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
         if (g_fps.cen && g_fps.cen->on) {
             g_fps.cen->OnSpawn();
             g_fps.cen->q_len[wid].fetch_add(1);
+            g_fps.cen->NoteQLen(wid);
         }
         w.ready.push_back(t);
     }

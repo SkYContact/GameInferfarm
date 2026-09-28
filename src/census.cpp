@@ -67,9 +67,12 @@ void Census::ResetLeg() {
     rev_sum.store(0);
     for (int i = 0; i < kMaxWorkers; i++) {
         q_len[i].store(0);
+        q_peak[i].store(0);
         busy_ns[i].store(0);
         idle_ns[i].store(0);
     }
+    ready_peak.store(0);
+    for (int i = 0; i < kQHistN; i++) qhist[i].store(0);
     seg_wait_ns.store(0); seg_poll_ns.store(0); seg_close_ns.store(0);
     seg_dep_disp_ns.store(0); seg_dep_self_ns.store(0);
     seg_harvest_ns.store(0); seg_rot_ns.store(0); seg_iter_ns.store(0);
@@ -93,6 +96,13 @@ void Census::OnPick(int worker, uint64_t ts_post_us) {
     q_len[worker].fetch_sub(1);
     state[1].fetch_sub(1);
     state[2].fetch_add(1);
+    // 取走时剩余队深分布（复活滞留=队深×回合假设的直接证据面）
+    {
+        int q = q_len[worker].load(std::memory_order_relaxed);
+        int b = q <= 0 ? 0 : q == 1 ? 1 : q == 2 ? 2 : q == 3 ? 3
+              : q < 8 ? 4 : q < 16 ? 5 : q < 32 ? 6 : 7;
+        qhist[b].fetch_add(1, std::memory_order_relaxed);
+    }
     if (ts_post_us) {   // 复活样：投递→取走（srv-lat 看不见的那段）
         const uint64_t d = NowUs() - ts_post_us;
         int b = (int)(d / 250);
@@ -112,7 +122,16 @@ void Census::OnPost(uint64_t& ts_post_out) {
     if (!on) return;
     ts_post_out = NowUs();
     state[3].fetch_sub(1);
-    state[1].fetch_add(1);
+    int r = state[1].fetch_add(1);
+    int p = ready_peak.load(std::memory_order_relaxed);
+    while (r > p && !ready_peak.compare_exchange_weak(p, r, std::memory_order_relaxed)) {}
+}
+
+void Census::NoteQLen(int worker) {
+    if (!on) return;
+    int q = q_len[worker].load(std::memory_order_relaxed);
+    int p = q_peak[worker].load(std::memory_order_relaxed);
+    while (q > p && !q_peak[worker].compare_exchange_weak(p, q, std::memory_order_relaxed)) {}
 }
 void Census::OnDone() {
     if (!on) return;
@@ -230,6 +249,28 @@ void Census::StopPrinter() {
         if (!p90d && acc * 10 >= tot * 9) { std::printf("|p90=%.2f|", edge); p90d = true; }
     }
     std::printf("\n");
+    // 队深峰值+取走时队深分布（复活滞留取证：100ms 快照漏的峰在这里）
+    {
+        int top1 = 0, top2 = 0, top3 = 0;
+        for (int wi = 0; wi < kMaxWorkers; wi++) {
+            int p = q_peak[wi].load();
+            if (p > top1) { top3 = top2; top2 = top1; top1 = p; }
+            else if (p > top2) { top3 = top2; top2 = p; }
+            else if (p > top3) top3 = p;
+        }
+        long long qt = 0;
+        for (int i = 0; i < kQHistN; i++) qt += qhist[i].load();
+        std::printf("[census] 队深: ready_peak=%d 工人峰值 top3=%d/%d/%d | 取走时剩余深度:",
+                    ready_peak.load(), top1, top2, top3);
+        static const char* qbn[kQHistN] =
+            {"0", "1", "2", "3", "4-7", "8-15", "16-31", "32+"};
+        for (int i = 0; i < kQHistN; i++) {
+            long long v = qhist[i].load();
+            if (!v) continue;
+            std::printf(" %s:%.1f%%", qbn[i], qt ? 100.0 * (double)v / (double)qt : 0.0);
+        }
+        std::printf("（n=%lld）\n", qt);
+    }
     double bsum = 0, isum = 0;
     int nw = 0;
     for (int wi = 0; wi < kMaxWorkers; wi++) {
