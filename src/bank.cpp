@@ -102,9 +102,13 @@ struct alignas(64) BankCtl {            // 64B 对齐：相邻银行的 cursor/i
                                          // 至多一个活 req，无需堆分配）
     // 槽基址预解（热路径去虚调用+名字串扫，2026-09-24 审计 P0）：行指针=
     // 基址+slot×row_bytes（InputRow 线性契约，三后端同式）。population 面
-    // =nullptr（不走预解，回退后端直查）
+    //=nullptr（不走预解，回退后端直查）
     std::vector<char*> in_rows;                       // 下标=I.spec.ins 下标
     std::vector<std::pair<const char*, size_t>> in_idx;   // 名字指针→ins 下标
+    // ③槽→池下标（成对状态行）：Claim 写（槽独占期单写者，release）/
+    // 发车读（drain 握手给 happens-before）；后端 Init 期 BindStatePids 取
+    // 数组地址——每批零接口流量。生命周期=银行池（会话销毁前有效）。
+    std::atomic<int>* sp_ids = nullptr;   // [slots]（建池 new/Shutdown delete）
     // 在途航班（单发=线性生命周期）。非原子字段，同步边=state：
     // 写侧（发车者）先写 flight_* 再 state.store(FLIGHT, release)；
     // 读侧（收割）state.load(FLIGHT, acquire) 后读——release/acquire 配对。
@@ -145,6 +149,8 @@ struct BankScheduler::Impl {
                                          // 契约；spec 终态点解析）
     std::vector<char> fw;                // 解析结果（与 spec.ins 同序；空=未声明=
                                          // 全行清零现状，Claim 快路径零额外判断）
+    std::vector<std::string> st_in_names;   // ③状态输入行名暂存（同上收集/解析）
+    std::vector<char> st_in;                // 解析结果（Claim 清零豁免；空=无状态）
     // init 握手（会话建在调度台线程上：ORT 图会话 PerThreadContext 铁律）
     std::mutex init_mx;
     std::condition_variable init_cv;
@@ -185,7 +191,7 @@ struct BankScheduler::Impl {
 // 无等待尝试：成功即得槽（inflight 已占，行清零由本函数完成=零基组装）。
 // 领号序=在途序（先占名额再领号）⇒ drain 归零时游标终态、行前缀连续。
 // dev=设备组门：只在本组的填充银行领号（链→组钉扎=异构逐位钥匙）。
-bool BankScheduler::Claim(int& bank, int& slot, int dev) {
+bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
     if (!banks_) return false;
     Impl& I = *impl_;
     const int g = dev < 0 ? 0 : dev;
@@ -207,6 +213,10 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
         }
         b_out = fi;
         s_out = v;
+        // ③池下标记账（成对状态行）：槽独占期单写者；release 与发车侧的
+        // drain 握手（req 提交原子链）合成 happens-before
+        if (pool_pid >= 0 && b.sp_ids)
+            b.sp_ids[v].store(pool_pid, std::memory_order_release);
         // 全行清零（零基契约）：未写区与"零垫基线"逐位同——适配器的清零类
         // 组装（高水位清零式）依赖"行起点为零"。基址走预解表（空=回退直查）
         {
@@ -214,6 +224,7 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
             for (size_t i = 0; i < I.spec.ins.size(); i++) {
                 if (I.spec.ins[i].population) continue;   // population 面不清零
                 if (!I.fw.empty() && I.fw[i]) continue;   // 恒全量覆写声明行（快刀一）
+                if (!I.st_in.empty() && I.st_in[i]) continue;   // ③状态行（D2D 填充）
                 if (b.in_rows.empty()) {   // 预解未就绪防御：退回直查（语义同）
                     size_t rb = 0;
                     void* row = b.be->InputRow(b.sess, I.spec.ins[i].name.c_str(), v, &rb);
@@ -286,6 +297,15 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev) {
 int BankScheduler::GroupOf(int bank) const {
     if (!impl_ || bank < 0 || bank >= banks_) return 0;
     return impl_->banks[(size_t)bank].grp;
+}
+
+bool BankScheduler::ResetStatePool(int grp, int row) {
+    if (!impl_) return false;
+    Impl& I = *impl_;
+    InferBackend* be = nullptr;
+    for (int i = 0; i < banks_; i++)
+        if (I.banks[(size_t)i].grp == grp) { be = I.banks[(size_t)i].be; break; }
+    return be && be->ResetStatePool(row);
 }
 
 void* BankScheduler::InputRow(int bank, int slot, const char* name, size_t* row_bytes) {
@@ -1007,6 +1027,10 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
     for (const auto& g : groups)   // 恒全量覆写声明：各组并集（IO 同契约；
         for (const auto& n : g.model.fullwrite_inputs)   // 重复名解析幂等）
             I.fw_names.push_back(n);
+    I.st_in_names.clear();   // ③状态输入行名并集（Claim 清零豁免面——
+    for (const auto& g : groups)   // 框架 D2D 填充恒覆盖，清零白清）
+        for (const auto& pr : g.model.state_pairs)
+            I.st_in_names.push_back(pr.in);
     I.cen = cen_;
     I.cfg = cfg;
     I.spin = cfg.spin;
@@ -1095,6 +1119,17 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 b.state.store(BK_POOL);
                 b.reqs.assign((size_t)gslots, nullptr);
                 b.req_pool.resize((size_t)gslots);   // 槽独占 req 对象池（一次分配）
+                // ③池下标数组（成对状态行）：建池分配+会话绑定（后端发车按行
+                // 取用；非状态农场 BindStatePids 缺省 no-op 恒 false=零开销）
+                b.sp_ids = new std::atomic<int>[(size_t)gslots];
+                for (int t = 0; t < gslots; t++) b.sp_ids[t].store(-1);
+                if (!gc.model.state_pairs.empty()
+                    && !b.be->BindStatePids(b.sess, b.sp_ids)) {
+                    std::fprintf(stderr, "[bank] 组 %d 后端不支持成对状态行"
+                                 "（state_pairs 声明须配 trt）\n", g);
+                    ok = false;
+                    break;
+                }
             }
         }
         int built = id;
@@ -1137,6 +1172,13 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
             std::fprintf(stderr, "[bank] fullwrite 行旗生效: %d/%zu 输入行跳过"
                          " Claim 清零（承诺=每次 AssembleInto 全量覆写）\n",
                          nhit, I.spec.ins.size());
+        }
+        // ③状态输入行旗（成对状态行）：Claim 清零豁免——框架 D2D 填充恒覆盖
+        if (!I.st_in_names.empty()) {
+            I.st_in.assign(I.spec.ins.size(), 0);
+            for (const auto& n : I.st_in_names)
+                for (size_t ii = 0; ii < I.spec.ins.size(); ii++)
+                    if (I.spec.ins[ii].name == n) { I.st_in[ii] = 1; break; }
         }
         // 图地址烧死小实验（各组首家）：任一不过=拒绝银行制启动（回不去旧路径
         // 的字节安全性不赌；DML 路线同一实验兜底"同步 Run"假设）
@@ -1213,6 +1255,8 @@ void BankScheduler::Shutdown() {
             b.be->DestroySession(b.sess);
             b.sess = nullptr;
         }
+    for (auto& b : I.banks)   // ③池下标数组（会话已毁=绑定失效，随后释放）
+        if (b.sp_ids) { delete[] b.sp_ids; b.sp_ids = nullptr; }
 #ifdef _WIN32
     // 内核等待对象（通知信号量/HR 定时器/唤醒事件）=Windows 面专属；POSIX
     // 面这些指针恒 null（Init 创建段同旗标守卫），段整体不参与编译。

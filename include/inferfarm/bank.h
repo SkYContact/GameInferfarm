@@ -98,8 +98,13 @@ public:
     // ---- 写手侧（对局 fiber 或 OS 线程）----
     // 领槽（自旋+等池背压；成功即行清零=零基组装契约：未写区与"python
     // 零垫"逐位同）。dev=设备组号（-1→组 0；多组时 Farm 按链钉扎传入）。
+    // pool_pid=③成对状态行的池下标（≥0 时记入本槽 sp_ids——后端发车按行
+    // 取用做状态输入 D2D 填充/输出散射；-1=非状态农场零开销）。
     // false 仅当银行未启用。
-    bool Claim(int& bank, int& slot, int dev = -1);
+    bool Claim(int& bank, int& slot, int dev = -1, int pool_pid = -1);
+    // ③成对状态行：NewGame 清零组 backend 的池行（链串行⇒无并发访问；
+    // 后端在全部会话流 memsetAsync=任意下一读所在流自有序）。
+    bool ResetStatePool(int grp, int row);
     // 组号查询（bank→组；缓存命名空间/诊断用）
     int GroupOf(int bank) const;
     int n_groups() const { return n_groups_; }

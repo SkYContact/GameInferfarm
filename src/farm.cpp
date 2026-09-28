@@ -122,6 +122,47 @@ bool Farm::Init(FarmConfig cfg) {
         d.banks = cfg_.banks;
         devs.push_back(d);
     }
+    // ③成对状态行前置校验（docs/state-residency-design.md）：v1 限 trt 后端
+    // +银行制（inline/cpu/ort 声明即拒）；池行数=chains（池下标 v1=chain_id）
+    has_state_ = false;
+    for (auto& d : devs) {
+        if (d.model.state_pairs.empty()) continue;
+        if (d.banks < 1) {
+            std::fprintf(stderr, "[farm] state_pairs 须银行制（banks=0 inline 无"
+                         "设备池）\n");
+            return false;
+        }
+        if (d.model.backend != "trt") {
+            std::fprintf(stderr, "[farm] state_pairs 暂限 trt 后端（%s 声明即拒；"
+                         "cpu=无设备池概念，ort=后续补）\n",
+                         d.model.backend.c_str());
+            return false;
+        }
+        d.model.state_pool_rows = cfg_.chains;
+        has_state_ = true;
+        // 护栏①：推理缓存与状态池互斥——池路径的主机状态行恒陈旧（D2D 不过
+        // 主机），HashSlot 键不再反映真实状态=错命中；护栏②：append/headlive
+        // 增量 H2D 与状态行 D2D 填充同输入并存=两套 H2D 语义打架
+        if (cfg_.cache_log2 > 0) {
+            std::fprintf(stderr, "[farm] state_pairs 与推理缓存互斥"
+                         "（cache_log2>0；池路径主机状态行恒陈旧=键失真）\n");
+            return false;
+        }
+        for (const auto& pr : d.model.state_pairs) {
+            for (const auto& an : d.model.append_inputs)
+                if (an == pr.in) {
+                    std::fprintf(stderr, "[farm] 状态行 %s 同时声明 append（H2D"
+                                 " 语义冲突）\n", pr.in.c_str());
+                    return false;
+                }
+            for (const auto& hn : d.model.headlive_inputs)
+                if (hn == pr.in) {
+                    std::fprintf(stderr, "[farm] 状态行 %s 同时声明 headlive"
+                                 "（H2D 语义冲突）\n", pr.in.c_str());
+                    return false;
+                }
+        }
+    }
     if (devs.size() > 8) {
         std::fprintf(stderr, "[farm] 设备组数 %zu > 8\n", devs.size());
         return false;
@@ -434,7 +475,7 @@ CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
     return h.Finalize();
 }
 
-bool Farm::DriveDecision(GameAdapter* g, int grp) {
+bool Farm::DriveDecision(GameAdapter* g, int grp, int chain_id) {
     if (bank_) {
         OutputDest dests[BankScheduler::kMaxOutputDests];
         const long long tc0 = census_.on ? Census::NowNsI() : 0;
@@ -447,7 +488,7 @@ bool Farm::DriveDecision(GameAdapter* g, int grp) {
             nd = BankScheduler::kMaxOutputDests;
         }
         int bk = -1, sl = -1;
-        if (!bank_->Claim(bk, sl, grp)) return false;
+        if (!bank_->Claim(bk, sl, grp, has_state_ ? chain_id : -1)) return false;
         // 组装直写槽（GameAdapter 契约 1：此处无挂起点——drain 有界的前提；
         // ScopedNoSuspend=debug 断言把契约变成机器校验）
         struct BankWriter : SlotWriter {
@@ -528,6 +569,13 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
     const int grp = chain_grp_.empty() ? 0
         : chain_grp_[(size_t)((uint32_t)chain_id % (uint32_t)chain_grp_.size())];
                                           // 链→组（加权轮询表；表长=chains）
+    if (has_state_ && !bank_->ResetStatePool(grp, chain_id)) {
+        std::fprintf(stderr, "[farm] 状态池行 %d 清零失败（组 %d）——手起清零是"
+                     "正确性前提，判负退出\n", chain_id, grp);
+        g->OnInferFail();
+        NoteGameDone(false, -1, 0, true, -1, chain_id, game_id);
+        return;
+    }
     long long dec = 0;
     bool infer_fail = false;
     for (long long guard = 0; guard < cfg_.max_decisions; guard++) {
@@ -541,7 +589,7 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
         if (!g->AdvanceToDecision()) break;
         if (census_.on) census_.OnAdv(Census::NowNsI() - tv0);
         dec++;
-        if (!DriveDecision(g, grp)) {
+        if (!DriveDecision(g, grp, chain_id)) {
             g->OnInferFail();   // 判负纪律：不静默重试（会撕裂确定性）
             infer_fail = true;
             break;

@@ -361,6 +361,13 @@ struct TrtSession {
     bool graph_ok = false;
     void* graph_c = nullptr;   // 计算图（seq H2D→enqueueV3，无回拷/盖章）：
     bool graph_c_ok = false;   // 部分行 D2H 档的前缀图（大输出模型专用）
+    // ③成对状态行（设备常驻池）：本会话解析结果（池指针拷贝自 backend 级
+    // 分配——MbSubmit 是 static，经会话携带）
+    bool has_state = false;              // 任一配对成立（恒图外尾段形态）
+    std::vector<int> st_in, st_out;      // 输入/输出下标→池号（-1=非状态）
+    std::vector<void*> pool_devs;        // 池号→设备池基址
+    const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（Claim 写/
+                                                  // 发车读；未绑=Init 期冒烟走旧路）
     int slots = 64;
     int dev = 0;      // 会话设备（多卡：分配/流/图/邮箱全落此设备）
     int last_n = 0;
@@ -529,6 +536,69 @@ public:
             s->mb_ok = false;
             std::fprintf(stderr, "[trt] 邮箱分配失败——本会话回退流同步\n");
         }
+        // ③成对状态行解析（docs/state-residency-design.md）：backend 级设备池
+        // 首会话分配一次（零基同步 memset）；会话记录池指针（MbSubmit=static，
+        // 经会话携带）。in/out 行字节不等或名字未命中=fail fast。
+        s->st_in.assign(spec.ins.size(), -1);
+        s->st_out.assign(spec.outs.size(), -1);
+        if (!cfg.state_pairs.empty()) {
+            if (cfg.state_pool_rows <= 0) {
+                std::fprintf(stderr, "[trt] state_pairs 声明但 state_pool_rows=%d"
+                             "（Farm 应填 chains）\n", cfg.state_pool_rows);
+                DestroySession(s);
+                return nullptr;
+            }
+            if (st_pools_.empty()) {
+                for (const auto& pr : cfg.state_pairs) {
+                    int ii = -1, jj = -1;
+                    for (size_t k = 0; k < spec.ins.size() && ii < 0; k++)
+                        if (spec.ins[k].name == pr.in) ii = (int)k;
+                    for (size_t k = 0; k < spec.outs.size() && jj < 0; k++)
+                        if (spec.outs[k].name == pr.out) jj = (int)k;
+                    const size_t rb_in = ii >= 0 ? spec.ins[(size_t)ii].row_bytes : 0;
+                    const size_t rb_out =
+                        jj >= 0 ? (size_t)spec.outs[(size_t)jj].width * 4 : 1;
+                    if (ii < 0 || jj < 0 || !rb_in || rb_in != rb_out) {
+                        std::fprintf(stderr, "[trt] state_pair %s↔%s 非法（in_idx=%d"
+                                     " out_idx=%d 行字节 %zu↔%zu 须相等且非零）\n",
+                                     pr.in.c_str(), pr.out.c_str(), ii, jj, rb_in, rb_out);
+                        DestroySession(s);
+                        return nullptr;
+                    }
+                    StatePool p;
+                    p.row_bytes = rb_in;
+                    p.rows = cfg.state_pool_rows;
+                    if (g_cu.Malloc(&p.dev, p.row_bytes * (size_t)p.rows)
+                        || g_cu.Memset(p.dev, 0, p.row_bytes * (size_t)p.rows)) {
+                        std::fprintf(stderr, "[trt] 状态池分配/零基失败（%d 行 × %zuB）\n",
+                                     p.rows, p.row_bytes);
+                        if (p.dev) g_cu.Free(p.dev);
+                        DestroySession(s);
+                        return nullptr;
+                    }
+                    st_pools_.push_back(p);
+                }
+            } else if (st_pools_.size() != cfg.state_pairs.size()) {
+                std::fprintf(stderr, "[trt] state_pairs 数目 %zu 与首会话 %zu 不一致\n",
+                             cfg.state_pairs.size(), st_pools_.size());
+                DestroySession(s);
+                return nullptr;
+            }
+            for (size_t pi = 0; pi < cfg.state_pairs.size(); pi++) {
+                const auto& pr = cfg.state_pairs[pi];
+                for (size_t k = 0; k < spec.ins.size(); k++)
+                    if (spec.ins[k].name == pr.in) s->st_in[k] = (int)pi;
+                for (size_t k = 0; k < spec.outs.size(); k++)
+                    if (spec.outs[k].name == pr.out) s->st_out[k] = (int)pi;
+            }
+            s->pool_devs.clear();
+            for (auto& p : st_pools_) s->pool_devs.push_back(p.dev);
+            s->has_state = true;
+            std::fprintf(stderr, "[trt] 状态池生效: %zu 对 × %d 行"
+                         "（提交侧 D2D 填充+批尾 D2D 散射，状态不过主机）\n",
+                         st_pools_.size(), cfg.state_pool_rows);
+        }
+        if (for_bank) st_streams_.push_back(s->stream);   // ResetStatePool 全流面
         return s;
     }
 
@@ -562,7 +632,8 @@ public:
     bool ProbeGraph(void* session) override {
         TrtSession* s = (TrtSession*)session;
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
-        if (!s->graph_ok) {
+        // 状态会话只捕计算图（无 4 段图）——计算图同为准入对象
+        if (!s->graph_ok && !s->graph_c_ok) {
             std::fprintf(stderr, "[trt-probe] 无批图——银行制要求图+邮箱，拒绝\n");
             return false;
         }
@@ -582,6 +653,14 @@ public:
             // 发车同款：先整块 h2d（图内只有 4B seq H2D，输入搬运在图外）
             if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1)) {
                 v.clear();
+                return;
+            }
+            if (!s->graph_ok) {   // 状态会话：计算图直发+同步回拷（无 pids，
+                v.clear();        // 尾段走同步面——探针只验图回放地址不烧死）
+                if (g_cu.GraphLaunch(s->graph_c, s->stream)) return;
+                g_cu.StreamSynchronize(s->stream);
+                g_cu.Memcpy(s->out_h_arena, s->out_d_arena, s->out_h_bytes, 2);
+                snap(v);
                 return;
             }
             unsigned seq = 0;
@@ -613,6 +692,11 @@ public:
     void DestroySession(void* session) override {
         TrtSession* s = (TrtSession*)session;
         if (!s) return;
+        for (size_t i = 0; i < st_streams_.size(); i++)   // ③流表摘除（防悬挂——
+            if (st_streams_[i] == s->stream) {            // ResetStatePool 全流面）
+                st_streams_.erase(st_streams_.begin() + (long)i);
+                break;
+            }
         if (s->graph && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph);
         if (s->graph_c && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph_c);
         if (s->ctx) delete s->ctx;
@@ -636,21 +720,39 @@ public:
         return nullptr;
     }
 
-    // 前缀 h2d（n > 7/8·slots 走整块；尾行旧数据=行独立无害）+ 异步发射
+    // 前缀 h2d（n > 7/8·slots 走整块；尾行旧数据=行独立无害）+ 异步发射；
+    // ③状态会话：状态输入行改设备池 D2D 填充（H2D 跳过，恒逐输入路径——
+    // 聚合分支会整块 H2D 状态行）
     bool SubmitBatch(void* session, int n_rows, unsigned& seq_out) override {
         TrtSession* s = (TrtSession*)session;
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev);   // 多卡守卫
         if (n_rows > s->slots) n_rows = s->slots;
         s->last_n = n_rows;
-        if (n_rows > (s->slots * 7) / 8) {
+        const bool st = s->has_state && s->st_pids;
+        if (!st && n_rows > (s->slots * 7) / 8) {
             if (g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1, s->stream))
                 return false;
         } else {
-            for (size_t i = 0; i < s->ins.size(); i++)
+            for (size_t i = 0; i < s->ins.size(); i++) {
+                const int pi = st ? (i < s->st_in.size() ? s->st_in[i] : -1) : -1;
+                if (pi >= 0) {   // 状态输入行：池行→输入行（D2D，链粘滞行集）
+                    char* dst = (char*)s->ins[i].dev;
+                    char* pool = (char*)s->pool_devs[(size_t)pi];
+                    const size_t rb = s->ins[i].meta.row_bytes;
+                    for (int r = 0; r < n_rows; r++) {
+                        const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+                        if (g_cu.MemcpyAsync(dst + (size_t)r * rb,
+                                             pool + (size_t)pid * rb, rb,
+                                             3 /*D2D*/, s->stream))
+                            return false;
+                    }
+                    continue;
+                }
                 if (g_cu.MemcpyAsync(s->ins[i].dev, s->ins[i].host,
                                      (size_t)n_rows * s->ins[i].meta.row_bytes,
                                      1, s->stream))
                     return false;
+            }
         }
         return MbSubmit(s, n_rows, seq_out);
     }
@@ -699,6 +801,42 @@ public:
 
 private:
     int dev_id_ = 0;   // 实例设备（LoadSpec 落定；多卡守卫用）
+    // ③状态池（backend 实例级——组内银行共享设备池；链→组钉扎=无跨组状态。
+    // 首个带 state_pairs 的会话创建时分配一次，零基一次；析构释放）
+    struct StatePool {
+        void* dev = nullptr;      // 设备池 [rows × row_bytes]
+        size_t row_bytes = 0;
+        int rows = 0;
+    };
+    std::vector<StatePool> st_pools_;
+    std::vector<void*> st_streams_;   // 全部银行会话流（ResetStatePool 全流
+                                      // memset=任意下一读所在流自有序；同零值
+                                      // 多流写良性）
+
+public:
+    ~TrtBackend() {
+        for (auto& p : st_pools_)
+            if (p.dev && g_cu.Free) g_cu.Free(p.dev);
+    }
+    // ③池行清零（NewGame）：链串行⇒该行无并发读者/写者；每条流各 memset
+    // 一次⇒该行在任意银行的后续读（自流有序）之前完成
+    bool ResetStatePool(int row) override {
+        if (st_pools_.empty()) return false;
+        if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);
+        for (auto& p : st_pools_) {
+            if (row < 0 || row >= p.rows) return false;
+            char* dst = (char*)p.dev + (size_t)row * p.row_bytes;
+            for (void* st_ : st_streams_)
+                if (g_cu.MemsetAsync(dst, 0, p.row_bytes, st_)) return false;
+        }
+        return true;
+    }
+    bool BindStatePids(void* session, const std::atomic<int>* pids) override {
+        ((TrtSession*)session)->st_pids = pids;
+        return true;
+    }
+
+private:
     static bool EnsureEngine(const ModelConfig& cfg) {
         if (g_trt_eng.eng) {
             if (!cfg.engine_path.empty() && g_trt_eng.path != cfg.engine_path) {
@@ -782,14 +920,60 @@ private:
         return true;
     }
 
+    // ③状态尾段（状态会话恒图外；pids 未绑=Init 期冒烟走旧路）：状态输出行
+    // D2D 散射回池（不过主机）+非状态输出前缀 D2H+盖章殿后（流序契约不变：
+    // 旗标到=散射与 D2H 均已执行）
+    static bool EnqueueStateTail(TrtSession* s, int n_rows) {
+        for (size_t oi = 0; oi < s->outs.size(); oi++) {
+            const int pi = oi < s->st_out.size() ? s->st_out[oi] : -1;
+            const size_t rb = (size_t)s->outs[oi].meta.width * sizeof(float);
+            if (pi >= 0) {
+                char* pool = (char*)s->pool_devs[(size_t)pi];
+                const char* src = (const char*)s->outs[oi].dev;
+                for (int r = 0; r < n_rows; r++) {
+                    const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+                    if (g_cu.MemcpyAsync(pool + (size_t)pid * rb,
+                                         src + (size_t)r * rb, rb, 3, s->stream))
+                        return false;
+                }
+            } else if (g_cu.MemcpyAsync(s->outs[oi].host, s->outs[oi].dev,
+                                        (size_t)n_rows * rb, 2, s->stream)) {
+                return false;
+            }
+        }
+        if (g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream))
+            return false;
+        return true;
+    }
+
     // 邮箱提交：序号 +1 写 staging → [图=graphLaunch（H2D 节点执行时读 staging
     // 当前值）] / [在线=4B H2D→enqueueV3→输出 D2H→盖章 逐个入队 stream]；
-    // 大输出模型非满批 → 计算图/在线 enqueue + 图外部分行 D2H
+    // 大输出模型非满批 → 计算图/在线 enqueue + 图外部分行 D2H；
+    // ③状态会话（pids 已绑）→ 恒计算图/在线 + 图外状态尾段
     static bool MbSubmit(TrtSession* s, int n_rows, unsigned& seq_out) {
         seq_out = ++s->mb_seq;
+        const bool st = s->has_state && s->st_pids;
         if (!s->mb_ok) {   // 流同步降级：发射即等完（提交税同步税都在）
             if (!s->ctx->enqueueV3((cudaStream_t)s->stream)) return false;
             g_cu.StreamSynchronize(s->stream);
+            if (st) {   // 状态尾段（同步版）：状态行 D2D 散射+非状态前缀 D2H
+                for (size_t oi = 0; oi < s->outs.size(); oi++) {
+                    const int pi = oi < s->st_out.size() ? s->st_out[oi] : -1;
+                    const size_t rb = (size_t)s->outs[oi].meta.width * sizeof(float);
+                    if (pi >= 0) {
+                        char* pool = (char*)s->pool_devs[(size_t)pi];
+                        const char* src = (const char*)s->outs[oi].dev;
+                        for (int r = 0; r < n_rows; r++)
+                            g_cu.Memcpy(pool + (size_t)s->st_pids[r].load(
+                                            std::memory_order_relaxed) * rb,
+                                        src + (size_t)r * rb, rb, 3);
+                    } else {
+                        g_cu.Memcpy(s->outs[oi].host, s->outs[oi].dev,
+                                    (size_t)n_rows * rb, 2);
+                    }
+                }
+                return true;
+            }
             if (PartialD2hOn(s, n_rows)) {
                 for (const auto& o : s->outs)
                     g_cu.Memcpy(o.host, o.dev,
@@ -800,6 +984,17 @@ private:
             return true;
         }
         *(volatile unsigned*)((char*)s->mb_host + 64) = seq_out;
+        if (st) {
+            if (s->graph_c_ok && s->graph_c) {
+                if (g_cu.GraphLaunch(s->graph_c, s->stream)) return false;
+            } else {
+                if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4,
+                                     1, s->stream))
+                    return false;
+                if (!s->ctx->enqueueV3((cudaStream_t)s->stream)) return false;
+            }
+            return EnqueueStateTail(s, n_rows);
+        }
         if (PartialD2hOn(s, n_rows)) {
             if (s->graph_c_ok && s->graph_c) {
                 if (g_cu.GraphLaunch(s->graph_c, s->stream)) return false;
@@ -910,6 +1105,12 @@ private:
             *gout = ge;
             return true;
         };
+        if (s->has_state) {
+            // ③状态会话：图内静态拷贝装不下逐批动态行集（散射/D2H 行集随批
+            // 变化）——恒计算图+图外状态尾段（MbSubmit 的 st 分支）
+            if (capture_one(false, &s->graph_c)) s->graph_c_ok = true;
+            else std::fprintf(stderr, "[trt] 计算图捕获失败——状态尾段走在线\n");
+        } else {
         if (!capture_one(true, &s->graph)) {
             std::fprintf(stderr, "[trt] CUDA Graph 捕获失败——降级仅邮箱\n");
             return;
@@ -919,6 +1120,7 @@ private:
         if (s->out_h_bytes >= kD2hPartialMinBytes) {
             if (capture_one(false, &s->graph_c)) s->graph_c_ok = true;
             else std::fprintf(stderr, "[trt] 计算图捕获失败——部分行 D2H 档走在线\n");
+        }
         }
         unsigned seq = 0;
         double spin = 0;

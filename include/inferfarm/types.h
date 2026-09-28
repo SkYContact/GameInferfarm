@@ -89,6 +89,12 @@ struct CpuModelDecl {
 // 使"均匀 pop（各行同权重）"与普通单模型腿逐位可比（门 G9a）
 std::vector<float> CpuBuildMlpFlat(const CpuModelDecl& d, uint32_t seed);
 
+// ③成对状态行（docs/state-residency-design.md）：in=状态输入行名（框架经
+// 设备池 D2D 填充，H2D/Claim 清零跳过，适配器不得写）；out=状态输出行名
+// （批尾 D2D 散射回池，D2H 跳过，dest 可不注册）。池行下标 v1=chain_id
+// （链粘滞），NewGame 由框架 memset 池行清零。in/out 行字节须相等。
+struct StatePairDecl { std::string in, out; };
+
 // 模型配置：Farm 初始化时交给后端（多设备：每设备组一份，见 FarmConfig.devices）
 struct ModelConfig {
     std::string backend = "cpu";      // "cpu" | "ort" | "trt" | "ncnn"
@@ -128,6 +134,11 @@ struct ModelConfig {
                                       // memset；状态化大行受益最大）。违诺=槽残留
                                       // 旧字节静默错推理，执法面=乘客指纹门（零基
                                       // 契约对未声明区不变；声明是加速非门槛）
+    std::vector<StatePairDecl> state_pairs;  // ③成对状态行（设备常驻池，trt 后端
+                                      // v1；cpu/inline 声明即拒）。池行数=
+                                      // state_pool_rows（Farm 填 chains）
+    int state_pool_rows = 0;         // 池行数（≥最大 chain_id+1；Farm Init 填
+                                      // cfg.chains；后端分配设备池零基一次）
     std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
                                       // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效；backend=="ncnn" 时

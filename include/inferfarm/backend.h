@@ -17,6 +17,7 @@
 // ============================================================
 #pragma once
 #include "types.h"
+#include <atomic>   // ③BindStatePids 的槽→池下标数组
 
 namespace inferfarm {
 
@@ -67,6 +68,21 @@ public:
     // （与 RefitWeights 同纪律）。不支持 population 的后端/找不到该输入=false
     virtual bool SetPopulation(void* session, const char* pop_input, const void* host) {
         (void)session; (void)pop_input; (void)host;
+        return false;
+    }
+
+    // ③成对状态行（docs/state-residency-design.md）——设备池接线面。
+    // BindStatePids：银行把本行槽→池下标数组（Claim 写/发车读，槽独占期
+    // 单写者）交给后端，SubmitBatch 据此做状态输入行 D2D 填充（数组生命周期
+    // =银行池，会话销毁前有效）。ResetStatePool：NewGame 清零池行（后端在
+    // 全部会话流上 memsetAsync=任意下一读所在流自有序；链串行⇒无并发读者）。
+    // 缺省 no-op/拒（cpu/ort v1 不支持=Farm Init 时 fail fast）。
+    virtual bool BindStatePids(void* session, const std::atomic<int>* pids) {
+        (void)session; (void)pids;
+        return false;
+    }
+    virtual bool ResetStatePool(int row) {
+        (void)row;
         return false;
     }
 

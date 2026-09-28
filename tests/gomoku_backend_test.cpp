@@ -57,6 +57,62 @@ static int g_fail = 0;
     std::fflush(stdout); \
 } while (0)
 
+// ---------------- R9：③成对状态行玩具适配器 ----------------
+// 池路径：S_prev 不写（框架 D2D 填充）+S_next 不申报 dest（不过主机）；
+// 主机路径：影子累加（S_prev 自写+S_next 回读步进）——双腿同 seed 必逐位同
+//（引擎相同、状态演化等价：主机影子=S_next 的逐位拷贝）。
+class StateToyAdapter : public GameAdapter {
+public:
+    StateToyAdapter(int chain, bool pool) : chain_(chain), pool_(pool) {}
+    void NewGame(uint64_t seed, bool we_first) override {
+        seed_ = seed; (void)we_first;
+        dec_ = 0; fail_ = false;
+        for (int j = 0; j < 4; j++) acc_[j] = 0.0f;   // 池路径不用（框架池行清零）
+        fp_ = 1469598103934665603ULL ^ seed;
+    }
+    bool AdvanceToDecision() override { return dec_ < 6 && !fail_; }
+    void AssembleInto(SlotWriter& slot) override {
+        float* x = (float*)slot.Row("x", nullptr);
+        if (x)
+            for (int j = 0; j < 4; j++)
+                x[j] = (float)(((int)((chain_ * 31 + dec_ * 7 + j + (int)(seed_ % 13))
+                                     % 17) - 8)) * 0.25f;
+        if (!pool_) {   // 主机路径：影子状态写 S_prev
+            float* s = (float*)slot.Row("S_prev", nullptr);
+            if (s) for (int j = 0; j < 4; j++) s[j] = acc_[j];
+        }
+        // 池路径：S_prev 不写（契约窄化——框架 D2D 池行填充）
+    }
+    int CollectOutputs(OutputDest* d, int cap) override {
+        if (cap < 1 || fail_) return 0;
+        d[0].name = "policy"; d[0].dst = &pol_; d[0].n = 1;
+        if (!pool_ && cap >= 2) {   // 主机路径：S_next 回读
+            d[1].name = "S_next"; d[1].dst = nxt_; d[1].n = 4;
+            return 2;
+        }
+        return 1;
+    }
+    void ApplyResult() override {
+        if (!pool_) for (int j = 0; j < 4; j++) acc_[j] = nxt_[j];
+        unsigned bits; std::memcpy(&bits, &pol_, 4);   // 指纹掺 policy 位
+        fp_ = (fp_ ^ bits) * 1099511628211ULL;
+        dec_++;
+    }
+    void OnInferFail() override { fail_ = true; }
+    bool IsDone() override { return dec_ >= 6 || fail_; }
+    int Outcome() override { return fail_ ? -1 : (pol_ > 0.0f ? 1 : 0); }
+    bool WeAreFirst() override { return true; }
+    long long GameFingerprint() override { return (long long)fp_; }
+    ITlsFrame* TlsFrame() override { return nullptr; }
+private:
+    int chain_; bool pool_; uint64_t seed_ = 0; int dec_ = 0; bool fail_ = false;
+    float acc_[4] = {0, 0, 0, 0}, nxt_[4] = {0, 0, 0, 0}, pol_ = 0;
+    uint64_t fp_ = 0;
+};
+static GameAdapter* StateToyMake(int chain, void* user) {
+    return new StateToyAdapter(chain, user != nullptr);
+}
+
 static bool FileExists(const char* p) {
     FILE* f = fopen(p, "rb");
     if (f) { fclose(f); return true; }
@@ -96,12 +152,16 @@ int main(int argc, char** argv) {
     // ORT CUDA 图捕获热身（cudaErrorInvalidValue@Concat，判决 27）——
     // 两面各跑各的 ALL PASS，共存限制由文档承载。
     const char* only = (argc > 1) ? argv[1] : nullptr;
+    // r9 子档（argv[2]=="r9"）：③状态池门独立跑——trt 后端一进程一引擎
+    //（全局缓存），R9 的玩具引擎须避开 R2-R7 的 gomoku 引擎
+    const bool r9_only = argc > 2 && !std::strcmp(argv[2], "r9");
     if (only) std::printf("=== 后端过滤：仅 %s 面 ===\n", only);
     const char* kOnnx = "models/gomoku_mlp.fb8.onnx";
     const char* kTrt = "models/gomoku_mlp.fb8.trt";
     std::printf("=== 真模型可选门（工件缺席=SKIP）===\n");
     bool have_ort = FileExists(kOnnx) && !(only && !std::strcmp(only, "trt"));
-    bool have_trt = FileExists(kTrt) && !(only && !std::strcmp(only, "ort"));
+    bool have_trt = FileExists(kTrt) && !(only && !std::strcmp(only, "ort"))
+                    && !r9_only;
     R ort{}, ort2{}, orti{}, trt{}, trt2{}, trti{};
     if (have_ort) {
         ort = Leg("ort", kOnnx, nullptr, 2);
@@ -744,7 +804,49 @@ int main(int argc, char** argv) {
     } else {
         std::printf("SKIP R8: 无 %s\n", kOnnx);
     }
-    if (!have_ort && !have_trt) {
+    // ---------------- R9：③成对状态行（设备池，docs/state-residency-design.md）----------------
+    // 玩具引擎 S_next=S_prev+x 跨决策累加+每链多局（换局池行清零验证）。
+    // 主门：池路径（state_pairs 声明）==主机路径（影子累加）同 seed 逐位同
+    //（池错/粘滞错/清零漏必指纹红）+复跑同。trt 面（工件缺席=SKIP）。
+    // 独立子档跑（`trt r9`）：trt 后端一进程一引擎（全局缓存），与 R2-R7 的
+    // gomoku 引擎互斥——有 gomoku 工件在场的完整面自动 SKIP R9。
+    if ((!only || !std::strcmp(only, "trt")) && !have_trt) {
+        const char* kToy = "models/state_toy.fb8.trt";
+        if (!FileExists(kToy)) {
+            std::printf("SKIP R9: 无 %s（tools/bake_state_toy.py + bake_fb8_trt.py）\n",
+                        kToy);
+        } else {
+            auto r9_leg = [&](bool pool) -> R {
+                FarmConfig cfg;
+                cfg.name = "r9";
+                cfg.chains = 4;
+                cfg.games = 16;   // 每链 4 局=换局清零进主门
+                cfg.seed0 = 20260929u;
+                cfg.banks = 2;
+                cfg.slots = 8;
+                cfg.workers = 4;
+                cfg.stagger_ms = 1;
+                cfg.model.backend = "trt";
+                cfg.model.engine_path = kToy;
+                if (pool) cfg.model.state_pairs.push_back({"S_prev", "S_next"});
+                Farm farm;
+                if (!farm.Init(cfg)) { g_fail++; return R{0, 0, 0}; }
+                double sec = farm.RunLeg(StateToyMake, (void*)(pool ? 1 : 0));
+                return R{farm.tally().fingerprint, farm.tally().games_done, sec};
+            };
+            R rh = r9_leg(false);
+            R rp = r9_leg(true);
+            R rp2 = r9_leg(true);
+            CHECK(rh.games == 16, "R9 主机路径腿完成（16 局）");
+            CHECK(rp.games == 16 && rp.fp == rh.fp,
+                  "R9a 池路径==主机路径逐位同（含指纹；池错/清零漏必红=主门）");
+            CHECK(rp2.fp == rp.fp, "R9b 池路径复跑逐位同");
+            if (rh.games == 16 && rp.games == 16)
+                std::printf("[R9] 池 %.0f 局/s / 主机 %.0f 局/s（玩具小图，吞吐"
+                            "非观测量）\n", rp.games / rp.sec, rh.games / rh.sec);
+        }
+    }
+    if (!have_ort && !have_trt && !r9_only) {
         std::printf("（本目录无模型工件——全部 SKIP 属正常）\n");
         return 0;
     }

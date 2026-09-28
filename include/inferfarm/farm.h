@@ -140,8 +140,9 @@ public:
     // 驱动环本体（对局 fiber 上；也供 inline/线程模式同构调用）
     void DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
                     int chain_id = 0, int game_id = 0);
-    // 决策一步（银行/inline 分流；grp=设备组（链钉扎）；返回 false=判负纪律已触发）
-    bool DriveDecision(GameAdapter* g, int grp = 0);
+    // 决策一步（银行/inline 分流；grp=设备组（链钉扎）；chain_id=③状态池
+    // 下标（v1=链粘滞）；返回 false=判负纪律已触发）
+    bool DriveDecision(GameAdapter* g, int grp = 0, int chain_id = 0);
 
     // 腿形状热调（回接方清单需求，2026-09-22）：腿间改 chains/games/seed0 而
     // 不重建银行池（Shutdown/Init=建池+热身+探针秒级开销每作业付一次——恰是
@@ -174,6 +175,7 @@ private:
     InferCache cache_;            // 推理缓存（cache_log2>0 时启）
     uint64_t infer_gen_ = 1;      // 权重代次：换心成功即 ++
     FarmTally tally_;
+    bool has_state_ = false;   // ③成对状态行声明存在（NewGame 池行重置门）
     std::mutex tally_mx_;
     void NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,
                       long long fingerprint, int chain_id, int game_id);
