@@ -946,6 +946,39 @@ int main() {
         CHECK(fp_fw2 == fp_fw, "G17b 声明腿复跑逐位同");
     }
 
+    // ---------------- G18：固批旋钮（FARM_FIXED_BATCH，掼蛋 DATA7 §1）----------------
+    // TRT 跨批形状微差（n<8 vs ≥8 tactic 异）的确定性解：提交行数恒定放大。
+    // cpu 面行独立+shape 无关=固批腿==非固批腿逐位同（trt 面验收=固批腿
+    // 复跑逐位同，留乘客负载复验——固批 vs 非固批在 trt 上指纹必异=设计使然）
+    {
+        auto g18_leg = [&](bool fixed) -> unsigned long long {
+            if (fixed) TestSetEnv("FARM_FIXED_BATCH=8");
+            FarmConfig cfg;
+            cfg.name = "g18";
+            cfg.chains = 4;
+            cfg.games = 16;
+            cfg.seed0 = 20260930u;
+            cfg.banks = 2;
+            cfg.slots = 8;
+            cfg.workers = 4;
+            cfg.stagger_ms = 1;
+            cfg.model.backend = "cpu";
+            cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
+            Farm farm;
+            if (!farm.Init(cfg)) { g_fail++; TestSetEnv("FARM_FIXED_BATCH="); return 0; }
+            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            TestSetEnv("FARM_FIXED_BATCH=");
+            return farm.tally().fingerprint;
+        };
+        unsigned long long fp0 = g18_leg(false);
+        CHECK(fp0 != 0, "G18 基线腿完成（16 局）");
+        unsigned long long fpf = g18_leg(true);
+        CHECK(fpf != 0 && fpf == fp0,
+              "G18a 固批腿（FARM_FIXED_BATCH=8）==基线腿逐位同（含指纹）");
+        unsigned long long fpf2 = g18_leg(true);
+        CHECK(fpf2 == fpf, "G18b 固批腿复跑逐位同");
+    }
+
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

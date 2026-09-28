@@ -118,6 +118,37 @@ int main(int argc, char** argv) {
                     hA, hB, hA == hB ? "同（行位置无关 ✓）" : "**异（同内容换位变结果）**");
         place(0);   // 恢复基准输入供后续 n 扫描
     }
+    // 垃圾邻行敏感性（DATA10 判别）：锚内容 C 固定槽 0-7，其余行填两种
+    // 不同垃圾图案——锚行输出若变=引擎对邻行内容敏感（行独立契约违诺，
+    // 固批垃圾行放大）。n 恒 64（固批形态）。
+    {
+        auto fill_others = [&](int pat) {
+            for (auto& im : spec.ins) {
+                for (int r = 8; r < slots; r++) {
+                    size_t rb = 0;
+                    unsigned char* row = (unsigned char*)be->InputRow(s, im.name.c_str(), r, &rb);
+                    if (im.et == DTYPE_F32) {
+                        float* p = (float*)row;
+                        for (size_t e = 0; e < rb / 4; e++)
+                            p[e] = (float)(((e * 13 + r * 7 + pat * 101) % 4096)) * (pat ? -0.03f : 0.07f);
+                    } else if (im.et == DTYPE_I64) {
+                        long long* p = (long long*)row;
+                        for (size_t e = 0; e < rb / 8; e++) p[e] = (long long)(e * 3 + r + pat * 77);
+                    } else {
+                        for (size_t e = 0; e < rb; e++) row[e] = (unsigned char)(e + r + pat * 31);
+                    }
+                }
+            }
+        };
+        unsigned long long hA = 0, hB = 0;
+        fill_others(0);
+        run_anchor_hash(64, &hA);
+        fill_others(1);
+        run_anchor_hash(64, &hB);
+        std::printf("[probe] 垃圾邻行：图案A=%016llx 图案B=%016llx %s\n",
+                    hA, hB, hA == hB ? "同（行独立成立）"
+                                     : "**异（引擎对邻行内容敏感=契约违诺）**");
+    }
     const int kNs[] = {1, 2, 4, 8, 16, 32, 64};
     unsigned long long ref = 0;
     bool ok = true;

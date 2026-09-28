@@ -579,6 +579,21 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     I.drain_us.fetch_add((long long)((NowMsD() - drain_t0) * 1000.0));
     int n = b.cursor.load(std::memory_order_acquire);
     if (n > b.slots) n = b.slots;
+    // 固批旋钮（掼蛋 DATA7 §1 判决落地）：TRT 引擎按批形状选 tactic——
+    // n<8 与 n≥8 浮点微差（探针定谳：变批改结果/行位置无关/同 shape 逐位
+    // 定），碎批负载（hands 模式）跨跑批形状跳动=近平局 argmax 翻面
+    // （~0.4% 局级噪声）。FARM_FIXED_BATCH=N：提交行数恒定放大到 N（缺省
+    // 0=关=现状）——垃圾行（cursor 到 N 间未领号）=幻影行机制现成
+    // （reqs null 跳收割/sp_ids=-1 跳 D2D），行独立+行位置无关契约下不
+    // 扰真行；代价=小批多算+批分布直方图恒 N。确定性验收=固批腿复跑逐位同。
+    static const int kFixedBatch = [] {
+        const char* e = std::getenv("FARM_FIXED_BATCH");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (kFixedBatch > 0 && n > 0) {
+        int fn = kFixedBatch > b.slots ? b.slots : kFixedBatch;
+        if (n < fn) n = fn;
+    }
     if (n <= 0) {   // 空舱（不可达防御）：直接回池
         b.state.store(BK_POOL, std::memory_order_release);
         std::lock_guard<std::mutex> lk(I.mx);
