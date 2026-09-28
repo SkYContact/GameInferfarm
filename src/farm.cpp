@@ -140,6 +140,8 @@ bool Farm::Init(FarmConfig cfg) {
         }
         d.model.state_pool_rows = cfg_.chains;
         has_state_ = true;
+        for (const auto& pr : d.model.state_pairs)
+            state_out_names_.push_back(pr.out);   // dest 安全网过滤面
         // 护栏①：推理缓存与状态池互斥——池路径的主机状态行恒陈旧（D2D 不过
         // 主机），HashSlot 键不再反映真实状态=错命中；护栏②：append/headlive
         // 增量 H2D 与状态行 D2D 填充同输入并存=两套 H2D 语义打架
@@ -486,6 +488,30 @@ bool Farm::DriveDecision(GameAdapter* g, int grp, int chain_id) {
             std::fprintf(stderr, "[farm] CollectOutputs 返回 %d > cap %d——截断"
                          "（适配器违约）\n", nd, BankScheduler::kMaxOutputDests);
             nd = BankScheduler::kMaxOutputDests;
+        }
+        // ③安全网：配对输出的 dest 过滤——池模式该输出不过 D2H，主机行恒
+        // 陈旧，回填=静默垃圾。适配器不该申报（契约），申报了=忽略+一次性警告
+        if (has_state_ && nd > 0) {
+            auto is_state_out = [&](const char* nm) {
+                for (const auto& so : state_out_names_)
+                    if (so == nm) return true;
+                return false;
+            };
+            int w = 0;
+            for (int i = 0; i < nd; i++) {
+                if (dests[i].name && is_state_out(dests[i].name)) {
+                    static bool warned = false;
+                    if (!warned) {
+                        std::fprintf(stderr, "[farm] 配对状态输出 %s 的 dest 已忽略"
+                                     "（池模式状态不过主机；调试需读状态走非池腿）\n",
+                                     dests[i].name);
+                        warned = true;
+                    }
+                    continue;
+                }
+                dests[w++] = dests[i];
+            }
+            nd = w;
         }
         int bk = -1, sl = -1;
         if (!bank_->Claim(bk, sl, grp, has_state_ ? chain_id : -1)) return false;

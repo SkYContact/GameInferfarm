@@ -176,6 +176,7 @@ private:
     uint64_t infer_gen_ = 1;      // 权重代次：换心成功即 ++
     FarmTally tally_;
     bool has_state_ = false;   // ③成对状态行声明存在（NewGame 池行重置门）
+    std::vector<std::string> state_out_names_;   // ③配对输出名（dest 安全网过滤）
     std::mutex tally_mx_;
     void NoteGameDone(bool we_first, int outcome, long long dec, bool infer_fail,
                       long long fingerprint, int chain_id, int game_id);
