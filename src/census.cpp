@@ -56,6 +56,11 @@ uint64_t Census::NowUs() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+long long Census::NowNsI() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void Census::ResetLeg() {
     if (!on) return;
     live.store(0);
@@ -84,6 +89,9 @@ void Census::ResetLeg() {
     copyslot_ns.store(0);
     self_dep.store(0);
     susp_n.store(0);
+    seg_adv_ns.store(0); seg_adv_n.store(0);
+    seg_coll_ns.store(0); seg_coll_n.store(0);
+    seg_asm_ns.store(0); seg_asm_n.store(0);
 }
 
 void Census::OnSpawn() {
@@ -249,6 +257,19 @@ void Census::StopPrinter() {
         if (!p90d && acc * 10 >= tot * 9) { std::printf("|p90=%.2f|", edge); p90d = true; }
     }
     std::printf("\n");
+    // 乘客侧三段（第二刀）：量子构成拆账的乘客列；框架列=bankprof 行的
+    // claim/提交/小拷贝+本行收割。fiber 形态下 adv=纯乘客（游戏逻辑+引擎
+    // 步进）；monolith 形态 adv 含银行等待（挂起期时钟照走）不作拆账依据。
+    if (seg_adv_n.load() || seg_coll_n.load() || seg_asm_n.load()) {
+        auto avg = [](long long ns, long long n) {
+            return n > 0 ? (double)ns / 1e6 / (double)n : 0.0;
+        };
+        std::printf("[census] 乘客侧/决策: adv=%.4fms(n=%lld) coll=%.4fms(n=%lld)"
+                    " asm=%.4fms(n=%lld)（框架侧见 bankprof 行 claim/提交/收割）\n",
+                    avg(seg_adv_ns.load(), seg_adv_n.load()), seg_adv_n.load(),
+                    avg(seg_coll_ns.load(), seg_coll_n.load()), seg_coll_n.load(),
+                    avg(seg_asm_ns.load(), seg_asm_n.load()), seg_asm_n.load());
+    }
     // 队深峰值+取走时队深分布（复活滞留取证：100ms 快照漏的峰在这里）
     {
         int top1 = 0, top2 = 0, top3 = 0;

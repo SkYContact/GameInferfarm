@@ -437,7 +437,9 @@ CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
 bool Farm::DriveDecision(GameAdapter* g, int grp) {
     if (bank_) {
         OutputDest dests[BankScheduler::kMaxOutputDests];
+        const long long tc0 = census_.on ? Census::NowNsI() : 0;
         int nd = g->CollectOutputs(dests, BankScheduler::kMaxOutputDests);
+        if (census_.on) census_.OnColl(Census::NowNsI() - tc0);
         if (nd > BankScheduler::kMaxOutputDests) {
             // 适配器违约（契约=返回条数 ≤cap）：截断防越界读，失败交判负纪律
             std::fprintf(stderr, "[farm] CollectOutputs 返回 %d > cap %d——截断"
@@ -465,7 +467,9 @@ bool Farm::DriveDecision(GameAdapter* g, int grp) {
         w.s = sl;
         {
             ScopedNoSuspend ns;
+            const long long ta0 = census_.on ? Census::NowNsI() : 0;
             g->AssembleInto(w);
+            if (census_.on) census_.OnAsm(Census::NowNsI() - ta0);
         }
         // 推理缓存（判决13）：键=本槽全输入行字节+权重代次。命中=Abandon
         // 弃槽（协议原生路径：作废槽+完工照减+发车跳过）+逐字节回放 dests；
@@ -533,7 +537,9 @@ void Farm::DriveGame(GameAdapter* g, uint64_t seed, bool we_first,
         // 跑在 AdvanceToDecision 里，如 YGO 回接）合法地在 advance 内
         // Claim/SubmitWait=挂起发生在槽已提交之后，对 drain 无害（2026-09-24
         // YGO 腿首跑实锤误伤，此前断言覆盖面写宽了）。
+        const long long tv0 = census_.on ? Census::NowNsI() : 0;
         if (!g->AdvanceToDecision()) break;
+        if (census_.on) census_.OnAdv(Census::NowNsI() - tv0);
         dec++;
         if (!DriveDecision(g, grp)) {
             g->OnInferFail();   // 判负纪律：不静默重试（会撕裂确定性）

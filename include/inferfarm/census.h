@@ -61,6 +61,13 @@ public:
     std::atomic<long long> copyslot_ns{0};
     std::atomic<long long> self_dep{0};
     std::atomic<long long> susp_n{0};  // 挂起总次数（每决策纤程成本拆账的分母面）
+    // ---- 乘客侧分段（第二刀：每决策量子=乘客份额 adv/coll/asm + 框架份额
+    //      claim/提交/收割——farm.cpp 相位包裹；fiber 形态下 adv 干净，
+    //      monolith 形态（advance 内 Claim/SubmitWait）adv 含等待，拆账以
+    //      fiber 形态为准）----
+    std::atomic<long long> seg_adv_ns{0}, seg_adv_n{0};    // AdvanceToDecision
+    std::atomic<long long> seg_coll_ns{0}, seg_coll_n{0};  // CollectOutputs
+    std::atomic<long long> seg_asm_ns{0}, seg_asm_n{0};    // AssembleInto
 
     // 选通与生命周期（FARM_CENSUS=1 / Farm 配置；默认关=各点一次可预测分支）
     bool on = false;
@@ -78,11 +85,19 @@ public:
     void OnDone();                     // RUNNING→DONE + live--
     void NoteQLen(int worker);         // q_len++ 后调：CAS 抬本工人峰值（多投递
                                       // 线程并发，非单写者——必须 CAS）
+    // 乘客侧三段累加（off=零开销立即返回）
+    void OnAdv(long long d) { if (on) { seg_adv_ns.fetch_add(d, std::memory_order_relaxed);
+                                        seg_adv_n.fetch_add(1, std::memory_order_relaxed); } }
+    void OnColl(long long d) { if (on) { seg_coll_ns.fetch_add(d, std::memory_order_relaxed);
+                                         seg_coll_n.fetch_add(1, std::memory_order_relaxed); } }
+    void OnAsm(long long d) { if (on) { seg_asm_ns.fetch_add(d, std::memory_order_relaxed);
+                                        seg_asm_n.fetch_add(1, std::memory_order_relaxed); } }
     void OnArrPush() { if (on) arr.fetch_add(1); }
     void OnArrPop(int n) { if (on) { arr.fetch_sub(n); pipe.fetch_add(n); } }
     void OnPipeDone(int n) { if (on) pipe.fetch_sub(n); }
 
     static uint64_t NowUs();
+    static long long NowNsI();   // ns（相位包裹用；bank.cpp 有同名私有实现）
 
 private:
     void* printer_ = nullptr;   // CensusPrinter（内部）
