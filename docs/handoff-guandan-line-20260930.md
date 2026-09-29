@@ -24,6 +24,22 @@
 > R 门复验同步清零（34+15 ok ALL PASS，R7 负路径按 fail-fast 契约更新
 > a17088d）。C 项无触发维持按需。
 
+> **清账补记三（2026-09-29 会话四）**：①REPLY16——W1 引擎缓存 vector 悬垂
+> 认领（掼蛋代理捡漏第 5 个真 bug；deque 修复三行逐字一致+R10 交错序门，
+> cec7d34；红光三连假门教训=取样点/成员值自比/UB 堆运气，终版判据=
+> DebugEngineCookie 地址稳定钩子）。②**仓库改单主线**：master 快进并删除
+> feature/cpp20-coroutines 分支（51 笔一次到位），此后工作直接在 master。
+> ③**ORT 1.30 转正**（farm_env.sh 已切 farm_pkg_130/cu13，指纹 a3535388
+> 零漂移×2+55 ok ALL PASS×2；回滚=farm_env_126.sh）。④**YGO ORT 热换工单
+> 判决+探针入仓**（docs/reply-ygo-ort-hotswap.md + tools/probe_ort_weightswap
+> {,_cuda}.py；四语义前提全立；Option 0=TRT refit-jobs 现役待 YGO 答复硬约束；
+> 2.3s 大头=CUDA EP init 实测 381-1836ms）。⑤ncnn 核显热换判决：C API 零权重
+> 口、reload 式可行但**判决 22 非确定挡死 YGO bitwise 验收**——挂账触发=出现
+> 无 bitwise 契约的纯吞吐换模型负载。⑥GPU_PROTOCOL v1.1（release 校验+who
+> 会话可区分名；本次校验测试误放 PFD 锁已代管恢复）。**挂账**：热换探针
+> 134MB pinned 计时段（tools/probe_ort_weightswap_cuda.py v2 已就绪，锁空即
+> 跑）；YGO Option 0 答复；③v2 维持按需。
+>
 ## 1. 速度谱终账（gd 复合图 fb64，4096 链）
 
 | 站 | dec/s | 提交 |
