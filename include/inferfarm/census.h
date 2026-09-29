@@ -52,6 +52,13 @@ public:
     std::atomic<long long> seg_wait_ns{0}, seg_poll_ns{0}, seg_close_ns{0};
     std::atomic<long long> seg_dep_disp_ns{0}, seg_dep_self_ns{0};
     std::atomic<long long> seg_harvest_ns{0}, seg_rot_ns{0}, seg_iter_ns{0};
+    // 收割细分（唤醒链拆账，2026-09-30）：批 harvest 段内部——memcpy 逐行
+    // 送回 vs FiberPost 逐行唤醒分开计时；post_n=真实回投行数（futex 假设
+    // 的分母面：真 wake 应≈工件工人数而非行数）
+    std::atomic<long long> seg_harv_copy_ns{0}, seg_harv_post_ns{0};
+    std::atomic<long long> seg_harv_n{0}, seg_harv_post_n{0};
+    // FiberPost 三段细分（唤醒链定谳第二刀）：钩子/锁+入队/唤醒
+    std::atomic<long long> post_hook_ns{0}, post_lock_ns{0}, post_wake_ns{0};
     std::atomic<long long> seg_iter_n{0}, seg_disp_n{0}, seg_self_dep_n{0};
     // ---- 工人侧（原子；多工人累加）----
     std::atomic<long long> claim_n{0};

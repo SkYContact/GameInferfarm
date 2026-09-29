@@ -510,6 +510,10 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         hoist[n_hoist++] = {od.name, w, base};
         return true;
     };
+    const bool hprof = I.cen && I.cen->on;
+    long long hc0 = hprof ? NowNsI() : 0;
+    int hpost_n = 0;
+    FiberPostBegin();   // 唤醒收敛：先全量入队，循环尾按工人各 wake 一次
     for (int s = 0; s < b.flight_n; s++) {
         BankReq* r = b.reqs[(size_t)s];
         b.reqs[(size_t)s] = nullptr;
@@ -527,7 +531,18 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         }
         if (r->fiber) {
             r->ldone->fail = false;   // fiber 腿：SwitchToFiber 全序免锁
+            if (hprof) {   // 唤醒链拆账：拷贝段在上一行收口（0 行 dest 也算）
+                const long long hn = NowNsI();
+                I.cen->seg_harv_copy_ns.fetch_add(hn - hc0, std::memory_order_relaxed);
+                hc0 = hn;
+            }
             FiberPost(r->fiber);
+            ++hpost_n;
+            if (hprof) {
+                const long long hn = NowNsI();
+                I.cen->seg_harv_post_ns.fetch_add(hn - hc0, std::memory_order_relaxed);
+                hc0 = hn;
+            }
         } else {
             {
                 std::lock_guard<std::mutex> lk2(r->ldone->mx);
@@ -539,6 +554,12 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         if (I.cen) I.cen->OnPipeDone(1);   // W 拆账：回信出账
         I.lat.push_back(NowMsD() - r->t0);
     }
+    if (hprof) {
+        I.cen->seg_harv_copy_ns.fetch_add(NowNsI() - hc0, std::memory_order_relaxed);
+        I.cen->seg_harv_n.fetch_add(1, std::memory_order_relaxed);
+        I.cen->seg_harv_post_n.fetch_add(hpost_n, std::memory_order_relaxed);
+    }
+    FiberPostEnd();   // 批内有投递的工人各一次 notify（256 发→16 发）
     I.gpu_busy_sum += NowMsD() - b.flight_t0;
     // 批大小/在飞时长样本：记在收割侧（BankHarvest 恒在调度台线程=与 lat 同源
     // 独占；勿移到发车侧——BankDrainSubmit 有写手自驱路径，plain vector 会竞争）
@@ -871,10 +892,22 @@ static void BankLoop(BankScheduler::Impl& I) {
                 double resid = (double)cen->seg_iter_ns.load() / 1e6 / d - wait - poll
                     - close - dep - harv - rot;
                 if (resid < 0) resid = 0;
+                const long long hn = cen->seg_harv_n.load();
                 std::printf("[banksched] 段/周期: wait=%.3f poll=%.3f close=%.3f 发车=%.3f"
-                            " harvest=%.3f rot=%.3f resid=%.3f | Σ=%.3f vs cycle=%.3f"
+                            " harvest=%.3f[拷%.3f 唤%.3f/行%.3fµs n=%lld"
+                            " post钩/锁/唤=%.3f/%.3f/%.3fµs]"
+                            " rot=%.3f resid=%.3f | Σ=%.3f vs cycle=%.3f"
                             " 迭代/批=%.1f 自驱发车/批=%.2f\n",
-                            wait, poll, close, dep, harv, rot, resid,
+                            wait, poll, close, dep, harv,
+                            hn ? (double)cen->seg_harv_copy_ns.load() / 1e6 / hn : 0.0,
+                            hn ? (double)cen->seg_harv_post_ns.load() / 1e6 / hn : 0.0,
+                            hn ? (double)cen->seg_harv_post_ns.load()
+                                  / (double)(hn ? cen->seg_harv_post_n.load() : 1) / 1e3 : 0.0,
+                            hn ? cen->seg_harv_post_n.load() : 0,
+                            (double)cen->post_hook_ns.load() / 1e3 / (hn ? cen->seg_harv_post_n.load() : 1),
+                            (double)cen->post_lock_ns.load() / 1e3 / (hn ? cen->seg_harv_post_n.load() : 1),
+                            (double)cen->post_wake_ns.load() / 1e3 / (hn ? cen->seg_harv_post_n.load() : 1),
+                            rot, resid,
                             wait + poll + close + dep + harv + rot + resid,
                             wall / d, itn / d,
                             (double)(cen->seg_self_dep_n.load() - sd_prev) / d);

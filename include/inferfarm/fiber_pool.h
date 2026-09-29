@@ -46,6 +46,13 @@ enum FiberWaitReason {
 void* FiberCurrent();
 void FiberSuspend(FiberWaitReason why = FWait_Other);
 void FiberPost(void* cookie);
+// 批模式投递（收割唤醒收敛，2026-09-30）：Begin 后 FiberPost 只入队不唤醒
+//（工人睡眠与否与队列可见性无关——Mesa 语义，队列非空=睡着的工人醒来必见）；
+// End 对批内有投递的工人各 notify 一次。满舱批 256 行×16 工人：256 发真
+// futex wake（实测 ~5µs/发=1.3ms 纯唤醒税）→ 16 发。Begin/End 必须同线程
+// 配对；End 不调=批模式泄漏（用 RAII 守卫）。
+void FiberPostBegin();
+void FiberPostEnd();
 
 // 契约 1 的机器校验（GameAdapter："advance 与 assemble 无挂起点"）：
 // 作用域内任何 FiberSuspend=debug 断言失败（框架在 AdvanceToDecision/

@@ -81,6 +81,9 @@ void Census::ResetLeg() {
     seg_wait_ns.store(0); seg_poll_ns.store(0); seg_close_ns.store(0);
     seg_dep_disp_ns.store(0); seg_dep_self_ns.store(0);
     seg_harvest_ns.store(0); seg_rot_ns.store(0); seg_iter_ns.store(0);
+    seg_harv_copy_ns.store(0); seg_harv_post_ns.store(0);
+    seg_harv_n.store(0); seg_harv_post_n.store(0);
+    post_hook_ns.store(0); post_lock_ns.store(0); post_wake_ns.store(0);
     seg_iter_n.store(0); seg_disp_n.store(0); seg_self_dep_n.store(0);
     claim_n.store(0);
     claim_try_ns.store(0); claim_zero_ns.store(0);

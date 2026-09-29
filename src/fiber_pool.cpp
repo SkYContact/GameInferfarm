@@ -69,8 +69,18 @@ struct FiberPoolState {
 };
 static FiberPoolState g_fps;
 static thread_local FiTask* t_fi_task = nullptr;   // 本工人当前局（等待侧桥取 cookie）
+// 批模式投递（FiberPostBegin/End；kMaxWorkers=512 → 512 位=8×u64 位图）
+static thread_local bool t_post_batch = false;
+static thread_local uint64_t t_post_wake[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 static thread_local int t_nosuspend = 0;           // 契约 1 断言计数（ScopedNoSuspend）
 static IFiberBackend* g_be = nullptr;              // 切换后端（RunLeg 期选定，池寿命）
+static inline void SpinPause() {                   // x86 PAUSE（SMT 对端不阻塞执行口）
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#else
+    ;
+#endif
+}
 
 // ---------------- 等待侧桥（银行层/任何等待点调用）----------------
 void* FiberCurrent() { return t_fi_task; }
@@ -115,14 +125,55 @@ void FiberPost(void* cookie) {
         g_fps.cen->q_len[t->worker].fetch_add(1);
         g_fps.cen->NoteQLen(t->worker);  // 峰值 CAS（投递线程并发）
     }
+    Census* cen = g_fps.cen;
+    const bool prof = cen && cen->on;
+    const long long p0 = prof ? Census::NowNsI() : 0;
     FiWorker& w = g_fps.fiw[(size_t)t->worker];
+    bool need_wake;
     {
         std::lock_guard<std::mutex> lk(w.mx);
+        const long long p1 = prof ? Census::NowNsI() : 0;
         assert(!t->queued);   // debug：同一 fiber 不得在队列中挂两条
+        // 唤醒收敛（harvest 拆账判决 2026-09-30）：只有空→非空转变才
+        // notify——Mesa 语义下队列非空=工人不可能在睡（谓词在锁内复检），
+        // 多余的 notify_one 在工人停着时每次都是真 futex wake 系统调用
+        //（strace 实锤每 post 一发 WAKE；批模式 FiberPostEnd 收敛 3×）。
+        need_wake = w.ready.empty();
         t->queued = true;
         w.ready.push_back(t);
+        const long long p2 = prof ? Census::NowNsI() : 0;
+        if (prof) cen->post_lock_ns.fetch_add(p2 - p1, std::memory_order_relaxed);
+        if (t_post_batch) {   // 批模式：只记账不唤醒（FiberPostEnd 统一发）
+            t_post_wake[(size_t)t->worker >> 6] |= uint64_t(1) << (t->worker & 63);
+            if (prof) cen->post_hook_ns.fetch_add((p1 - p0) + (Census::NowNsI() - p2), std::memory_order_relaxed);
+            return;
+        }
+        if (need_wake) w.cv.notify_one();
+        if (prof) {
+            const long long p3 = Census::NowNsI();
+            cen->post_hook_ns.fetch_add(p1 - p0, std::memory_order_relaxed);
+            cen->post_wake_ns.fetch_add(p3 - p2, std::memory_order_relaxed);
+        }
     }
-    w.cv.notify_one();
+}
+
+void FiberPostBegin() {
+    t_post_batch = true;
+    for (auto& m : t_post_wake) m = 0;
+}
+
+void FiberPostEnd() {
+    t_post_batch = false;
+    for (size_t i = 0; i < 8; i++) {
+        uint64_t m = t_post_wake[i];
+        t_post_wake[i] = 0;
+        while (m) {
+            const int w = (int)(i << 6) + __builtin_ctzll(m);
+            m &= m - 1;
+            g_fps.fiw[(size_t)w].cv.notify_one();   // 队列非空已可见（锁内
+            // push 先于本 notify；cv 谓词在锁内复检）——无需持锁
+        }
+    }
 }
 
 // ---------------- 契约 1 机器校验（作用域内挂起=断言）----------------
@@ -186,6 +237,7 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
         return;
     }
     FiWorker& w = g_fps.fiw[(size_t)wid];
+    bool need_wake;
     {
         std::lock_guard<std::mutex> lk(w.mx);
         // census 入册在入队之前（锁内）：工人取走前必已 live++/READY，
@@ -197,9 +249,10 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
             g_fps.cen->NoteQLen(wid);
         }
         t->ts_spawn = (g_fps.cen && g_fps.cen->on) ? Census::NowUs() : 0;
+        need_wake = w.ready.empty();   // 空→非空才 notify（同 FiberPost 收敛）
         w.ready.push_back(t);
     }
-    w.cv.notify_one();
+    if (need_wake) w.cv.notify_one();
 }
 
 static void FiWorkerLoop(int wid, Census* cen) {
@@ -216,11 +269,30 @@ static void FiWorkerLoop(int wid, Census* cen) {
         return;
     }
     g_fps.workers_ready.fetch_add(1);   // 点火线程等到全体转换完（sched 指针就绪）
+    // 纯自旋档（FARM_WORKER_SPIN=1，2026-09-30 判决）：空转 SpinPause
+    //（x86 PAUSE——SMT 对端不阻塞执行口）不进 futex 睡眠，收割唤醒降为
+    // 纯内存可见性（futex wait/wake 一对 ~5µs 系统调用对消失）。闲时烧
+    // 一个核的Retired 位（用户拍板：农场机独占，烧得起）。stop 检查每
+    // 千圈一次（volatile 读，无锁）；退出条件与 cv 档同=stop 且队列空。
+    const bool spin_mode = [] {
+        const char* e = std::getenv("FARM_WORKER_SPIN");
+        return e && std::atoi(e) == 1;
+    }();
     for (;;) {
         FiTask* t = nullptr;
         const bool con = cen && cen->on;   // census 门（默认关=零开销）
         uint64_t t_wait0 = con ? Census::NowUs() : 0;
-        {
+        if (spin_mode) {
+            for (int it = 0;; it++) {
+                {
+                    std::lock_guard<std::mutex> lk(w.mx);
+                    if (!w.ready.empty()) { t = w.ready.front(); w.ready.pop_front(); t->queued = false; break; }
+                    if (w.stop && w.ready.empty() && (it & 1023) == 1023) break;
+                }
+                for (int k = 0; k < 64; k++) SpinPause();
+            }
+            if (!t && w.ready.empty()) break;   // stop 且队列空：收工
+        } else {
             std::unique_lock<std::mutex> lk(w.mx);
             w.cv.wait(lk, [&w] { return w.stop || !w.ready.empty(); });
             if (w.ready.empty()) break;   // stop 且队列空：收工
