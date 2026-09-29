@@ -552,7 +552,7 @@ cm1/threads16/slm1（probe 读回），旧版数字产生于"load 期 vk=0 CPU �
 
 **动机**：掼蛋侧反馈纤程开销 ~12µs/决策，是 30k 局/s 负载最大单项成本；
 "C++20 协程版纤程池"实验立项。设计评审与拆解账全文见
-`docs/design-cpp20-coroutines.md`（分支 feature/cpp20-coroutines）。
+`docs/design-cpp20-coroutines.md`（原分支 feature/cpp20-coroutines，2026-09-29 已并主线 master=单主线开发）。
 
 **第 0 步拆解账（测量先行）**：原语单价（fiber_bench，暖态三跑中位）——
 SwitchToFiber 23.3ns/切换（FLOAT_SWITCH）；Post→pickup cv 真醒 p50
