@@ -14,7 +14,7 @@ RT.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, c
 RT.cudaMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
 RT.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
 RT.cudaDeviceSynchronize.argtypes = []
-# v2.1（09-30 锁内实跑定谳）：同步 cudaMemcpy 入口在本机 ORT CUDA EP init 后原生崩
+# v2.1（09-29 锁内实跑定谳）：同步 cudaMemcpy 入口在本机 ORT CUDA EP init 后原生崩
 #   ——pinned 源/128KB 也崩（怪癖面比旧档"pageable ≥1MB"更宽：同窗 cudaMalloc/
 #   cudaHostAlloc 皆活，唯 sync-memcpy 死）。改 MemcpyAsync+流同步=框架生产同款
 #   路径（fence 门 Linux 全绿实证），免疫。

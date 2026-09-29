@@ -28,7 +28,7 @@ Option 0 最快；若 ORT 是硬约束——如与在产 fb64 管线同一套工
 | 图优化级别敏感性（ALL/BASIC/DISABLE 三档） | 全过=不敏感 |
 | 热换世界 == 重建会话世界 | ✓（同图同优化=同 float 世界，跨作业恒定） |
 
-CUDA 段实测（`tools/probe_ort_weightswap_cuda.py` v2.1，2026-09-30 GPU 锁内，
+CUDA 段实测（`tools/probe_ort_weightswap_cuda.py` v2.1，2026-09-29 GPU 锁内，
 ORT 1.30/farm_env.sh 现役，RTX 3060M）：
 
 | 判据 | 结果 |
