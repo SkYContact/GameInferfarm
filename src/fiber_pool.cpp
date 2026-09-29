@@ -278,7 +278,8 @@ void FiberPool::Configure(int workers, Census* census) {
 }
 
 double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
-                         FiberFrameFn frame_fn, void* user, double stagger_ms) {
+                         FiberFrameFn frame_fn, void* user, double stagger_ms,
+                         int stagger_batch) {
     const int K = workers_;
     g_fps.worker_aff = ParseCpuList(std::getenv("FARM_WORKER_AFFINITY"));
     if (!g_fps.worker_aff.empty()) {
@@ -306,7 +307,10 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
     while (g_fps.workers_ready.load() < K)
         FiSleepMs(1);
     // 逐链点火（错峰=stagger 语义：同步起跑=到达层羊群灾难；链 c → 工人
-    // c%K=确定性亲和）
+    // c%K=确定性亲和）。stagger_batch：每 tick 连点几条链再睡——4096 链×
+    // 逐条睡 1ms 时点火拖 4s+（活口被掐死的假象来源）；批化后点火时长=
+    // (chains/batch)×stagger。羊群度=batch×K 同时到达，batch=1 保持原语义。
+    if (stagger_batch < 1) stagger_batch = 1;
     int spawned = 0;
     for (int c = 0; c < chains; c++) {
         FiChain& ch = g_fps.fich[(size_t)c];
@@ -317,7 +321,7 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
         g_fps.total += per;
         FiSpawnGame(&ch, 0, c % K);
         spawned++;
-        if (stagger_ms > 0 && c + 1 < chains)
+        if (stagger_ms > 0 && c + 1 < chains && spawned % stagger_batch == 0)
             FiSleepMs(stagger_ms);
     }
     std::printf("[fiber] %d 条链已点火（K=%d 工人，后端=%s，每局一 fiber，链-工人亲和 c%%K）\n",
@@ -362,7 +366,8 @@ static void ThreadChainMain(ThreadLegCtx c) {
 }
 
 double RunLegThreads(int chains, int per, FiberGameFn game_fn, FiberFrameFn frame_fn,
-                     void* user, double stagger_ms) {
+                     void* user, double stagger_ms, int stagger_batch) {
+    if (stagger_batch < 1) stagger_batch = 1;
     auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> ths;
     ThreadLegCtx base{game_fn, frame_fn, user, 0, per};
@@ -370,7 +375,7 @@ double RunLegThreads(int chains, int per, FiberGameFn game_fn, FiberFrameFn fram
         ThreadLegCtx lc = base;
         lc.chain = c;
         ths.emplace_back(ThreadChainMain, lc);
-        if (stagger_ms > 0 && c + 1 < chains)
+        if (stagger_ms > 0 && c + 1 < chains && (c + 1) % stagger_batch == 0)
             FiSleepMs(stagger_ms);
     }
     for (auto& t : ths) t.join();

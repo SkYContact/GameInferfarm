@@ -77,7 +77,7 @@ public:
     // 返回墙钟秒。game_fn 在对局 fiber 上被调；首局在点火线程创建 fiber
     // （YGO 原版语义：首局主线程投、后续局由上一局在同工人创建）。
     double RunLeg(int chains, int per, FiberGameFn game_fn, FiberFrameFn frame_fn,
-                  void* user, double stagger_ms);
+                  void* user, double stagger_ms, int stagger_batch = 1);
 
     bool enabled() const { return workers_ > 0; }
     int workers() const { return workers_; }
@@ -90,6 +90,6 @@ private:
 // 线程模式腿（不用 fiber 时的同构对照路径）：chains 条 OS 线程各串行跑 per 局，
 // 帧在线程内 install 一次（链寿命语义一致）。返回墙钟秒。
 double RunLegThreads(int chains, int per, FiberGameFn game_fn, FiberFrameFn frame_fn,
-                     void* user, double stagger_ms);
+                     void* user, double stagger_ms, int stagger_batch = 1);
 
 } // namespace inferfarm

@@ -89,6 +89,7 @@ bool Farm::Init(FarmConfig cfg) {
     cfg_.banks = EnvInt("FARM_BANKS", cfg_.banks);
     cfg_.window_floor = EnvDouble("FARM_BANK_WINDOW_FLOOR", cfg_.window_floor);
     cfg_.stagger_ms = EnvDouble("FARM_STAGGER_MS", cfg_.stagger_ms);
+    cfg_.stagger_batch = EnvInt("FARM_STAGGER_BATCH", cfg_.stagger_batch);
     cfg_.cache_log2 = EnvInt("FARM_CACHE_LOG2", cfg_.cache_log2);
 
 #ifdef _WIN32
@@ -103,13 +104,15 @@ bool Farm::Init(FarmConfig cfg) {
         || cfg_.workers < 0 || cfg_.workers > 512
         || cfg_.cache_log2 < 0 || cfg_.cache_log2 > 24
         || !(cfg_.window_ms > 0) || !(cfg_.stagger_ms >= 0)
+        || cfg_.stagger_batch < 1 || cfg_.stagger_batch > cfg_.chains
         || cfg_.max_decisions < 1) {
         std::fprintf(stderr, "[farm] 配置非法: chains=%d games=%d slots=%d banks=%d "
-                     "workers=%d window=%.3f stagger=%.3f max_decisions=%lld cache_log2=%d"
+                     "workers=%d window=%.3f stagger=%.3f stagger_batch=%d max_decisions=%lld cache_log2=%d"
                      "（界: chains[1,4096] games[1,1e8] slots[1,1024] banks[0,32] "
-                     "workers[0,512] window>0 stagger>=0 cache_log2[0,24]）\n",
+                     "workers[0,512] window>0 stagger>=0 stagger_batch[1,chains] cache_log2[0,24]）\n",
                      cfg_.chains, cfg_.games, cfg_.slots, cfg_.banks, cfg_.workers,
-                     cfg_.window_ms, cfg_.stagger_ms, cfg_.max_decisions, cfg_.cache_log2);
+                     cfg_.window_ms, cfg_.stagger_ms, cfg_.stagger_batch,
+                     cfg_.max_decisions, cfg_.cache_log2);
         return false;
     }
     // cpu 路由模式便利：pop_p>0 而未点名 population_input → 缺省 "pop"
@@ -791,10 +794,10 @@ double Farm::RunLeg(AdapterFactory make, void* user) {
     double sec;
     if (cfg_.fibers)
         sec = pool_.RunLeg(cfg_.chains, per, FarmGameMain, FarmFrameFactory, &ctx,
-                           cfg_.stagger_ms);
+                           cfg_.stagger_ms, cfg_.stagger_batch);
     else
         sec = RunLegThreads(cfg_.chains, per, FarmGameMain, FarmFrameFactory, &ctx,
-                            cfg_.stagger_ms);
+                            cfg_.stagger_ms, cfg_.stagger_batch);
     // census 收尾：线程普查须在工人 join 前（RunLeg 已 join——普查退化为
     // 调度台/驱动面；YGO 产线在 join 前调，此处保接口可用性）
     if (bank_ && census_.on) census_.DumpThreads();

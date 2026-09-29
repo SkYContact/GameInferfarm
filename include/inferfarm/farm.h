@@ -74,6 +74,10 @@ struct FarmConfig {
     double window_ms = 0.2;
     double window_floor = 0.2;
     double stagger_ms = 10;       // 到达层羊群判决：错峰甜点
+    int stagger_batch = 1;        // 每 stagger tick 连点链数（点火吞吐旋钮）：
+                                  // 1=逐条错峰原语义；如 10=每 1ms 点 10 条。
+                                  // 大批链下点火时长=(chains/batch)×stagger——
+                                  // 4096 链逐条睡曾把点火拖到 4s+（活口假象）
     long long max_decisions = 1000000;   // 对局决策数护栏（防适配器死循环）
     bool census = false;
     int cache_log2 = 0;          // 推理缓存：0=关（缺省零行为差）；如 16=64K 条
