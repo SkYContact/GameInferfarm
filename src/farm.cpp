@@ -99,7 +99,7 @@ bool Farm::Init(FarmConfig cfg) {
     census_.on = cfg_.census;
     cache_.Init(cfg_.cache_log2);   // 推理缓存（0=关零行为差）
     // 配置校验（除零/巨分配防线）：误配 fail fast 而非崩溃
-    if (cfg_.chains < 1 || cfg_.chains > 4096 || cfg_.games < 1 || cfg_.games > 100000000
+    if (cfg_.chains < 1 || cfg_.chains > 16384 || cfg_.games < 1 || cfg_.games > 100000000
         || cfg_.slots < 1 || cfg_.slots > 1024 || cfg_.banks < 0 || cfg_.banks > 32
         || cfg_.workers < 0 || cfg_.workers > 512
         || cfg_.cache_log2 < 0 || cfg_.cache_log2 > 24
@@ -108,7 +108,7 @@ bool Farm::Init(FarmConfig cfg) {
         || cfg_.max_decisions < 1) {
         std::fprintf(stderr, "[farm] 配置非法: chains=%d games=%d slots=%d banks=%d "
                      "workers=%d window=%.3f stagger=%.3f stagger_batch=%d max_decisions=%lld cache_log2=%d"
-                     "（界: chains[1,4096] games[1,1e8] slots[1,1024] banks[0,32] "
+                     "（界: chains[1,16384] games[1,1e8] slots[1,1024] banks[0,32] "
                      "workers[0,512] window>0 stagger>=0 stagger_batch[1,chains] cache_log2[0,24]）\n",
                      cfg_.chains, cfg_.games, cfg_.slots, cfg_.banks, cfg_.workers,
                      cfg_.window_ms, cfg_.stagger_ms, cfg_.stagger_batch,

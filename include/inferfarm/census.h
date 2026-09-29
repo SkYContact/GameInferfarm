@@ -57,8 +57,21 @@ public:
     // 的分母面：真 wake 应≈工件工人数而非行数）
     std::atomic<long long> seg_harv_copy_ns{0}, seg_harv_post_ns{0};
     std::atomic<long long> seg_harv_n{0}, seg_harv_post_n{0};
-    // FiberPost 三段细分（唤醒链定谳第二刀）：钩子/锁+入队/唤醒
+    std::atomic<long long> seg_harv_samp_n{0};   // 细分样本批数（抽样均分母）
+    // FiberPost 三段细分（唤醒链定谳第二刀）：钩子/锁+入队/唤醒。
+    // **细档分级（DATA14 判决：全量逐行三段计时=2.3× 观测税）**：细分计时
+    // 仅在 fine 档打——fine=2 全量（FARM_CENSUS=2，取证短开）；fine=1 抽样
+    // 1/256（FARM_CENSUS=1 缺省，样本均打印，post_samp_n=分母）；fine=0 不打。
+    // 粗档总量计数（fetch_add 面）不受分级影响=恒全量。
     std::atomic<long long> post_hook_ns{0}, post_lock_ns{0}, post_wake_ns{0};
+    std::atomic<long long> post_samp_n{0};   // 细分样本数（抽样均的分母）
+    int fine = 0;                            // 0=关 1=抽样1/256 2=全量
+    inline bool FineSample() {               // 热路径判定（单分支+线程局部位与）
+        if (fine == 2) return true;
+        if (fine != 1) return false;
+        static thread_local uint32_t s = 0;
+        return (++s & 0xFF) == 0;            // 1/256
+    }
     std::atomic<long long> seg_iter_n{0}, seg_disp_n{0}, seg_self_dep_n{0};
     // ---- 工人侧（原子；多工人累加）----
     std::atomic<long long> claim_n{0};
@@ -84,7 +97,8 @@ public:
     //      park  = 挂起中"等银行出池槽"（Claim 池空背压）
     //      infer = 挂起中"等推理在飞回信"（SubmitWait）
     //      other = 其余挂起（未知等待点——新挂起点忘传原因时在这里现形）----
-    static const int kMaxChains = 4096;   // 超界链不记账（钩子侧钳掉，不崩）
+    static const int kMaxChains = 16384;  // 超界链不记账（钩子侧钳掉，不崩；
+                                          // 掼蛋高等待者世界 16384 链档，DATA14）
     std::atomic<long long> ch_wall_ns[kMaxChains];
     std::atomic<long long> ch_run_ns[kMaxChains];
     std::atomic<long long> ch_ready_ns[kMaxChains];

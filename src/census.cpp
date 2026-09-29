@@ -46,7 +46,13 @@ Census* CensusGlobal() {
         static Census c;
         g_census = &c;
         // 默认关；env 选通（各宿主也可显式置 on）
-        if (const char* e = getenv("FARM_CENSUS")) c.on = atoi(e) == 1;
+        // 二档（DATA14）：1=粗档+细分抽样1/256（缺省取证档）；2=细档全量
+        //（三段计时逐行打，2.3× 税——只在短开取证用）
+        if (const char* e = getenv("FARM_CENSUS")) {
+            int v = atoi(e);
+            c.on = v >= 1;
+            c.fine = v >= 1 ? (v >= 2 ? 2 : 1) : 0;
+        }
     }
     return g_census;
 }
@@ -84,6 +90,7 @@ void Census::ResetLeg() {
     seg_harv_copy_ns.store(0); seg_harv_post_ns.store(0);
     seg_harv_n.store(0); seg_harv_post_n.store(0);
     post_hook_ns.store(0); post_lock_ns.store(0); post_wake_ns.store(0);
+    post_samp_n.store(0); seg_harv_samp_n.store(0);
     seg_iter_n.store(0); seg_disp_n.store(0); seg_self_dep_n.store(0);
     claim_n.store(0);
     claim_try_ns.store(0); claim_zero_ns.store(0);

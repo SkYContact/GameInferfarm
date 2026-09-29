@@ -126,7 +126,9 @@ void FiberPost(void* cookie) {
         g_fps.cen->NoteQLen(t->worker);  // 峰值 CAS（投递线程并发）
     }
     Census* cen = g_fps.cen;
-    const bool prof = cen && cen->on;
+    // 细分计时分级门（DATA14：全量逐行=2.3× 税）：fine 档抽样/全量才付
+    // 时钟读+簿记；粗档只留下方 push 面的 fetch_add（无条件门旁路）
+    const bool prof = cen && cen->on && cen->FineSample();
     const long long p0 = prof ? Census::NowNsI() : 0;
     FiWorker& w = g_fps.fiw[(size_t)t->worker];
     bool need_wake;
@@ -145,7 +147,11 @@ void FiberPost(void* cookie) {
         if (prof) cen->post_lock_ns.fetch_add(p2 - p1, std::memory_order_relaxed);
         if (t_post_batch) {   // 批模式：只记账不唤醒（FiberPostEnd 统一发）
             t_post_wake[(size_t)t->worker >> 6] |= uint64_t(1) << (t->worker & 63);
-            if (prof) cen->post_hook_ns.fetch_add((p1 - p0) + (Census::NowNsI() - p2), std::memory_order_relaxed);
+            if (prof) {
+                cen->post_hook_ns.fetch_add((p1 - p0) + (Census::NowNsI() - p2),
+                                            std::memory_order_relaxed);
+                cen->post_samp_n.fetch_add(1, std::memory_order_relaxed);
+            }
             return;
         }
         if (need_wake) w.cv.notify_one();
@@ -153,6 +159,7 @@ void FiberPost(void* cookie) {
             const long long p3 = Census::NowNsI();
             cen->post_hook_ns.fetch_add(p1 - p0, std::memory_order_relaxed);
             cen->post_wake_ns.fetch_add(p3 - p2, std::memory_order_relaxed);
+            cen->post_samp_n.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
