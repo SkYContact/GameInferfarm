@@ -66,6 +66,7 @@ add_library(inferfarm STATIC
     src/backends/ort_backend.cpp
     src/backends/trt_backend.cpp
     src/backends/ncnn_backend.cpp
+    src/backends/state_gather.cpp   # 状态面 gather/scatter 行拷内核（DATA13）
 )
 if (MSVC)
     # fcontext 后端切换体（MASM64；Windows x64 ABI 面，src/fcontext.asm）
@@ -140,6 +141,14 @@ if (INFERFARM_BUILD_TESTS)
     # 纤程开销拆解微基准（判决实验原语单价账；手动跑，不入 ctest）
     add_executable(fiber_bench tests/fiber_bench.cpp)
     target_link_libraries(fiber_bench PRIVATE inferfarm)
+
+    # 状态面行拷内核微基准（DATA13；真 GPU 手动跑，须先 ~/gpu_lock.sh
+    # acquire——GPU 协议硬规矩，不入 ctest）
+    add_executable(state_gather_bench tests/state_gather_bench.cpp)
+    target_link_libraries(state_gather_bench PRIVATE inferfarm)
+    # bench 直接复用仓内 cudart_dyn.h（lib 的 PRIVATE 头）——补 include 面
+    target_include_directories(state_gather_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 
     enable_testing()

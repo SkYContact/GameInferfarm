@@ -20,6 +20,7 @@
 #include "inferfarm/backend.h"
 #include "inferfarm/refit.h"
 #include "cudart_dyn.h"
+#include "state_gather.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -406,6 +407,13 @@ struct TrtSession {
         void clear() { dst.clear(); src.clear(); sz.clear(); ai.clear(); }
         bool empty() const { return dst.empty(); }
     } sb;
+    // ③gather 内核行号表（DATA13；FARM_STATE_GATHER=1）：主机建表→H2D→
+    // 单 launch 搬全面（CE 逐行固定开销 ~6.4µs×行数 → 一次 launch）。每池
+    // 各建一张（zero_pending 属池）；缓冲按 slots 一次分配逐批复用——复用
+    // 安全由会话生命周期保证（收割=旗标殿后，复用时上一批 H2D 必已执行）。
+    int* sg_tbl_h = nullptr;   // 主机 staging（3KB/批级）
+    int* sg_tbl_d = nullptr;   // 设备端表
+    int sg_cap = 0;            // 已分配容量
     int slots = 64;
     int dev = 0;      // 会话设备（多卡：分配/流/图/邮箱全落此设备）
     int last_n = 0;
@@ -754,6 +762,8 @@ public:
         if (s->out_d_arena) g_cu.Free(s->out_d_arena);
         if (s->mb_host) g_cu.FreeHost(s->mb_host);
         if (s->mb_seq_dev) g_cu.Free(s->mb_seq_dev);
+        if (s->sg_tbl_d) g_cu.Free(s->sg_tbl_d);
+        delete[] s->sg_tbl_h;
         delete s;
     }
 
@@ -794,6 +804,12 @@ public:
                     const size_t rb = s->ins[i].meta.row_bytes;
                     const StatePool& pol = st_pools_[(size_t)pi];
                     const size_t prows = (size_t)pol.rows;
+                    if (StGatherOn()) {   // DATA13：单 launch gather 全面
+                        if (!SgRun(s, dst, pool, pol, /*zero_ok=*/true, n_rows,
+                                   rb, 0))
+                            return false;
+                        continue;
+                    }
                     const bool batch = StBatchOn();
                     for (int r = 0; r < n_rows; r++) {
                         const int pid = s->st_pids[r].load(std::memory_order_relaxed);
@@ -1055,6 +1071,65 @@ private:
         }();
         return mode > 0 && g_cu.MemcpyBatchOk();
     }
+    // ③gather 内核档（DATA13，2026-09-30 判决）：FARM_STATE_GATHER=1 opt-in。
+    // 逐行 D2D 的执行端 CE 固定开销（~6.4µs×1536 行/批 ≈10ms）是吞吐真墙；
+    // 批 API 只省提交端不省执行端。内核路径=主机建行号表→H2D→单 launch。
+    // 装载失败自动回落旧路（batch/逐行）——旋钮是加速器不是依赖。
+    static bool StGatherOn() {
+        static const bool ready = [] {
+            const char* e = std::getenv("FARM_STATE_GATHER");
+            if (!e || std::atoi(e) != 1) return false;
+            if (!StateGatherInit()) {
+                std::fprintf(stderr, "[trt] state gather 内核装载失败——状态面回落逐行/batch 路径\n");
+                return false;
+            }
+            std::printf("[trt] state gather 内核就绪（行号表→单 launch）\n");
+            std::fflush(stdout);
+            return true;
+        }();
+        return ready;
+    }
+    // 主机侧行号表（语义全在这定，内核零分支零原子）：
+    //   -1=幻影行跳过（目标留陈旧内容，与逐行路径 continue 逐位同）；
+    //   zero_ok（仅填充侧）：pending 行改用池末保留零行（行号=prows）且消费
+    //   即清旗——load(acquire)→决策→store(0) 顺序与逐行路径逐位同；
+    //   散射侧 zero_ok=false：pending 不碰（散射覆写池行即 NewGame 语义兑现）。
+    static void SgBuildTbl(TrtSession* s, int n_rows, const StatePool& pol,
+                           bool zero_ok, int* tbl) {
+        const int prows = pol.rows;
+        for (int r = 0; r < n_rows; r++) {
+            const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+            if (pid < 0 || pid >= prows) { tbl[r] = -1; continue; }
+            if (zero_ok && pol.zero_pending[pid].load(std::memory_order_acquire)) {
+                pol.zero_pending[pid].store(0, std::memory_order_relaxed);
+                tbl[r] = prows;
+            } else {
+                tbl[r] = pid;
+            }
+        }
+    }
+    // 建表+H2D+单 launch（rc!=0 即 false——失败纪律同 memcpy，上层判负）。
+    // 表缓冲按 slots 一次分配逐批复用；安全由会话生命周期保证（旗标殿后=
+    // 复用时上一批 H2D 必已执行）。
+    static bool SgRun(TrtSession* s, void* rows_base, void* pool_base,
+                      const StatePool& pol, bool zero_ok, int n_rows,
+                      size_t rb, int mode) {
+        if (n_rows > s->sg_cap) {
+            if (s->sg_tbl_d && g_cu.Free(s->sg_tbl_d)) return false;
+            delete[] s->sg_tbl_h;
+            s->sg_tbl_h = new int[s->slots];
+            s->sg_tbl_d = nullptr;
+            if (g_cu.Malloc((void**)&s->sg_tbl_d, (size_t)s->slots * sizeof(int)))
+                return false;
+            s->sg_cap = s->slots;
+        }
+        SgBuildTbl(s, n_rows, pol, zero_ok, s->sg_tbl_h);
+        if (g_cu.MemcpyAsync(s->sg_tbl_d, s->sg_tbl_h,
+                             (size_t)n_rows * sizeof(int), 1, s->stream))
+            return false;
+        return StateGatherLaunch(rows_base, pool_base, s->sg_tbl_d, n_rows, rb,
+                                 s->stream, mode);
+    }
     // flush 批 scratch（单 attr 复用全条目；失败=scratch 清空后 false）
     static bool StBatchFlush(TrtSession* s) {
         if (s->sb.empty()) return true;
@@ -1091,6 +1166,12 @@ private:
                 char* pool = (char*)st_pools_[(size_t)pi].dev;
                 const char* src = (const char*)s->outs[oi].dev;
                 const size_t prows = (size_t)st_pools_[(size_t)pi].rows;
+                if (StGatherOn()) {   // DATA13：单 launch scatter 全面
+                    if (!SgRun(s, s->outs[oi].dev, pool, st_pools_[(size_t)pi],
+                               /*zero_ok=*/false, n_rows, rb, 1))
+                        return false;
+                    continue;
+                }
                 for (int r = 0; r < n_rows; r++) {
                     const int pid = s->st_pids[r].load(std::memory_order_relaxed);
                     if (pid < 0 || (size_t)pid >= prows)
