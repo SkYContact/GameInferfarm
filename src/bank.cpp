@@ -226,7 +226,7 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
             const std::vector<char>& gfw = I.fw_g[b.grp];
             const std::vector<char>& gst = I.st_in_g[b.grp];
             for (size_t i = 0; i < gs.ins.size(); i++) {
-                if (gs.ins[i].population) continue;   // population 面不清零
+                if (gs.ins[i].population || gs.ins[i].weight) continue;   // population/升格权重面不清零（后者唯一写入口=RefitWeights）
                 if (!gfw.empty() && gfw[i]) continue;   // 恒全量覆写声明行（快刀一）
                 if (!gst.empty() && gst[i]) continue;   // ③状态行（D2D 填充）
                 if (b.in_rows.empty()) {   // 预解未就绪防御：退回直查（语义同）
@@ -1164,7 +1164,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
             b.in_rows.assign(bs.ins.size(), nullptr);
             b.in_idx.reserve(bs.ins.size());
             for (size_t ii = 0; ii < bs.ins.size(); ii++) {
-                if (bs.ins[ii].population) continue;
+                if (bs.ins[ii].population || bs.ins[ii].weight) continue;   // 非槽行面不进预解表
                 size_t rb = 0;
                 b.in_rows[ii] = (char*)b.be->InputRow(b.sess, bs.ins[ii].name.c_str(), 0, &rb);
                 b.in_idx.push_back({bs.ins[ii].name.c_str(), ii});

@@ -10,8 +10,14 @@
 //     台线程不在对局关键路径；GPU 侧多批仍并行——device sync 等的是 max 不是
 //     sum）。v2 实验：legacy 默认流（synchronizing stream）邮箱盖章可去围栏
 //     税，须 probe 门验证 ORT 流为 blocking 再开——此处不赌。
-//  3. **无 refit**：ORT 无权重热换 API——RefitWeights 恒 false（ES 候选迭代
-//     每腿回退重载会话=秒级；演化场景走 TRT 后端）。
+//  3. **权重热换（2026-09-29，推翻本行旧判"ORT 无热换 API 恒 false"）**：
+//     升格权重（initializer 兼 graph input=ORT overridable initializer，
+//     枚举期自动检测）绑定为本会话常驻设备缓冲（IOBinding 创建期钉地址），
+//     RefitWeights(RW1)=validate-first 全会话先验后写 host+阻塞 H2D 覆写。
+//     图捕获兼容：冻结地址原地改值，重放即读新权重。RW1 stash=实例级种子
+//     （换心先于会话创建时暂存，Warmup memset 后播种）；未换心就发车=
+//     SubmitBatch fail fast（零=垃圾，不许静默）。尺寸实测见
+//     docs/reply-ygo-ort-hotswap.md §1（134MB=28.8ms，每 Run 0.525ms 零重传）。
 //
 // 图会话收益仍全额：批提交 3-4 次 WDDM 合成 1 次（ORT 内部 CUDA Graph）；
 // 零拷贝直写槽/攒批/多批在飞等调度层收益与后端无关。
@@ -37,6 +43,7 @@
 // （同步提交会阻塞写手 fiber 整个 GPU 时长）。实测 610M 核显 66K rows/s
 // （玩具 MLP，DML 调度开销绑定）。
 #include "inferfarm/backend.h"
+#include "inferfarm/refit.h"
 #include "cudart_dyn.h"
 #include "onnxruntime_c_api.h"
 #include <atomic>
@@ -426,6 +433,10 @@ struct OrtSess {
     bool pop_mode = false;    // population 路由模式（cfg.population_input 命中）
     std::vector<int> mid_like;   // 路由键输入下标（1-D i64 非 population——批尾
                                  // 毒化目标；路由图约定：i64 标量列=mid）
+    // ---- 升格权重面（overridable initializer，RefitWeights 通道）----
+    bool any_weight = false;      // 存在权重面（SubmitBatch fail-fast 门加速度器）
+    bool weights_seeded = false;  // 全部权重面已从 stash 播种（Warmup 置位；
+                                  // false 时 SubmitBatch 拒发车=零权重是垃圾）
     int slots = 64;
     // 完成协议（整设备同步血律）：Submit 后首个 CompletionReached 做一次
     // device sync + 前缀 D2H，随后同 seq 恒 true（dml：Run 同步=恒真）
@@ -489,6 +500,25 @@ class OrtBackend : public InferBackend {
 public:
     const char* Name() const override { return dml_ ? "ort-dml" : "ort"; }
 
+    // ---- 会话注册表+RW1 stash（RefitWeights 广播面，镜像 cpu_backend）----
+    // refit 与腿互斥（Farm 契约"前置=腿已返回"）⇒ mx_ 只护注册表与 stash
+    // 的结构性读写，不护 SubmitBatch 热路径。
+    std::mutex refit_mx_;
+    std::vector<OrtSess*> sessions_;       // refit 广播面（Track/Untrack）
+    std::vector<char> stash_blob_;         // 实例种子 RW1（整块持有；
+                                           // Rw1Entry.data 指向此块内 carve）
+    std::vector<Rw1Entry> stash_ents_;     // 种子条目（名字→权重字节）
+    void Track(OrtSess* s) {
+        std::lock_guard<std::mutex> lk(refit_mx_);
+        sessions_.push_back(s);
+    }
+    void Untrack(OrtSess* s) {
+        std::lock_guard<std::mutex> lk(refit_mx_);
+        for (size_t i = 0; i < sessions_.size(); i++)
+            if (sessions_[i] == s) { sessions_.erase(sessions_.begin() + (long)i); break; }
+    }
+
+
     // ORT 图会话绑调度台线程（PerThreadContext 铁律）+ DML 同步提交不可自驱：
     // 两条路线统一禁写手自驱，发车一律走调度台
     bool DispatchFromWriterOk() const override { return false; }
@@ -530,6 +560,11 @@ public:
     bool Warmup(void* session) override {
         OrtSess* s = (OrtSess*)session;
         memset(s->in_h_arena, 0, s->in_h_bytes);
+        // 升格权重播种（RW1 stash→host+H2D；memset 抹掉创建期种子，此处重播
+        // 幂等）。stash 覆盖不全=权重面留零——发车侧 fail fast 兜底（不静默）。
+        if (s->any_weight && !SeedWeights(s))
+            std::fprintf(stderr, "[ort] 权重面播种不全（stash 空/名字覆盖不全）"
+                         "——RefitWeights 前发车将被拒\n");
         // 一击必中探针（FARM_ORT_CAPTEST=1，外部审计建议的拦截器思路的零依赖
         // 版）：把流交给 ORT 前自捕一次。自捕 OK=流干净可捕获 ⇒ ORT 的 900
         // 来自它没用这条流；自捕 900=流已被捕/不可捕 ⇒ 有谁先动了它。
@@ -651,6 +686,7 @@ public:
     void DestroySession(void* session) override {
         OrtSess* s = (OrtSess*)session;
         if (!s) return;
+        Untrack(s);   // 注册表先摘除（refit 广播面不再指向将毁会话）
         if (s->helper) {   // 发射线程先停（Join 后再动会话对象）
             {
                 std::lock_guard<std::mutex> lk(s->h_mx);
@@ -705,6 +741,10 @@ public:
         OrtSess* s = (OrtSess*)session;
         for (auto& i : s->ins)
             if (i.meta.name == name) {
+                // 升格权重面=RefitWeights 专属，组装面不存在（nullptr=SlotWriter
+                // "未知名"契约）。唯一写入口执法点：inline 清零/Claim 回退/bank
+                // 视图回退经此全部自动安全。
+                if (i.meta.weight) return nullptr;
                 if (row_bytes) *row_bytes = i.meta.row_bytes;
                 return (char*)i.host + (size_t)slot * i.meta.row_bytes;
             }
@@ -715,6 +755,13 @@ public:
         OrtSess* s = (OrtSess*)session;
         if (n_rows > s->slots) n_rows = s->slots;
         if (n_rows < 1) n_rows = 1;
+        // 升格权重未换心=权重面全零（Warmup 零基 memset 后无种子）——零权重
+        // 输出是垃圾，拒发车（loud，不静默）。首次 RefitWeights 即解除。
+        if (s->any_weight && !s->weights_seeded) {
+            std::fprintf(stderr, "[ort] 升格权重面未换心——拒发车（先 "
+                         "RefitWeights(rw1)，或 init 期配 ModelConfig.refit_weights）\n");
+            return false;
+        }
         s->seq++;
         s->last_n = n_rows;
         s->synced_for_seq = false;
@@ -774,7 +821,7 @@ public:
                 // 尾段毒化照旧单拷。
                 size_t nb = 0;
                 for (size_t i = 0; i < s->ins.size(); i++) {
-                    if (s->ins[i].meta.population) continue;
+                    if (s->ins[i].meta.population || s->ins[i].meta.weight) continue;
                     s->hb_dst[(size_t)nb] = s->ins[i].dev;
                     s->hb_src[(size_t)nb] = s->ins[i].host;
                     s->hb_sizes[(size_t)nb] = (size_t)n_rows * s->ins[i].meta.row_bytes;
@@ -815,7 +862,7 @@ public:
                     }
             } else {
                 for (size_t i = 0; i < s->ins.size(); i++) {
-                    if (s->ins[i].meta.population) continue;
+                    if (s->ins[i].meta.population || s->ins[i].meta.weight) continue;
                     if (!h2d(s->ins[i].dev, s->ins[i].host,
                              (size_t)n_rows * s->ins[i].meta.row_bytes))
                         return false;
@@ -859,7 +906,7 @@ public:
                 };
                 for (size_t i = 0; i < s->ins.size() && ok; i++) {
                     OrtIn& in = s->ins[i];
-                    if (in.meta.population) continue;
+                    if (in.meta.population || in.meta.weight) continue;
                     if (!in.meta.append && !in.meta.headlive) {
                         emit(in.dev, in.host,
                              (size_t)n_rows * in.meta.row_bytes);
@@ -1126,11 +1173,126 @@ public:
         return -1;
     }
 
-    bool RefitWeights(const char*) override {
-        std::fprintf(stderr, "[ort] ORT 无权重热换 API——换心仅 TRT 后端支持"
-                     "（演化场景走 TRT；ORT 候选迭代=每腿重载会话）\n");
-        return false;
+    // ---- RefitWeights（升格权重热换，2026-09-29；接口语义与 TRT/CPU 同门：
+    //      RW1 blob→全会话换心，跨会话共享=实例级）。前置条件=腿已返回
+    //      （Farm 契约；与 SetPopulation 同纪律）。----
+    // 相一 validate（全条目×全会话先验，零撕裂态）→ 相二 commit（host 覆写+
+    // 阻塞 H2D——腿间流空闲，阻塞 memcpy=生产同款通道）。无会话=仅入 stash
+    // （init 期换心先于建行：farm.cpp cfg.refit_weights 在建行前调——种子由
+    // 后续会话 Warmup 播种；名字契约失配在 Warmup/发车侧 fail fast）。
+    bool RefitWeights(const char* rw1_path) override {
+        const double t0 = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::vector<char> blob;
+        std::vector<Rw1Entry> ents;
+        if (!ParseRw1(rw1_path, blob, ents)) return false;
+        std::lock_guard<std::mutex> lk(refit_mx_);
+        for (OrtSess* s : sessions_)
+            if (!ValidateOrCommit(s, ents, false)) return false;
+        int n_set = 0;
+        for (OrtSess* s : sessions_)
+            if (!ValidateOrCommit(s, ents, true, &n_set)) return false;
+        // stash 换代（成功才动；未来会话播种源）。data 指针重基到 stash 块。
+        std::vector<size_t> offs(ents.size());
+        for (size_t k = 0; k < ents.size(); k++)
+            offs[k] = (size_t)(ents[k].data - blob.data());
+        stash_blob_ = std::move(blob);
+        stash_ents_ = ents;
+        for (size_t k = 0; k < stash_ents_.size(); k++)
+            stash_ents_[k].data = stash_blob_.data() + offs[k];
+        const double t1 = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr, "[ort] refit 换心 %d 项×%zu 会话耗时 %.1fms：%s\n",
+                     n_set, sessions_.size(), t1 - t0, rw1_path);
+        return true;
     }
+
+private:
+    // stash→会话播种（Warmup memset 后调用；幂等）。返回 true=全部权重面已获
+    // 真实种子。stash 空/名字不命中=留零+false（发车侧 fail fast 兜底）。
+    bool SeedWeights(OrtSess* s) {
+        if (!s->any_weight) return true;
+        std::lock_guard<std::mutex> lk(refit_mx_);
+        bool all = true;
+        for (auto& i : s->ins) {
+            if (!i.meta.weight) continue;
+            const Rw1Entry* e = nullptr;
+            for (const auto& c : stash_ents_)
+                if (c.name == i.meta.name) { e = &c; break; }
+            const size_t bytes = i.meta.row_bytes * (size_t)i.meta.dims[0];
+            if (!e || e->bytes != bytes) { all = false; continue; }
+            std::memcpy(i.host, e->data, bytes);
+            if (!s->dml) {
+                if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+                if (g_cu.Memcpy(i.dev, i.host, bytes, 1)) return false;
+            }
+        }
+        s->weights_seeded = all;
+        return all;
+    }
+
+    // 单会话 RW1 校验/提交（RefitWeights 两相共用；前置=持 refit_mx_）。
+    // commit=false：只验——模型无权重面=拒（RW1 无落点）；有面但一项不中=空转
+    // 拒载（e271290/DATA11 教训）；dtype/numel 不符=fail fast（TRT 原型校验同门）。
+    // commit=true：host 覆写+阻塞 H2D（DML=纯宿主）。未播种会话要求全覆盖
+    //（部分换心后余下面仍是零=垃圾）。
+    bool ValidateOrCommit(OrtSess* s, const std::vector<Rw1Entry>& ents,
+                          bool commit, int* n_set = nullptr) {
+        int set = 0, faces = 0, matched = 0;
+        for (auto& i : s->ins) {
+            if (!i.meta.weight) continue;
+            faces++;
+            const Rw1Entry* hit = nullptr;
+            for (const auto& e : ents)
+                if (e.name == i.meta.name) { hit = &e; break; }
+            if (!hit) continue;
+            matched++;
+            const size_t bytes = i.meta.row_bytes * (size_t)i.meta.dims[0];
+            if ((size_t)Rw1DtypeSize(hit->dtype) != i.meta.esize
+                || hit->bytes != bytes) {
+                std::fprintf(stderr, "[ort] refit %s dtype/numel 与模型面不符"
+                             "（blob %zuB/dtype%u vs 面 %zuB/esize%zu）——fail fast\n",
+                             i.meta.name.c_str(), hit->bytes,
+                             (unsigned)Rw1DtypeSize(hit->dtype), bytes, i.meta.esize);
+                return false;
+            }
+            if (commit) {
+                std::memcpy(i.host, hit->data, bytes);
+                if (!s->dml) {
+                    if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
+                    if (g_cu.Memcpy(i.dev, i.host, bytes, 1)) {
+                        std::fprintf(stderr, "[ort] refit %s H2D 覆写失败\n",
+                                     i.meta.name.c_str());
+                        return false;
+                    }
+                }
+                set++;
+            }
+        }
+        if (!faces) {
+            std::fprintf(stderr, "[ort] refit 拒载：模型无升格权重面"
+                         "（RW1 %zu 项无落点）\n", ents.size());
+            return false;
+        }
+        if (!matched) {
+            std::fprintf(stderr, "[ort] refit 空转拒载：RW1 %zu 项与本会话 %d 个"
+                         "权重面名字全不匹配\n", ents.size(), faces);
+            return false;
+        }
+        if (commit) {
+            if (!s->weights_seeded && set < faces) {
+                std::fprintf(stderr, "[ort] refit 拒载：未播种会话仅覆盖 %d/%d 个"
+                             "权重面（余下面为零）——首次换心须全量 RW1"
+                             "（升格工具边车即全量）\n", set, faces);
+                return false;
+            }
+            s->weights_seeded = true;
+            if (n_set) *n_set += set;
+        }
+        return true;
+    }
+
+public:
 
     // population 面写入（演化路由）：宿主 arena 落盘 + cuda 置脏旗（下次批全量
     // H2D 一次）；dml=宿主绑定直读，写完即生效（无拷贝）
@@ -1364,6 +1526,9 @@ private:
     static void FillPattern(OrtSess* s, int seed) {
         for (size_t i = 0; i < s->ins.size(); i++) {
             OrtIn& oi = s->ins[i];
+            // 升格权重面不进图案实验：ProbeGraph 的 run_pat 会整 arena H2D，
+            // 垃圾图案上设备=后续真腿用垃圾权重（面恢复无门）
+            if (oi.meta.weight) continue;
             // population 面=总量按 dim0（P≠slots；同族坑第二处——按 slots 会写爆堆）
             size_t n = (oi.meta.population
                             ? oi.meta.row_bytes * (size_t)oi.meta.dims[0]
@@ -1642,6 +1807,9 @@ private:
             DestroySession(s);
             return nullptr;
         }
+        // （升格权重不在会话输入列表——ORT 把 overridable initializer 单列成
+        //  独立类别（实测定谳 2026-09-29：SessionGetInputCount 只数真输入），
+        //  见常规输入循环后的专列枚举段。）
         for (size_t i = 0; i < n_in; i++) {
             char* nm = nullptr;
             IgnoreStatus(a, a->SessionGetInputName(s->sess, i, alloc, &nm));
@@ -1687,9 +1855,11 @@ private:
             s->ins[i].meta.row_bytes = row * s->ins[i].meta.esize;
             // 声明式增量 H2D（判决25）：点名面标记。深度单位=行首维 dims[1]
             // （掼蛋形状 [256,18] → depth∈[0,256]、stride=18*esize 字节）。
-            // population 面与 <2 维面深度无定义=忽略点名（静默回落 full）；
+            // population/weight 面与 <2 维面深度无定义=忽略点名（静默回落 full
+            // ——full 永远正确，声明是加速非门槛）；
             // FARM_H2D_DELTA=0 杀手锏=全部忽略（零行为差回退）。
-            if (!dml && !s->ins[i].meta.population && DeltaEnvOn()
+            if (!dml && !s->ins[i].meta.population && !s->ins[i].meta.weight
+                && DeltaEnvOn()
                 && (!cfg.append_inputs.empty() || !cfg.headlive_inputs.empty())
                 && s->ins[i].meta.dims.size() >= 2
                 && s->ins[i].meta.dims[1] > 0) {
@@ -1718,6 +1888,68 @@ private:
             if (spec_out) {
                 InputMeta m = s->ins[i].meta;
                 spec_out->ins.push_back(std::move(m));
+            }
+        }
+        // ---- 升格权重面专列枚举（2026-09-29 实测定谳）：overridable initializer
+        //      （initializer 兼 graph input=升格）不进会话输入列表，是独立类别
+        //      ——按名 BindInput 即"覆写"语义（探针 P4 实证：覆写绑定缓冲→输出
+        //      跟着变）。从专列 API 枚举后追加进 ins 尾部：arena carve/绑定/
+        //      播种/换心/全豁免链自动覆盖。模型文件即声明面（升格工具产出），
+        //      零配置；ORT 对升格权重仅 Warning"禁 const folding"不阻断。----
+        {
+            size_t n_ovr = 0;
+            IgnoreStatus(a, a->SessionGetOverridableInitializerCount(s->sess, &n_ovr));
+            for (size_t k = 0; k < n_ovr; k++) {
+                char* nm = nullptr;
+                IgnoreStatus(a, a->SessionGetOverridableInitializerName(s->sess, k, alloc, &nm));
+                OrtIn wi;
+                wi.meta.name = nm ? nm : "?";
+                if (nm) IgnoreStatus(a, a->AllocatorFree(alloc, nm));
+                if (!cfg.population_input.empty()
+                    && wi.meta.name == cfg.population_input) {
+                    std::fprintf(stderr, "[ort] 升格权重面 %s 与 population_input "
+                                 "同名——两机制写同一面必打架，拒绝启动\n",
+                                 wi.meta.name.c_str());
+                    DestroySession(s);
+                    return nullptr;
+                }
+                OrtTypeInfo* ti = nullptr;
+                if (a->SessionGetOverridableInitializerTypeInfo(s->sess, k, &ti)) {
+                    DestroySession(s);
+                    return nullptr;
+                }
+                const OrtTensorTypeAndShapeInfo* info = nullptr;
+                if (a->CastTypeInfoToTensorInfo(ti, &info) || !info) {
+                    a->ReleaseTypeInfo(ti);
+                    DestroySession(s);
+                    return nullptr;
+                }
+                ONNXTensorElementDataType et;
+                IgnoreStatus(a, a->GetTensorElementType(info, &et));
+                size_t nd = 0;
+                IgnoreStatus(a, a->GetDimensionsCount(info, &nd));
+                wi.meta.dims.resize(nd);
+                IgnoreStatus(a, a->GetDimensions(info, wi.meta.dims.data(), nd));
+                a->ReleaseTypeInfo(ti);
+                wi.meta.et = OnnxToElem(et);
+                wi.meta.esize = OnnxElemSize(et);
+                bool static_dims = nd >= 1;
+                for (size_t d = 0; d < nd; d++)
+                    if (wi.meta.dims[d] <= 0) static_dims = false;
+                if (wi.meta.et != DTYPE_F32 || !wi.meta.esize || !static_dims) {
+                    std::fprintf(stderr, "[ort] 升格权重面 %s 须 f32+全静态维"
+                                 "（升格工具只升 float initializer）\n",
+                                 wi.meta.name.c_str());
+                    DestroySession(s);
+                    return nullptr;
+                }
+                size_t row = 1;
+                for (size_t d = 1; d < nd; d++) row *= (size_t)wi.meta.dims[d];
+                wi.meta.row_bytes = row * wi.meta.esize;
+                wi.meta.weight = true;
+                if (spec_out) spec_out->ins.push_back(wi.meta);
+                s->ins.push_back(std::move(wi));
+                s->any_weight = true;
             }
         }
         // ---- 输出元数据（须 fp32）----
@@ -1770,8 +2002,8 @@ private:
         //      carve[VirtualAlloc 64K 对齐]，地址均终身固定）----
         const size_t kAlign = 256;
         size_t off = 0;
-        for (size_t i = 0; i < n_in; i++)
-            off = (off + (s->ins[i].meta.population
+        for (size_t i = 0; i < s->ins.size(); i++)
+            off = (off + ((s->ins[i].meta.population || s->ins[i].meta.weight)
                               ? s->ins[i].meta.row_bytes * (size_t)s->ins[i].meta.dims[0]
                               : s->ins[i].meta.row_bytes * (size_t)slots)
                       + kAlign - 1) / kAlign * kAlign;
@@ -1810,10 +2042,11 @@ private:
             }
         }
         off = 0;
-        for (size_t i = 0; i < n_in; i++) {
-            // 绑定量=元数据口径：population 面总量=row_bytes×P（dim0=P≠slots！
-            // 曾按 slots 统一乘→fb128 靠 P==slots 侥幸、fb1024 声明 8×实配→越界 700）
-            size_t bytes = s->ins[i].meta.population
+        for (size_t i = 0; i < s->ins.size(); i++) {
+            // 绑定量=元数据口径：population/weight 面总量=row_bytes×dim0（dim0≠
+            // slots！曾按 slots 统一乘→fb128 靠 P==slots 侥幸、fb1024 声明 8×
+            // 实配→越界 700）
+            size_t bytes = (s->ins[i].meta.population || s->ins[i].meta.weight)
                 ? s->ins[i].meta.row_bytes * (size_t)s->ins[i].meta.dims[0]
                 : s->ins[i].meta.row_bytes * (size_t)slots;
             off = (off + kAlign - 1) / kAlign * kAlign;
@@ -1956,13 +2189,28 @@ private:
             spec_out->slots = slots;
         }
         // 路由键识别（population 模式）：1-D i64 非 population 输入=mid 类
+        //（weight 面排除——升格的 1-D i64 权重若被当路由键批尾毒化=权重被打烂）
         if (!cfg.population_input.empty())
             for (size_t i = 0; i < n_in; i++) {
                 if (s->ins[i].meta.population) s->pop_mode = true;
                 else if (s->ins[i].meta.et == DTYPE_I64
-                         && s->ins[i].meta.dims.size() == 1)
+                         && s->ins[i].meta.dims.size() == 1
+                         && !s->ins[i].meta.weight)
                     s->mid_like.push_back((int)i);
             }
+        if (s->any_weight) {
+            std::fprintf(stderr, "[ort] 升格权重面 %zu 个：",
+                         s->ins.size() - [&] { size_t k = 0;
+                             for (auto& i : s->ins) if (!i.meta.weight) k++;
+                             return k; }());
+            for (auto& i : s->ins)
+                if (i.meta.weight)
+                    std::fprintf(stderr, " %s(%zuMB)", i.meta.name.c_str(),
+                                 i.meta.row_bytes * (size_t)i.meta.dims[0] / (1 << 20));
+            std::fprintf(stderr, "——RefitWeights(RW1) 换心通道；未换心发车将拒绝\n");
+            std::fflush(stderr);
+        }
+        Track(s);
         if (dml) {
             // 专属发射线程（队头阻塞解药）：银行单飞（线性生命周期）⇒ 在飞
             // 作业 ≤1，投递槽单变量即够。失败仍记完成（loud print——银行无

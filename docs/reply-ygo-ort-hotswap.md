@@ -50,7 +50,8 @@ ORT 1.30/farm_env.sh 现役，RTX 3060M）：
 MemcpyAsync+流同步（框架生产同款路径）后全绿。凡 ctypes/cudart_dyn 直接
 调 CUDA 的探针一律走 MemcpyAsync+同步，别碰同步 cudaMemcpy 入口。
 
-## 2. 设计（ort_backend 立项面）
+## 2. 设计（ort_backend 立项面）——**已落地（2026-09-29，用户令"框架先立能力，
+不依赖 YGO 用不用"；实现差异见 §2a）**
 
 - **导出侧**：bake 脚本加"权重升格"出口（torch 导出后把 initializers 挪进
   graph inputs——onnx 官方工具 remove_initializer_from_input 的逆操作，
@@ -65,6 +66,29 @@ MemcpyAsync+流同步（框架生产同款路径）后全绿。凡 ctypes/cudart
 - **const folding 损失**：升格后 ORT 禁用权重相关折叠（Warning 在案）——
   YGO 模型 BN 折叠在训练侧已完成，残余影响待 fb64 真模型 A/B（探针小模型
   三档优化全过=方向性乐观）。
+
+### 2a. 实现定稿（与 §2 设计的差异，2026-09-29）
+
+- **声明面=模型文件本体，零配置**：检测用 ORT 官方 overridable initializer
+  枚举（`SessionGetOverridableInitializer{Name,Count}`，v19 头在）——升格的
+  onnx 自带声明，无 ModelConfig 新旋钮（population 需配置因文件里无从分辨；
+  升格权重文件里自明）。`InputMeta.weight` 旗标随 spec 流动。
+- **种子语义（v19 头无 initializer 读值 API 的解法）**：RefitWeights 在无会话
+  时入实例级 stash（init 期换心先于建行的现役时序正好吻合）；后续会话
+  Warmup memset 后从 stash 播种。**升格模型未换心就发车=SubmitBatch fail
+  fast 拒批**（零权重=垃圾，不许静默；⑥负路径门）——首换心用升格工具的
+  RW1 边车（as-baked 值）或 `ModelConfig.refit_weights` 指向它。
+- **validate-first 两相提交**：全条目×全会话先验（dtype/numel 不符/无落点/
+  空转=拒，e271290 同款）后写，零撕裂态；未播种会话的部分换心=拒（余下面
+  仍为零）。DML=纯宿主覆写；CUDA=阻塞 H2D（生产通道，腿间流空闲）。
+- **豁免接线（population 同款+一处执法）**：Claim 清零/HashSlot/H2D 三循环/
+  槽基址预解/FillPattern/mid_like 毒化排除全按 `population||weight`；
+  **ort InputRow 对权重面返回 nullptr**（唯一写入口执法——inline 清零/Claim
+  回退/bank 视图回退经此自动安全）。fillwrite/append/headlive/state_pairs
+  不受影响（权重面与各声明面互斥或静默回落 full=永远安全）。
+- **工具**：`tools/promote_weights_to_inputs.py`（升格+RW1 边车一次产出）；
+  门=`gomoku_backend_test` R11（换心必变/复采同/幂等/换回还原/假名负路径/
+  未换心拒批/stash 播种重建世界对拍）。
 
 ## 3. 验收门（按 YGO 契约+框架纪律）
 

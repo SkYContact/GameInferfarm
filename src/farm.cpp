@@ -519,7 +519,7 @@ CacheKey128 Farm::HashSlot(int bk, int sl, int grp) {
     // 按路由组自己的 spec 走（W2 组间异 IO：各组的面名/行宽各说各话）
     const ModelSpec& gs = group_specs_[(size_t)grp];
     for (size_t i = 0; i < gs.ins.size(); i++) {
-        if (gs.ins[i].population) continue;      // pop 面不哈希（代次 gen 已管）
+        if (gs.ins[i].population || gs.ins[i].weight) continue;   // pop/升格权重面不哈希（代次 gen 已管）
         size_t rb = 0;
         void* row = bank_->InputRow(bk, sl, gs.ins[i].name.c_str(), &rb);
         if (row && rb) h.Update(row, rb);

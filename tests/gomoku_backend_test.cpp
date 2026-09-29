@@ -493,6 +493,164 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // ---------------- R11：ort 升格权重热换（2026-09-29，YGO 工单落地）----------------
+    // 升格模型 models/gomoku_mlp.fb8.rw.onnx（fb8 的 4 项 float initializer 兼
+    // graph input=ORT overridable initializer；tools/promote_weights_to_inputs.py
+    // 产出，边车 .rw1=as-baked 种子）。会话级门：
+    //   ① RefitWeights(边车 as-baked) → 基线采样 ref0
+    //   ② RefitWeights(全零) → 输出必变 + 复采逐位同
+    //   ③ 同 blob 二次 refit → 幂等（ref1c == ref1）
+    //   ④ RefitWeights(边车) → 换回逐位还原（A→B→A==A；P3 语义 farm 级）
+    //   ⑤ 全假名 RW1 → 拒载+权重不动（负路径；空转 fail fast 同款）
+    //   ⑥ 未换心会话（新后端实例=空 stash）→ SubmitBatch 拒批（零权重=垃圾）
+    //   ⑦ 重建世界对拍：stash 播种的第二会话同输入 → 输出与 ref0 逐位同
+    // 升格模型缺 --names 同名初值=SKIP（工件由升格工具按需产出，不入库）。
+    if (have_ort && FileExists("models/gomoku_mlp.fb8.rw.onnx")) {
+        const char* kRwOnnx = "models/gomoku_mlp.fb8.rw.onnx";
+        const char* kRwSeed = "models/gomoku_mlp.fb8.rw.onnx.rw1";
+        InferBackend* be = CreateOrtBackend();
+        ModelConfig mc;
+        mc.backend = "ort";
+        mc.model_path = kRwOnnx;
+        ModelSpec spec;
+        if (!be || !be->LoadSpec(mc, 8, spec)) {
+            std::printf("SKIP R11: LoadSpec 失败\n");
+            delete be;
+        } else {
+            void* sess = be->CreateSession(mc, spec, /*for_bank=*/true);
+            if (!sess || !be->Warmup(sess)) {
+                std::printf("SKIP R11: 会话/热身不可用\n");
+                if (sess) be->DestroySession(sess);
+                delete be;
+            } else {
+                auto biteq = [](const std::vector<float>& a,
+                                const std::vector<float>& b) {
+                    return a.size() == b.size()
+                        && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+                };
+                auto sample0 = [&]() -> std::vector<float> {
+                    for (size_t i = 0; i < spec.ins.size(); i++) {
+                        size_t rb = 0;
+                        void* row = be->InputRow(sess, spec.ins[i].name.c_str(), 0, &rb);
+                        if (!row) continue;   // 升格权重面=组装面不存在（nullptr 契约）
+                        uint32_t x = 0x1234567u * (uint32_t)(i + 7);
+                        float* f = (float*)row;
+                        for (size_t j = 0; j < rb / sizeof(float); j++) {
+                            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                            f[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                        }
+                    }
+                    unsigned seq = 0;
+                    if (!be->SubmitBatch(sess, 1, seq)) return {};
+                    while (!be->CompletionReached(sess, seq)) {}
+                    be->CompletionFence();
+                    const float* p = be->OutputRow(sess, "policy", 0);
+                    return std::vector<float>(p, p + (size_t)spec.outs[0].width);
+                };
+                auto write_rw1 = [](const char* path, const char* const* names,
+                                    size_t n_names) {
+                    std::vector<char> b;
+                    auto put32 = [&](uint32_t v) {
+                        for (int i = 0; i < 4; i++) b.push_back((char)(v >> (8 * i)));
+                    };
+                    auto put16 = [&](uint16_t v) {
+                        for (int i = 0; i < 2; i++) b.push_back((char)(v >> (8 * i)));
+                    };
+                    b.insert(b.end(), {'R', 'W', '1', '\0'});
+                    put32(1);
+                    put32((uint32_t)n_names);
+                    static const uint32_t kNumel[4] = {64 * 450, 64, 225 * 64, 225};
+                    for (size_t k = 0; k < n_names && k < 4; k++) {
+                        std::string nm = names[k];
+                        put16((uint16_t)nm.size());
+                        b.insert(b.end(), nm.begin(), nm.end());
+                        b.push_back((char)2);   // f32
+                        put32(kNumel[k]);
+                        for (uint32_t e = 0; e < kNumel[k]; e++) put32(0);
+                    }
+                    FILE* f = fopen(path, "wb");
+                    if (f) { fwrite(b.data(), 1, b.size(), f); fclose(f); }
+                    return f != nullptr;
+                };
+                static const char* kNames[4] = {"fc1.weight", "fc1.bias",
+                                                "fc2.weight", "fc2.bias"};
+                bool ok1 = be->RefitWeights(kRwSeed);
+                std::vector<float> ref0 = ok1 ? sample0() : std::vector<float>{};
+                CHECK(ok1 && !ref0.empty(), "R11 as-baked 首次换心（边车种子）+基线采样");
+                const char* kRwZero = "gomoku_r11_zero.rw1";
+                bool w0 = write_rw1(kRwZero, kNames, 4);
+                bool refit1 = w0 && be->RefitWeights(kRwZero);
+                std::vector<float> ref1 = refit1 ? sample0() : std::vector<float>{};
+                CHECK(refit1 && !ref1.empty() && !biteq(ref0, ref1),
+                      "R11 换心必变（升格面 4 项全中）");
+                std::vector<float> ref1b = sample0();
+                CHECK(biteq(ref1, ref1b), "R11 换心后复采逐位同");
+                bool refit2 = be->RefitWeights(kRwZero);
+                std::vector<float> ref1c = refit2 ? sample0() : std::vector<float>{};
+                CHECK(refit2 && biteq(ref1, ref1c), "R11 同 blob 二次 refit 幂等");
+                bool refit3 = be->RefitWeights(kRwSeed);
+                std::vector<float> ref3 = refit3 ? sample0() : std::vector<float>{};
+                CHECK(refit3 && biteq(ref0, ref3),
+                      "R11 换回逐位还原（A→B→A==A；G5/P3 语义）");
+                static const char* kFake[2] = {"nope.weight", "also_fake.bias"};
+                bool w4 = write_rw1(kRwZero, kFake, 2);
+                bool refit4 = w4 && be->RefitWeights(kRwZero);
+                std::vector<float> ref4 = sample0();   // 拒载=权重必未动
+                CHECK(!refit4 && biteq(ref0, ref4),
+                      "R11 全假名=空转拒载+权重不动（负路径）");
+                std::remove(kRwZero);
+                // ⑥ 未换心拒批：新后端实例=空 stash（会话级隔离实证）。Warmup
+                // 播种不全→weights_seeded=false→SubmitBatch fail fast。
+                {
+                    InferBackend* beB = CreateOrtBackend();
+                    ModelSpec specB;
+                    void* sessB = nullptr;
+                    bool rejected = false;
+                    if (beB && beB->LoadSpec(mc, 8, specB)
+                        && (sessB = beB->CreateSession(mc, specB, false))
+                        && beB->Warmup(sessB)) {
+                        unsigned seq = 0;
+                        rejected = !beB->SubmitBatch(sessB, 1, seq);
+                    }
+                    CHECK(rejected, "R11 未换心会话拒发车（零权重=垃圾，fail fast）");
+                    if (sessB) beB->DestroySession(sessB);
+                    delete beB;
+                }
+                // ⑦ 重建世界对拍：同实例第二会话（stash=边车 as-baked 播种），
+                // 同输入 → 与 ref0 逐位同（热换世界==重建世界，probe P5 farm 级）。
+                {
+                    void* sess2 = be->CreateSession(mc, spec, true);
+                    bool same = false;
+                    if (sess2 && be->Warmup(sess2)) {
+                        std::vector<float> sv;
+                        for (size_t i = 0; i < spec.ins.size(); i++) {
+                            size_t rb = 0;
+                            void* row = be->InputRow(sess2, spec.ins[i].name.c_str(), 0, &rb);
+                            if (!row) continue;
+                            uint32_t x = 0x1234567u * (uint32_t)(i + 7);
+                            float* f = (float*)row;
+                            for (size_t j = 0; j < rb / sizeof(float); j++) {
+                                x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                                f[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                            }
+                        }
+                        unsigned seq = 0;
+                        if (be->SubmitBatch(sess2, 1, seq)) {
+                            while (!be->CompletionReached(sess2, seq)) {}
+                            be->CompletionFence();
+                            const float* p = be->OutputRow(sess2, "policy", 0);
+                            sv.assign(p, p + (size_t)spec.outs[0].width);
+                        }
+                        same = biteq(ref0, sv);
+                    }
+                    CHECK(same, "R11 stash 播种重建会话==热换会话（世界逐位同）");
+                    if (sess2) be->DestroySession(sess2);
+                }
+                be->DestroySession(sess);
+                delete be;
+            }
+        }
+    }
     // ---------------- R8：声明式增量 H2D（判决25）----------------
     // 深度前缀模式（content=f(k) 与局无关）是 append-only 承诺的结构性成立形态：
     // 任意行任意局写 [0,d) 都是同一前缀 → 槽轮转/换局下增长段假设恒真。

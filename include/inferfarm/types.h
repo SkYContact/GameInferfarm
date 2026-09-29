@@ -35,6 +35,16 @@ struct InputMeta {
                                  // 整张量=[P, flat_w] 种群权重平面——Claim 不清零/
                                  // 缓存不哈希（代次 gen 已在键）/SubmitBatch 脏旗
                                  // 全量拷（cuda）；dim0=P ≠ slots 合法
+    bool weight = false;         // 升格权重面（ORT 权重热换，2026-09-29）：initializer
+                                 // 兼 graph input（ORT 官方名 overridable initializer，
+                                 // 后端枚举期自动检测=模型文件即声明，零配置）。整张量
+                                 // =权重本体（dim0=模型自身维度 ≠ slots 合法）。会话级
+                                 // 绑定面（IOBinding 钉死地址，创建期一次绑定）——
+                                 // Claim 不清零/缓存不哈希/槽表不预解/SubmitBatch 不传
+                                 // /InputRow 拒写（适配器组装面不存在此面）；唯一写
+                                 // 入口=RefitWeights（RW1 blob，validate-first 全体
+                                 // 先验后写；未换心就发车=SubmitBatch fail fast）。
+                                 // 与 population/append/headlive 互斥（枚举期拒绝）
     bool append = false;         // 声明式增量 H2D 面（判决25）：模型配置
                                  // append_inputs 点名的 append-only 面（后端在
                                  // 枚举期标记；未点名=full 现状行为）。正确性前提
