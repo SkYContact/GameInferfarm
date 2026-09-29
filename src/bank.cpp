@@ -204,6 +204,12 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
         BankCtl& b = I.banks[(size_t)fi];
         const int S = b.slots;   // 界=本银行形状（异构批形状：慢卡小图）
         if (b.state.load(std::memory_order_acquire) != BK_FILL) return false;  // 预检（不占名额）
+        // 缓存行友好预检：满座高频场景下失败路径的两次 RMW（占名额+退名额）
+        // =16 核排队传一条 cursor 缓存行（实测单价 ~535ns/圈）。cursor 一次
+        // FILL 期内单调不减（虚增量只增），读得 ≥S=满座确凿，直接败退——
+        // 失败路径降为共享读（S 态行，无失效传递）；读到陈旧低位被"骗"进
+        // RMW 无妨，下方 v>=S 复检兜底，正确性不变。
+        if (b.cursor.load(std::memory_order_acquire) >= S) return false;
         b.inflight.fetch_add(1, std::memory_order_acq_rel);   // 占在途名额（占额者必完工）
         int v = b.cursor.fetch_add(1, std::memory_order_acq_rel);
         if (v >= S || b.state.load(std::memory_order_acquire) != BK_FILL) {
