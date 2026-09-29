@@ -728,6 +728,7 @@ static void BankLoop(BankScheduler::Impl& I) {
     if (window_ms < I.cfg.window_floor) window_ms = I.cfg.window_floor;
     double window_t0[BankScheduler::Impl::kMaxGrp] = {0};
     bool window_open[BankScheduler::Impl::kMaxGrp] = {false};
+    long long sd_prev = 0;   // 自驱发车窗口速率快照（差分尺；census 计数不清零）
     I.stat_t0 = NowMsD();
     Census* cen = I.cen;
     for (;;) {
@@ -876,13 +877,16 @@ static void BankLoop(BankScheduler::Impl& I) {
                             wait, poll, close, dep, harv, rot, resid,
                             wait + poll + close + dep + harv + rot + resid,
                             wall / d, itn / d,
-                            (double)cen->seg_self_dep_n.load() / d);
+                            (double)(cen->seg_self_dep_n.load() - sd_prev) / d);
+                sd_prev = cen->seg_self_dep_n.load();   // 窗口速率用快照差分——
+                // census 计数保持腿寿命（bankprof-worker 腿末打全量）；曾在此
+                // 清零=腿末残值只剩最后一窗（被误判"死计数器"）
                 std::fflush(stdout);
                 for (auto* ctr : {&cen->seg_wait_ns, &cen->seg_poll_ns,
                                   &cen->seg_close_ns, &cen->seg_dep_disp_ns,
                                   &cen->seg_harvest_ns, &cen->seg_rot_ns,
                                   &cen->seg_iter_ns, &cen->seg_iter_n,
-                                  &cen->seg_disp_n, &cen->seg_self_dep_n})
+                                  &cen->seg_disp_n})
                     ctr->store(0, std::memory_order_relaxed);
             }
             I.lat.clear();
