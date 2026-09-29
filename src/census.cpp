@@ -92,6 +92,7 @@ void Census::ResetLeg() {
     seg_adv_ns.store(0); seg_adv_n.store(0);
     seg_coll_ns.store(0); seg_coll_n.store(0);
     seg_asm_ns.store(0); seg_asm_n.store(0);
+    ChainLegBegin(0);   // 链钟清零（ch_n=0；RunLeg 会再 ChainLegBegin(chains)）
 }
 
 void Census::OnSpawn() {
@@ -133,6 +134,46 @@ void Census::OnPost(uint64_t& ts_post_out) {
     int r = state[1].fetch_add(1);
     int p = ready_peak.load(std::memory_order_relaxed);
     while (r > p && !ready_peak.compare_exchange_weak(p, r, std::memory_order_relaxed)) {}
+}
+
+// ---- 链钟（墙钟去向全埋点；写侧=属主转移点单写 relaxed，腿末汇总线程读）----
+void Census::ChainLegBegin(int chains) {
+    if (!on) return;
+    ch_n = chains > kMaxChains ? kMaxChains : chains;
+    for (int c = 0; c < ch_n; c++) {
+        ch_wall_ns[c].store(0);
+        ch_run_ns[c].store(0);
+        ch_ready_ns[c].store(0);
+        ch_park_ns[c].store(0);
+        ch_infer_ns[c].store(0);
+        ch_other_ns[c].store(0);
+        ch_spawn_us[c].store(0);
+    }
+}
+void Census::OnChainSpawn(int chain) {
+    if (!on || chain < 0 || chain >= kMaxChains) return;
+    ch_spawn_us[chain].store(NowUs(), std::memory_order_relaxed);
+}
+void Census::OnChainDone(int chain) {
+    if (!on || chain < 0 || chain >= kMaxChains) return;
+    const uint64_t sp = ch_spawn_us[chain].load(std::memory_order_relaxed);
+    if (sp) ch_wall_ns[chain].fetch_add((long long)(NowUs() - sp) * 1000,
+                                        std::memory_order_relaxed);
+}
+void Census::OnChainRun(int chain, long long ns) {
+    if (!on || chain < 0 || chain >= kMaxChains) return;
+    ch_run_ns[chain].fetch_add(ns, std::memory_order_relaxed);
+}
+void Census::OnChainReady(int chain, long long ns) {
+    if (!on || chain < 0 || chain >= kMaxChains) return;
+    ch_ready_ns[chain].fetch_add(ns, std::memory_order_relaxed);
+}
+void Census::OnChainWait(int chain, int reason, long long ns) {
+    if (!on || chain < 0 || chain >= kMaxChains) return;
+    std::atomic<long long>& bucket = reason == 1 ? ch_park_ns[chain]
+                                  : reason == 2 ? ch_infer_ns[chain]
+                                  : ch_other_ns[chain];
+    bucket.fetch_add(ns, std::memory_order_relaxed);
 }
 
 void Census::NoteQLen(int worker) {
@@ -291,6 +332,64 @@ void Census::StopPrinter() {
             std::printf(" %s:%.1f%%", qbn[i], qt ? 100.0 * (double)v / (double)qt : 0.0);
         }
         std::printf("（n=%lld）\n", qt);
+    }
+    // 链钟汇总：每链墙钟去向（run/ready/park/infer/other），闭合账
+    {
+        long long wsum = 0, bsum[5] = {0, 0, 0, 0, 0};   // run ready park infer other
+        int nch = 0;
+        double wmax = 0;
+        for (int c = 0; c < ch_n; c++) {
+            const long long w = ch_wall_ns[c].load();
+            if (!w) continue;
+            nch++;
+            wsum += w;
+            if (w > wmax) wmax = (double)w / 1e9;
+            bsum[0] += ch_run_ns[c].load();
+            bsum[1] += ch_ready_ns[c].load();
+            bsum[2] += ch_park_ns[c].load();
+            bsum[3] += ch_infer_ns[c].load();
+            bsum[4] += ch_other_ns[c].load();
+        }
+        if (nch > 0) {
+            const long long btot = bsum[0] + bsum[1] + bsum[2] + bsum[3] + bsum[4];
+            std::printf("[clock] 链墙钟去向 n=%d 链: 墙钟均值=%.3fs/链 峰值=%.3fs | "
+                        "桶合计=%.3fs 闭合缺=%.2f%%\n"
+                        "[clock]   run=%.1f%% ready=%.1f%% park(等池)=%.1f%% "
+                        "infer(在飞)=%.1f%% other=%.1f%%\n",
+                        nch, wsum / 1e9 / nch, wmax,
+                        btot / 1e9, wsum > 0 ? 100.0 * (1.0 - (double)btot / (double)wsum) : 0.0,
+                        wsum ? 100.0 * bsum[0] / wsum : 0.0,
+                        wsum ? 100.0 * bsum[1] / wsum : 0.0,
+                        wsum ? 100.0 * bsum[2] / wsum : 0.0,
+                        wsum ? 100.0 * bsum[3] / wsum : 0.0,
+                        wsum ? 100.0 * bsum[4] / wsum : 0.0);
+            if (bsum[4] > 0)
+                std::printf("[clock] ⚠ other>0：存在未传原因的挂起点（新挂起点应接"
+                            "FiberSuspend(原因)）\n");
+            // 链级明细：墙钟最长的前 8 条（极差侦查：哪条链拖尾）。选择式取
+            // top8 免全排序；选中即清 wall 防重复选中（腿末一次性打印）。
+            const int show = nch < 8 ? nch : 8;
+            std::printf("[clock] 拖尾 top%d（chain: wall | run/ready/park/infer/other %%）:",
+                        show);
+            for (int k = 0; k < show; k++) {
+                int best = -1; long long bw = -1;
+                for (int c = 0; c < ch_n; c++) {
+                    long long w = ch_wall_ns[c].load();
+                    if (w > bw) { bw = w; best = c; }
+                }
+                if (best < 0 || bw <= 0) break;
+                ch_wall_ns[best].store(0);
+                const long long w = bw;
+                std::printf(" [%d: %.3fs %.0f/%.0f/%.0f/%.0f/%.0f]",
+                            best, w / 1e9,
+                            100.0 * ch_run_ns[best].load() / w,
+                            100.0 * ch_ready_ns[best].load() / w,
+                            100.0 * ch_park_ns[best].load() / w,
+                            100.0 * ch_infer_ns[best].load() / w,
+                            100.0 * ch_other_ns[best].load() / w);
+            }
+            std::printf("\n");
+        }
     }
     double bsum = 0, isum = 0;
     int nw = 0;

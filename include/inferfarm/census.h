@@ -69,6 +69,30 @@ public:
     std::atomic<long long> seg_coll_ns{0}, seg_coll_n{0};  // CollectOutputs
     std::atomic<long long> seg_asm_ns{0}, seg_asm_n{0};    // AssembleInto
 
+    // ---- 链钟（第三刀：链墙钟去向全埋点。链生命周期每段都在属主转移点
+    //      入账，闭合等式 wall = run+ready+park+infer+other 恒成立）：
+    //      wall  = 首局点火 → 末局收卷（OnChainSpawn/OnChainDone 记两端）
+    //      run   = 工人切入→让出/收卷（在工人上真执行）
+    //      ready = 入就绪队列→工人取走（首跑=点火→首取；复活=投递→取走）
+    //      park  = 挂起中"等银行出池槽"（Claim 池空背压）
+    //      infer = 挂起中"等推理在飞回信"（SubmitWait）
+    //      other = 其余挂起（未知等待点——新挂起点忘传原因时在这里现形）----
+    static const int kMaxChains = 4096;   // 超界链不记账（钩子侧钳掉，不崩）
+    std::atomic<long long> ch_wall_ns[kMaxChains];
+    std::atomic<long long> ch_run_ns[kMaxChains];
+    std::atomic<long long> ch_ready_ns[kMaxChains];
+    std::atomic<long long> ch_park_ns[kMaxChains];
+    std::atomic<long long> ch_infer_ns[kMaxChains];
+    std::atomic<long long> ch_other_ns[kMaxChains];
+    std::atomic<uint64_t> ch_spawn_us[kMaxChains];   // 首局点火时刻
+    int ch_n = 0;                                    // 本腿链数（RunLeg 报备）
+    void ChainLegBegin(int chains);                  // RunLeg 开头报备链数并清零
+    void OnChainSpawn(int chain);                    // 首局入队（记点火时刻）
+    void OnChainDone(int chain);                     // 末局收卷（wall 闭合）
+    void OnChainRun(int chain, long long ns);
+    void OnChainReady(int chain, long long ns);
+    void OnChainWait(int chain, int reason, long long ns);  // reason=FiberWaitReason
+
     // 选通与生命周期（FARM_CENSUS=1 / Farm 配置；默认关=各点一次可预测分支）
     bool on = false;
 

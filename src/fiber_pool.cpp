@@ -40,6 +40,11 @@ struct alignas(64) FiTask {             // 一局一 fiber（64B 对齐：多 fi
                                         // 双重投递断言；w.mx 内读写=无竞争）
     uint64_t ts_post = 0;               // census：投递时刻（µs；w.mx 护送建立
                                         // happens-before，取走侧读）
+    // 链钟埋点（cen->on 时有效；均在属主转移点单写）：
+    uint64_t ts_spawn = 0;              // 入就绪队列时刻（首跑 ready 的起点）
+    uint64_t ts_run0 = 0;               // 最近一次被工人取走时刻（run 段起点）
+    uint64_t ts_susp = 0;               // 最近一次让出时刻（挂起段起点）
+    int susp_reason = 0;                // FWait_*（挂起期入哪个桶）
 };
 struct FiWorker {
     std::mutex mx;
@@ -70,14 +75,26 @@ static IFiberBackend* g_be = nullptr;              // 切换后端（RunLeg 期�
 // ---------------- 等待侧桥（银行层/任何等待点调用）----------------
 void* FiberCurrent() { return t_fi_task; }
 
-void FiberSuspend() {
+void FiberSuspend(FiberWaitReason why) {
     // 让出：Switch 回本工人调度器（恢复点=FiberPost 投递后工人再切入；
     // 恢复即结果就绪——收割侧先拷输出后投递）
     if (!t_fi_task) return;   // 线程腿误调=无操作（防御）
     assert(t_nosuspend == 0);   // 契约 1：组装直写槽窗口（ScopedNoSuspend
                                  // 只包 AssembleInto）内挂起=适配器违约
-    if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnSuspend();
-    g_be->Switch(t_fi_task->sched);
+    FiTask* t = t_fi_task;
+    if (g_fps.cen && g_fps.cen->on) {
+        g_fps.cen->OnSuspend();
+        // 链钟：run 段（工人切入→本让出）闭合；挂起段起点+原因登记
+        const uint64_t now = Census::NowUs();
+        if (t->ts_run0) {
+            g_fps.cen->OnChainRun(t->ch->chain,
+                                  (long long)(now - t->ts_run0) * 1000);
+            t->ts_run0 = 0;
+        }
+        t->ts_susp = now;
+        t->susp_reason = (int)why;
+    }
+    g_be->Switch(t->sched);
     // 恢复点：工人取走时已把状态翻回 RUNNING（见工人循环取走处）
 }
 
@@ -87,6 +104,13 @@ void FiberPost(void* cookie) {
     // 时二次 Post=它会恢复两次=逻辑错）。
     FiTask* t = (FiTask*)cookie;
     if (g_fps.cen && g_fps.cen->on) {
+        // 链钟：挂起段（让出→投递=答案就绪）按原因入账。ts_susp=0（登记→
+        // 挂起窗口内被投回，本 fiber 还没真正让出）时无挂起段可记。
+        if (t->ts_susp) {
+            g_fps.cen->OnChainWait(t->ch->chain, t->susp_reason,
+                                   (long long)(Census::NowUs() - t->ts_susp) * 1000);
+            t->ts_susp = 0;
+        }
         g_fps.cen->OnPost(t->ts_post);   // WAIT→READY + 投递时刻
         g_fps.cen->q_len[t->worker].fetch_add(1);
         g_fps.cen->NoteQLen(t->worker);  // 峰值 CAS（投递线程并发）
@@ -116,7 +140,11 @@ static void FI_API FiGameMain(void* p) {
     // 创建于工人=同链不跨工人）。到 per=链收卷。
     if (tk->gi + 1 < ch2->per)
         FiSpawnGame(ch2, tk->gi + 1, tk->worker);
-    if (g_fps.cen && g_fps.cen->on) g_fps.cen->OnDone();   // RUNNING→DONE + live--
+    if (g_fps.cen && g_fps.cen->on) {
+        g_fps.cen->OnDone();   // RUNNING→DONE + live--
+        if (tk->gi + 1 >= ch2->per)
+            g_fps.cen->OnChainDone(ch2->chain);   // 末局收卷：链墙钟闭合
+    }
     tk->finished = true;
     g_be->Switch(tk->sched);   // 不归路（工人侧 Destroy；函数返回=杀线程）
 }
@@ -164,9 +192,11 @@ static void FiSpawnGame(FiChain* ch, int gi, int wid) {
         // 消灭"先减后加"瞬时 -1 的 X≠0 假警报
         if (g_fps.cen && g_fps.cen->on) {
             g_fps.cen->OnSpawn();
+            if (gi == 0) g_fps.cen->OnChainSpawn(ch->chain);   // 链钟：点火时刻
             g_fps.cen->q_len[wid].fetch_add(1);
             g_fps.cen->NoteQLen(wid);
         }
+        t->ts_spawn = (g_fps.cen && g_fps.cen->on) ? Census::NowUs() : 0;
         w.ready.push_back(t);
     }
     w.cv.notify_one();
@@ -203,7 +233,13 @@ static void FiWorkerLoop(int wid, Census* cen) {
             // 闲段（cv 等待）入账 + 取走转移 READY→RUNNING + 复活样（投递→取走）
             cen->idle_ns[wid].fetch_add((t_run0 - t_wait0) * 1000);
             cen->OnPick(wid, t->ts_post);
+            // 链钟：ready 段（入队→取走；首跑=ts_spawn、复活=ts_post）闭合
+            const uint64_t rdy0 = t->ts_post ? t->ts_post : t->ts_spawn;
+            if (rdy0)
+                cen->OnChainReady(t->ch->chain, (long long)(t_run0 - rdy0) * 1000);
             t->ts_post = 0;
+            t->ts_spawn = 0;
+            t->ts_run0 = t_run0;   // run 段起点（让出/收卷处闭合）
         }
         // 切换点装卸（首跑/恢复同路）：帧=链寿命 → 同链跨局携带=线程模式语义
         t_fi_task = t;
@@ -212,6 +248,9 @@ static void FiWorkerLoop(int wid, Census* cen) {
         if (t->ch->frame) t->ch->frame->Uninstall();
         t_fi_task = nullptr;
         if (t->finished) {
+            if (con)   // 链钟：末段 run 闭合（收卷不经 FiberSuspend）
+                cen->OnChainRun(t->ch->chain,
+                                (long long)(Census::NowUs() - t->ts_run0) * 1000);
             g_be->Destroy(t->fiber);
             delete t;
             {
@@ -257,6 +296,7 @@ double FiberPool::RunLeg(int chains, int per, FiberGameFn game_fn,
     g_fps.game_fn = game_fn;
     g_fps.frame_fn = frame_fn;
     g_fps.cen = census_;
+    if (census_ && census_->on) census_->ChainLegBegin(chains);   // 链钟：报备本腿链数
     g_fps.fich.clear();
     g_fps.fich.resize((size_t)chains);
     std::vector<std::thread> wth;

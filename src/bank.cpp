@@ -283,7 +283,7 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
             I.waiting.fetch_add(1);
             if (I.cen && I.cen->on)
                 I.cen->claim_park_ns.fetch_add(NowNsI() - tp0, std::memory_order_relaxed);
-            FiberSuspend();   // 恢复=调度台已出池新银行（或再试）（挂起本身不计）
+            FiberSuspend(FWait_BankPark);   // 恢复=调度台已出池新银行（或再试）（挂起本身不计）
             I.waiting.fetch_sub(1);
         } else {
             std::unique_lock<std::mutex> lk(I.mx);
@@ -455,7 +455,7 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
         I.cen->sub_n.fetch_add(1, std::memory_order_relaxed);
     }
     if (r->fiber) {
-        FiberSuspend();
+        FiberSuspend(FWait_Infer);   // 链钟：在飞等待段按 infer 桶入账
     } else {
         std::unique_lock<std::mutex> lk(done.mx);
         done.cv.wait(lk, [&] { return done.done; });

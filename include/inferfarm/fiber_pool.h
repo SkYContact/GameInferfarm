@@ -36,8 +36,15 @@ class Census;
 // return/跑完收卷=工人重复切入已收卷 fiber=UAF）。SubmitWait 的协议防御
 // 分支"绝不 FiberPost 自己"正是这条义务的执行点。debug 构建对双重投递
 // 加断言（queued 旗标）。
+// 挂起原因（链钟埋点：挂起期时长按此入账 census 的 park/infer/other 桶）。
+// 新增挂起点必须传对原因——漏传落 other 桶即"未知等待点"警报。
+enum FiberWaitReason {
+    FWait_Other = 0,    // 未分类（默认；存在量应≈0）
+    FWait_BankPark = 1, // Claim 池空背压：等银行出槽
+    FWait_Infer = 2,    // SubmitWait：等推理在飞回信
+};
 void* FiberCurrent();
-void FiberSuspend();
+void FiberSuspend(FiberWaitReason why = FWait_Other);
 void FiberPost(void* cookie);
 
 // 契约 1 的机器校验（GameAdapter："advance 与 assemble 无挂起点"）：
