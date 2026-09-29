@@ -136,6 +136,22 @@ struct BankScheduler::Impl {
     std::mutex mx;
     std::condition_variable cv;
     std::thread disp;
+    // 收割线程（DATA15 §3.1 调度台并行化，所有权切分版）：**收割线程全权
+    // 收车**——完成旗标轮询/Fence/拷贝/批量回投/还池/统计向量全是它的，
+    // 调度台只发车（轮转+关舱+发车）。两线程零共享可变面：state 原子
+    // （发车 FLIGHT / 还池 POOL 各自单向写）、census 全原子、统计向量收割
+    // 独占（报告窗也在收割线程打）——无 stat_mx 无交接队列（首版交接+
+    // stat_mx 方案被实测否决：锁作用罩 cv 等待=收割饿 34ms/批，且
+    // "调度台代看消息再转交"徒增一跳）。
+    // **opt-in（FARM_HARVEST_THREAD=1，缺省关=现行为零变化）**：收益限定
+    // "调度台串行是墙、CPU 有闲"世界（掼蛋 90k 行/s 固定墙案）；CPU 紧张
+    // 世界（YGO）瓶颈是 CPU 总量，多一个可运行线程反与满载工人抢核=负资产。
+    std::thread harv;
+    std::atomic<bool> harv_on{false};   // 原子（TSAN 定谳：调度台线程先于本
+                                        // 值写入起跑，plain bool 跨线程读
+                                        // =O1 提出循环后调度台/收割线程各持
+                                        // 幻觉值→双收割（投递-挂起不变量爆）
+                                        // 或无人收→漂移性挂死）
     std::vector<int> sched_aff;          // FARM_SCHED_AFFINITY 解析（Init 填、
                                          // disp 线程开头消费——spin=1 自旋核
                                          // 钉扎防迁移，判决17/18）
@@ -556,7 +572,8 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
             r->ldone->cv.notify_one();
         }
         if (I.cen) I.cen->OnPipeDone(1);   // W 拆账：回信出账
-        I.lat.push_back(NowMsD() - r->t0);
+        I.lat.push_back(NowMsD() - r->t0);   // 统计向量属主=收割线程独占
+                                             //（老路=调度台独占；两路各自单写）
     }
     if (hprof) {
         I.cen->seg_harv_copy_ns.fetch_add(NowNsI() - hc0, std::memory_order_relaxed);
@@ -567,10 +584,10 @@ static void BankHarvest(BankScheduler::Impl& I, BankCtl& b) {
         I.cen->seg_harv_post_n.fetch_add(hpost_n, std::memory_order_relaxed);
     }
     FiberPostEnd();   // 批内有投递的工人各一次 notify（256 发→16 发）
-    I.gpu_busy_sum += NowMsD() - b.flight_t0;
-    // 批大小/在飞时长样本：记在收割侧（BankHarvest 恒在调度台线程=与 lat 同源
-    // 独占；勿移到发车侧——BankDrainSubmit 有写手自驱路径，plain vector 会竞争）
     const double flw = NowMsD() - b.flight_t0;
+    // 批大小/在飞时长样本：收割线程（或老路调度台）单写——不能移发车侧
+    //（BankDrainSubmit 有写手自驱路径，plain vector 会竞争）
+    I.gpu_busy_sum += NowMsD() - b.flight_t0;
     I.bsz.push_back(b.flight_n);
     I.fl_ms.push_back(flw);
     // 还池（线性生命周期；mx 护——满座自驱路径也可能回池；按组还）
@@ -692,7 +709,33 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
 // 挂起写手（组内等待——他组轮转不惊醒，免唤醒风暴）
 static void BankTryRotate(BankScheduler::Impl& I, int g) {
     if (g < 0 || g >= I.n_groups) return;
-    if (I.fill_idx[g].load(std::memory_order_acquire) >= 0) return;
+    if (I.fill_idx[g].load(std::memory_order_acquire) >= 0) {
+        // 已有 FILL 银行：补唤醒滞留 waiters（零行 FILL 死锁洞，收割剥离档
+        // 首跑定谳 2026-09-30——写手 park 落在本组还池轮转之后=无人叫醒领号，
+        // 而 FILL 零行永不 timer 发车=永挂；老路靠写手自旋活着掩盖同款窗口）。
+        // 唤醒≠领到号：醒来 try_claim 自有态复查，抢失败者再 park 等下轮。
+        int fi = I.fill_idx[g].load(std::memory_order_acquire);
+        BankCtl& fb = I.banks[(size_t)fi];
+        std::deque<void*> wake;
+        {
+            std::lock_guard<std::mutex> lk(I.mx);
+            const long long spare =
+                (long long)fb.slots - fb.cursor.load(std::memory_order_acquire);
+            if (fb.state.load(std::memory_order_acquire) == BK_FILL && spare > 0
+                && !I.waiters_g[(size_t)g].empty()) {
+                const size_t want = (size_t)spare + (size_t)fb.slots / 2 + 1;
+                const size_t take = (std::min)(I.waiters_g[(size_t)g].size(), want);
+                for (size_t k = 0; k < take; ++k) {
+                    wake.push_back(I.waiters_g[(size_t)g].front());
+                    I.waiters_g[(size_t)g].pop_front();
+                }
+            }
+        }
+        FiberPostBegin();
+        for (void* fib : wake) FiberPost(fib);
+        FiberPostEnd();
+        return;
+    }
     int i = -1;
     std::deque<void*> wake;
     {
@@ -744,6 +787,147 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
     FiberPostEnd();
 }
 
+// 窗口报告（每 3000 回信一行；收割剥离档=收割线程打=统计向量独占无锁，
+// 老路=调度台打。两路共用本函数（谁收割谁打）。
+static void BankReport(BankScheduler::Impl& I, Census* cen) {
+    static thread_local long long sd_prev = 0;   // 自驱发车窗口速率快照（差分尺；census 计数不清零）
+// ---- 汇报（每 300 个回信一行）----
+if ((int)I.lat.size() >= 3000) {   // P0-4（2026-09-24 审计）：3×sort+
+                                   // printf+fflush 在调度台线程=行速
+                                   // 高时每几 ms 抖一次——×10 节流
+                                   //（细粒度看 census）
+    std::sort(I.lat.begin(), I.lat.end());
+    std::sort(I.bsz.begin(), I.bsz.end());
+    std::sort(I.fl_ms.begin(), I.fl_ms.end());
+    auto pct = [](const std::vector<int>& v, double p) -> double {
+        return v.empty() ? 0.0 : (double)v[(size_t)(p * (double)(v.size() - 1))];
+    };
+    auto pctd = [](const std::vector<double>& v, double p) -> double {
+        return v.empty() ? 0.0 : v[(size_t)(p * (double)(v.size() - 1))];
+    };
+    double wall = NowMsD() - I.stat_t0;
+    long long nb = I.batches.load();
+    std::printf("[bank] srv-lat p50=%.1fms p90=%.1fms rows/batch=%.1f cycle=%.2fms "
+                "dep=%.2f drain=%.3f gpu_flight=%.0f%% waiting=%d "
+                "self_dep=%d batches=%lld\n",
+                I.lat[I.lat.size() / 2],
+                I.lat[(I.lat.size() * 9) / 10],
+                nb ? (double)I.rows.load() / (double)nb : 0.0,
+                nb ? wall / (double)nb : 0.0,
+                nb ? (double)I.dep_us.load() / 1000.0 / (double)nb : 0.0,
+                nb ? (double)I.drain_us.load() / 1000.0 / (double)nb : 0.0,
+                wall > 0 ? 100.0 * I.gpu_busy_sum / wall : 0.0,
+                I.waiting.load(),
+                (int)I.self_dep.load(),
+                nb);
+    std::printf("[bank] 批分布: bsz p10/p50/p90=%.0f/%.0f/%.0f（slots=%d）"
+                " flw p50/p90=%.2f/%.2fms n=%zu\n",
+                pct(I.bsz, 0.10), pct(I.bsz, 0.50), pct(I.bsz, 0.90),
+                I.cfg.slots,
+                pctd(I.fl_ms, 0.50), pctd(I.fl_ms, 0.90),
+                I.bsz.size());
+    std::fflush(stdout);
+    if (cen && cen->on && nb > 0) {
+        double d = (double)nb;
+        double wait = (double)cen->seg_wait_ns.load() / 1e6 / d;
+        double poll = (double)cen->seg_poll_ns.load() / 1e6 / d;
+        double close = (double)cen->seg_close_ns.load() / 1e6 / d;
+        double dep = (double)cen->seg_dep_disp_ns.load() / 1e6 / d;
+        double harv = (double)cen->seg_harvest_ns.load() / 1e6 / d;
+        double rot = (double)cen->seg_rot_ns.load() / 1e6 / d;
+        double itn = (double)cen->seg_iter_n.load();
+        double resid = (double)cen->seg_iter_ns.load() / 1e6 / d - wait - poll
+            - close - dep - harv - rot;
+        if (resid < 0) resid = 0;
+        const long long hn = cen->seg_harv_n.load();
+        const long long hs = cen->seg_harv_samp_n.load();
+        const long long ps = cen->post_samp_n.load();
+        std::printf("[banksched] 段/周期: wait=%.3f poll=%.3f close=%.3f 发车=%.3f"
+                    " harvest=%.3f[拷%.3f 唤%.3f/行%.3fµs n=%lld"
+                    " post钩/锁/唤=%.3f/%.3f/%.3fµs]"
+                    " rot=%.3f resid=%.3f | Σ=%.3f vs cycle=%.3f"
+                    " 迭代/批=%.1f 自驱发车/批=%.2f\n",
+                    wait, poll, close, dep, harv,
+                    hs ? (double)cen->seg_harv_copy_ns.load() / 1e6 / hs : 0.0,
+                    hs ? (double)cen->seg_harv_post_ns.load() / 1e6 / hs : 0.0,
+                    hs ? (double)cen->seg_harv_post_ns.load()
+                          / (double)(cen->seg_harv_post_n.load() ? cen->seg_harv_post_n.load() : 1) / 1e3 : 0.0,
+                    cen->seg_harv_post_n.load(),
+                    ps ? (double)cen->post_hook_ns.load() / 1e3 / ps : 0.0,
+                    ps ? (double)cen->post_lock_ns.load() / 1e3 / ps : 0.0,
+                    ps ? (double)cen->post_wake_ns.load() / 1e3 / ps : 0.0,
+                    rot, resid,
+                    wait + poll + close + dep + harv + rot + resid,
+                    wall / d, itn / d,
+                    (double)(cen->seg_self_dep_n.load() - sd_prev) / d);
+        sd_prev = cen->seg_self_dep_n.load();   // 窗口速率用快照差分——
+        // census 计数保持腿寿命（bankprof-worker 腿末打全量）；曾在此
+        // 清零=腿末残值只剩最后一窗（被误判"死计数器"）
+        std::fflush(stdout);
+        for (auto* ctr : {&cen->seg_wait_ns, &cen->seg_poll_ns,
+                          &cen->seg_close_ns, &cen->seg_dep_disp_ns,
+                          &cen->seg_harvest_ns, &cen->seg_rot_ns,
+                          &cen->seg_iter_ns, &cen->seg_iter_n,
+                          &cen->seg_disp_n})
+            ctr->store(0, std::memory_order_relaxed);
+    }
+    I.lat.clear();
+    I.bsz.clear();
+    I.fl_ms.clear();
+    I.stat_t0 = NowMsD();
+    I.dep_us.store(0);
+    I.drain_us.store(0);
+    I.batches.store(0);
+    I.rows.store(0);
+    I.self_dep.store(0);
+    I.gpu_busy_sum = 0;
+    }
+}
+
+
+// 收割线程主体（harv_on 档，所有权切分版）：**全权收车**——自己轮询完成
+// 旗标→Fence→收割→还池（还池 Notify 叫醒调度台轮转；发车通知也到本线程
+// 的 I.cv wait——调度台发车后立即开始盯在飞），调度台零参与。统计向量与
+// 报告窗全在本线程=零锁。忙（有在飞）0.1ms 轮询 / 闲 2ms，与调度台同策。
+static void BankHarvestLoop(BankScheduler::Impl* Ip) {
+    BankScheduler::Impl& I = *Ip;
+    Census* cen = I.cen;
+    I.stat_t0 = NowMsD();
+    for (;;) {
+        double now = NowMsD();
+        bool any_flight = false;
+        for (int i = 0; i < I.n_banks; i++) {
+            BankCtl& b = I.banks[(size_t)i];
+            if (b.state.load(std::memory_order_acquire) != BK_FLIGHT) continue;
+            any_flight = true;
+            if (!b.be->CompletionReached(b.sess, b.flight_seq)) {
+                if (now - b.flight_t0 > 500.0 && !b.flight_warned) {
+                    b.flight_warned = true;
+                    std::printf("[bank] FLIGHT 看门狗: bank=%d 已 %.0fms 未回信"
+                                " seq=%u（后端段卡死排查线索）\n",
+                                i, now - b.flight_t0, b.flight_seq);
+                    std::fflush(stdout);
+                }
+                continue;
+            }
+            b.be->CompletionFence();
+            b.flight_warned = false;
+            const long long th0 = cen && cen->on ? NowNsI() : 0;
+            BankHarvest(I, b);
+            if (cen && cen->on)
+                cen->seg_harvest_ns.fetch_add(NowNsI() - th0,
+                                              std::memory_order_relaxed);
+        }
+        BankReport(I, cen);   // 窗口报告（本线程独占统计向量=无锁）
+        if (I.stop.load()) break;
+        {
+            std::unique_lock<std::mutex> lk(I.mx);
+            I.cv.wait_for(lk, std::chrono::duration<double>(
+                                  (any_flight ? 0.1 : 2.0) / 1000.0));
+        }
+    }
+}
+
 // ---------------- 调度台 ----------------
 // 事件驱动+短轮询（在途时 200µs 兜底叫醒——完成旗标无中断，只轻轮询）。
 static void BankLoop(BankScheduler::Impl& I) {
@@ -761,14 +945,15 @@ static void BankLoop(BankScheduler::Impl& I) {
     if (window_ms < I.cfg.window_floor) window_ms = I.cfg.window_floor;
     double window_t0[BankScheduler::Impl::kMaxGrp] = {0};
     bool window_open[BankScheduler::Impl::kMaxGrp] = {false};
-    long long sd_prev = 0;   // 自驱发车窗口速率快照（差分尺；census 计数不清零）
     I.stat_t0 = NowMsD();
     Census* cen = I.cen;
     for (;;) {
         const long long it0 = cen && cen->on ? NowNsI() : 0;
         long long seg_t0 = it0;
         double now = NowMsD();
-        // ---- 收割：轮询在途银行完成旗标（FLIGHT 看门狗：>500ms 未到）----
+        // ---- 收割：老路=调度台自己轮询在飞银行完成旗标（看门狗>500ms）；
+        //      剥离档=收割线程全权收车，调度台零参与 ----
+        if (!I.harv_on) {
         for (int i = 0; i < I.n_banks; i++) {
             BankCtl& b = I.banks[(size_t)i];
             if (b.state.load(std::memory_order_acquire) != BK_FLIGHT) continue;
@@ -796,6 +981,7 @@ static void BankLoop(BankScheduler::Impl& I) {
         }
         if (cen && cen->on && seg_t0 != it0)
             cen->seg_poll_ns.fetch_add(NowNsI() - seg_t0, std::memory_order_relaxed);
+        }
         if (I.stop.load()) {
             // 唤醒挂起写手（fiber 投回队列/线程腿 notify）：它们重试 Claim
             // 见 stop 即弃领退出——否则停机即挂死。前置条件仍是"腿已全部
@@ -856,97 +1042,8 @@ static void BankLoop(BankScheduler::Impl& I) {
                 }
             }
         }
-        // ---- 汇报（每 300 个回信一行）----
-        if ((int)I.lat.size() >= 3000) {   // P0-4（2026-09-24 审计）：3×sort+
-                                           // printf+fflush 在调度台线程=行速
-                                           // 高时每几 ms 抖一次——×10 节流
-                                           //（细粒度看 census）
-            std::sort(I.lat.begin(), I.lat.end());
-            std::sort(I.bsz.begin(), I.bsz.end());
-            std::sort(I.fl_ms.begin(), I.fl_ms.end());
-            auto pct = [](const std::vector<int>& v, double p) -> double {
-                return v.empty() ? 0.0 : (double)v[(size_t)(p * (double)(v.size() - 1))];
-            };
-            auto pctd = [](const std::vector<double>& v, double p) -> double {
-                return v.empty() ? 0.0 : v[(size_t)(p * (double)(v.size() - 1))];
-            };
-            double wall = NowMsD() - I.stat_t0;
-            long long nb = I.batches.load();
-            std::printf("[bank] srv-lat p50=%.1fms p90=%.1fms rows/batch=%.1f cycle=%.2fms "
-                        "dep=%.2f drain=%.3f gpu_flight=%.0f%% waiting=%d "
-                        "self_dep=%d batches=%lld\n",
-                        I.lat[I.lat.size() / 2],
-                        I.lat[(I.lat.size() * 9) / 10],
-                        nb ? (double)I.rows.load() / (double)nb : 0.0,
-                        nb ? wall / (double)nb : 0.0,
-                        nb ? (double)I.dep_us.load() / 1000.0 / (double)nb : 0.0,
-                        nb ? (double)I.drain_us.load() / 1000.0 / (double)nb : 0.0,
-                        wall > 0 ? 100.0 * I.gpu_busy_sum / wall : 0.0,
-                        I.waiting.load(),
-                        (int)I.self_dep.load(),
-                        nb);
-            std::printf("[bank] 批分布: bsz p10/p50/p90=%.0f/%.0f/%.0f（slots=%d）"
-                        " flw p50/p90=%.2f/%.2fms n=%zu\n",
-                        pct(I.bsz, 0.10), pct(I.bsz, 0.50), pct(I.bsz, 0.90),
-                        I.cfg.slots,
-                        pctd(I.fl_ms, 0.50), pctd(I.fl_ms, 0.90),
-                        I.bsz.size());
-            std::fflush(stdout);
-            if (cen && cen->on && nb > 0) {
-                double d = (double)nb;
-                double wait = (double)cen->seg_wait_ns.load() / 1e6 / d;
-                double poll = (double)cen->seg_poll_ns.load() / 1e6 / d;
-                double close = (double)cen->seg_close_ns.load() / 1e6 / d;
-                double dep = (double)cen->seg_dep_disp_ns.load() / 1e6 / d;
-                double harv = (double)cen->seg_harvest_ns.load() / 1e6 / d;
-                double rot = (double)cen->seg_rot_ns.load() / 1e6 / d;
-                double itn = (double)cen->seg_iter_n.load();
-                double resid = (double)cen->seg_iter_ns.load() / 1e6 / d - wait - poll
-                    - close - dep - harv - rot;
-                if (resid < 0) resid = 0;
-                const long long hn = cen->seg_harv_n.load();
-                const long long hs = cen->seg_harv_samp_n.load();
-                const long long ps = cen->post_samp_n.load();
-                std::printf("[banksched] 段/周期: wait=%.3f poll=%.3f close=%.3f 发车=%.3f"
-                            " harvest=%.3f[拷%.3f 唤%.3f/行%.3fµs n=%lld"
-                            " post钩/锁/唤=%.3f/%.3f/%.3fµs]"
-                            " rot=%.3f resid=%.3f | Σ=%.3f vs cycle=%.3f"
-                            " 迭代/批=%.1f 自驱发车/批=%.2f\n",
-                            wait, poll, close, dep, harv,
-                            hs ? (double)cen->seg_harv_copy_ns.load() / 1e6 / hs : 0.0,
-                            hs ? (double)cen->seg_harv_post_ns.load() / 1e6 / hs : 0.0,
-                            hs ? (double)cen->seg_harv_post_ns.load()
-                                  / (double)(cen->seg_harv_post_n.load() ? cen->seg_harv_post_n.load() : 1) / 1e3 : 0.0,
-                            cen->seg_harv_post_n.load(),
-                            ps ? (double)cen->post_hook_ns.load() / 1e3 / ps : 0.0,
-                            ps ? (double)cen->post_lock_ns.load() / 1e3 / ps : 0.0,
-                            ps ? (double)cen->post_wake_ns.load() / 1e3 / ps : 0.0,
-                            rot, resid,
-                            wait + poll + close + dep + harv + rot + resid,
-                            wall / d, itn / d,
-                            (double)(cen->seg_self_dep_n.load() - sd_prev) / d);
-                sd_prev = cen->seg_self_dep_n.load();   // 窗口速率用快照差分——
-                // census 计数保持腿寿命（bankprof-worker 腿末打全量）；曾在此
-                // 清零=腿末残值只剩最后一窗（被误判"死计数器"）
-                std::fflush(stdout);
-                for (auto* ctr : {&cen->seg_wait_ns, &cen->seg_poll_ns,
-                                  &cen->seg_close_ns, &cen->seg_dep_disp_ns,
-                                  &cen->seg_harvest_ns, &cen->seg_rot_ns,
-                                  &cen->seg_iter_ns, &cen->seg_iter_n,
-                                  &cen->seg_disp_n})
-                    ctr->store(0, std::memory_order_relaxed);
-            }
-            I.lat.clear();
-            I.bsz.clear();
-            I.fl_ms.clear();
-            I.stat_t0 = NowMsD();
-            I.dep_us.store(0);
-            I.drain_us.store(0);
-            I.batches.store(0);
-            I.rows.store(0);
-            I.self_dep.store(0);
-            I.gpu_busy_sum = 0;
-        }
+        if (!I.harv_on) BankReport(I, cen);   // 剥离档：报告在收割线程（统计向量属主）
+
         // ---- 等待：事件（commit/领号/还池）cv 叫醒；窗内等窗到期（取各组最近
         //      到期）；在途兜底轮询 ----
         {
@@ -1330,6 +1427,14 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
         Shutdown();
         return false;
     }
+    // 收割线程（DATA15 §3.1；opt-in）：CPU 闲世界开（调度台串行墙解除），
+    // CPU 紧张世界（YGO）勿开——多一线程抢核=负资产
+    if (const char* e = getenv("FARM_HARVEST_THREAD")) I.harv_on = atoi(e) == 1;
+    if (I.harv_on) {
+        I.harv = std::thread(BankHarvestLoop, &I);
+        std::printf("[bank] 收割线程剥离开（拷贝/回投/还池移交；调度台只管轮转发车）\n");
+        std::fflush(stdout);
+    }
     banks_ = I.n_banks;
     n_groups_ = I.n_groups;
     std::printf("[bank] 零拷贝槽位银行就绪: 池 %d 家（%d 组）× %d 槽，window=%.2fms"
@@ -1352,6 +1457,9 @@ void BankScheduler::Shutdown() {
     if (I.notify_sem) ReleaseSemaphore(I.notify_sem, 1, nullptr);   // 唤醒 WMO
 #endif
     if (I.disp.joinable()) I.disp.join();
+    // 收割线程收工（stop 已置；若正收割一批则办完本轮再退出；在飞不保证
+    // 收割=既有 Shutdown 纪律，会话销毁前必须已 join）
+    if (I.harv.joinable()) I.harv.join();
     for (auto& b : I.banks)
         if (b.sess) {
             b.be->DestroySession(b.sess);
