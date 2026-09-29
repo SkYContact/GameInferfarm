@@ -28,8 +28,27 @@ Option 0 最快；若 ORT 是硬约束——如与在产 fb64 管线同一套工
 | 图优化级别敏感性（ALL/BASIC/DISABLE 三档） | 全过=不敏感 |
 | 热换世界 == 重建会话世界 | ✓（同图同优化=同 float 世界，跨作业恒定） |
 
-CUDA 段（`tools/probe_ort_weightswap_cuda.py`，138MB 量级+计时）待锁内
-复验——绑定的设备缓冲跨 Run 常驻为 IOBinding 文档语义，探针就绪。
+CUDA 段实测（`tools/probe_ort_weightswap_cuda.py` v2.1，2026-09-30 GPU 锁内，
+ORT 1.30/farm_env.sh 现役，RTX 3060M）：
+
+| 判据 | 结果 |
+|---|---|
+| P_swap 热换生效（134MB pinned H2D 覆写绑定缓冲→下个 Run 读新值） | ✓ |
+| P3 换回幂等（A→B→A 输出逐位还原） | ✓ |
+| 换心计时 | **28.8 ms**（134MB pinned H2D+同步；换回 28.7ms） |
+| 每 Run 开销（含 134MB 权重绑定） | **0.525 ms**=常规会话同量级（绑定零重传实证） |
+| 会话创建冷启（含 CUDA EP init） | 0.55–2.08 s（跑间波动；与 YGO 2.3s/作业读数同域） |
+| 会话创建温启（同进程第二会话） | 0.33 s |
+
+对账：124 作业/代 × 29ms ≈ **3.6s/代**（vs 现行 285s，-99%）。热换成本
+实测落在预判带内（138MB≈15-30ms §2），且低于 TRT refit 的 53ms——两后端
+"换心不换会话"成本同数量级，粗筛腿留 ORT 无成本罚。
+
+**环境怪癖面修正（v2.1 顺带定谳）**：同步 `cudaMemcpy` 在 ORT CUDA EP init
+后原生崩的怪癖，实测**pinned 源/128KB 也崩**（旧档"pageable ≥1MB"记窄了）；
+同窗 `cudaMalloc`/`cudaHostAlloc` 皆活=纯 sync-memcpy 入口问题。探针改
+MemcpyAsync+流同步（框架生产同款路径）后全绿。凡 ctypes/cudart_dyn 直接
+调 CUDA 的探针一律走 MemcpyAsync+同步，别碰同步 cudaMemcpy 入口。
 
 ## 2. 设计（ort_backend 立项面）
 
@@ -67,6 +86,7 @@ G5-ort 门（~半天）→ YGO 接线联调（你们侧半天，pol==3 式档位
 
 ## 5. 附
 
-探针 CPU 版四前提×三档优化全过=判决已立；CUDA 计时段脚本就绪，锁内一跑
-即得数。TRT 侧同思路先例（判决 12"演化场景选 TRT"+53ms 实测）不变——
-本工单是把同一思想移植到 ORT 现役管线，两后端此后同享"换心不换会话"。
+探针 CPU 版四前提×三档优化全过 + CUDA 版计时/生效/幂等全绿（§1）=判决
+完备，工单可随时立项（等 YGO Option 0 答复定路线）。TRT 侧同思路先例
+（判决 12"演化场景选 TRT"+53ms 实测）不变——本工单是把同一思想移植到
+ORT 现役管线，两后端此后同享"换心不换会话"。

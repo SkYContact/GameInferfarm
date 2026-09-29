@@ -9,6 +9,15 @@ sys.path.insert(0, '/home/wrp/farm_pkg_130')
 import numpy as np, onnx, onnx.helper as oh, onnxruntime as ort
 
 RT = ctypes.CDLL("/home/wrp/farm_pkg_130/nvidia/cu13/lib/libcudart.so.13")
+RT.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+RT.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]
+RT.cudaMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
+RT.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+RT.cudaDeviceSynchronize.argtypes = []
+# v2.1（09-30 锁内实跑定谳）：同步 cudaMemcpy 入口在本机 ORT CUDA EP init 后原生崩
+#   ——pinned 源/128KB 也崩（怪癖面比旧档"pageable ≥1MB"更宽：同窗 cudaMalloc/
+#   cudaHostAlloc 皆活，唯 sync-memcpy 死）。改 MemcpyAsync+流同步=框架生产同款
+#   路径（fence 门 Linux 全绿实证），免疫。
 def cuda_alloc(n):
     p = ctypes.c_void_p()
     assert RT.cudaMalloc(ctypes.byref(p), ctypes.c_size_t(n)) == 0
@@ -19,9 +28,13 @@ def pinned_view(nbytes, dtype=np.float32):
     return np.ctypeslib.as_array(ctypes.cast(p, ctypes.POINTER(ctypes.c_float)),
                                  shape=(nbytes // 4,))
 def h2d(dst, src_pinned, nbytes):
-    assert RT.cudaMemcpy(dst, src_pinned, ctypes.c_size_t(nbytes), 4) == 0  # pinned→dev
+    assert RT.cudaMemcpyAsync(dst, ctypes.c_void_p(src_pinned), ctypes.c_size_t(nbytes), 4, None) == 0  # pinned→dev
+    assert RT.cudaStreamSynchronize(None) == 0
 def d2h(dst_pinned, src, nbytes):
-    assert RT.cudaMemcpy(dst_pinned, src, ctypes.c_size_t(nbytes), 2) == 0
+    if isinstance(src, ctypes.c_void_p):
+        src = src.value
+    assert RT.cudaMemcpyAsync(dst_pinned, ctypes.c_void_p(src), ctypes.c_size_t(nbytes), 2, None) == 0
+    assert RT.cudaStreamSynchronize(None) == 0
 
 # 模型：YGO fb64 权重量级（w1 4096×8192 fp32 = 134MB，两层 MLP）
 din, dh, dout, N = 4096, 8192, 64, 8
@@ -71,11 +84,12 @@ h2d(pw1, pw1h.ctypes.data, w1.nbytes)
 h2d(pb1, pb1h.ctypes.data, b1.nbytes)
 h2d(pw2, pw2h.ctypes.data, w2.nbytes)
 io = ort.IOBinding(sess)
-io.bind_input("x", "cuda", 0, np.float32, x.shape, px)
-io.bind_input("w1", "cuda", 0, np.float32, w1.shape, pw1)
-io.bind_input("b1", "cuda", 0, np.float32, b1.shape, pb1)
-io.bind_input("w2", "cuda", 0, np.float32, w2.shape, pw2)
-io.bind_output("y", "cuda", 0, np.float32, (N, dout), py)
+# 1.30 pybind 新重载：buffer_ptr 须纯 int（c_void_p 实例不满足 SupportsInt）
+io.bind_input("x", "cuda", 0, np.float32, x.shape, px.value)
+io.bind_input("w1", "cuda", 0, np.float32, w1.shape, pw1.value)
+io.bind_input("b1", "cuda", 0, np.float32, b1.shape, pb1.value)
+io.bind_input("w2", "cuda", 0, np.float32, w2.shape, pw2.value)
+io.bind_output("y", "cuda", 0, np.float32, (N, dout), py.value)
 oh16 = pinned_view(N * dout * 4)
 sess.run_with_iobinding(io, None)
 d2h(oh16.ctypes.data, py, N * dout * 4)
