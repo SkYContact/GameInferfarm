@@ -51,6 +51,17 @@ struct FiWorker {
     std::condition_variable cv;
     std::deque<FiTask*> ready;          // 唤醒队列（per-worker）
     bool stop = false;
+    bool sleeping = false;              // 工人在 cv 睡眠中（唤醒跳过旗，DATA14
+                                        // 回执后追加：投递侧跳过叫醒已醒工人
+                                        // ——YGO 忙世界工人恒醒，notify 全是
+                                        // 白打）。同步性：置位/清位/读（投递
+                                        // 非批路径）全在 mx 临界区内=happens-
+                                        // before 闭合，漏唤醒不可能；唯一
+                                        // 无锁读点=FiberPostEnd（push-CS 之后
+                                        // 同线程读），最坏=对已醒工人多发一次
+                                        // notify（无害；用户拍板"极端多一次
+                                        // 唤醒没啥"）。纯自旋档永不置位=投递
+                                        // 零 notify（自旋工人轮询天然可见）。
     void* main_fib = nullptr;
 };
 
@@ -140,7 +151,8 @@ void FiberPost(void* cookie) {
         // notify——Mesa 语义下队列非空=工人不可能在睡（谓词在锁内复检），
         // 多余的 notify_one 在工人停着时每次都是真 futex wake 系统调用
         //（strace 实锤每 post 一发 WAKE；批模式 FiberPostEnd 收敛 3×）。
-        need_wake = w.ready.empty();
+        need_wake = w.sleeping;   // 只叫醒在睡的（旗在锁内读写=无漏唤醒；
+                                  // 已醒工人循环里必然再查队列）
         t->queued = true;
         w.ready.push_back(t);
         const long long p2 = prof ? Census::NowNsI() : 0;
@@ -177,8 +189,11 @@ void FiberPostEnd() {
         while (m) {
             const int w = (int)(i << 6) + __builtin_ctzll(m);
             m &= m - 1;
-            g_fps.fiw[(size_t)w].cv.notify_one();   // 队列非空已可见（锁内
-            // push 先于本 notify；cv 谓词在锁内复检）——无需持锁
+            // 只叫醒在睡的：sleeping 无锁读的竞争窗=工人正醒着干活（本批
+            // 早前行可能已把它叫醒）——跳过省 notify；真在睡则旗已置位可见。
+            // 误判方向唯一：对已醒工人多叫一次（无害，用户拍板）。
+            if (g_fps.fiw[(size_t)w].sleeping)
+                g_fps.fiw[(size_t)w].cv.notify_one();
         }
     }
 }
@@ -301,7 +316,9 @@ static void FiWorkerLoop(int wid, Census* cen) {
             if (!t && w.ready.empty()) break;   // stop 且队列空：收工
         } else {
             std::unique_lock<std::mutex> lk(w.mx);
+            w.sleeping = true;   // 睡眠旗（投递侧跳过已醒工人；见 FiWorker 注）
             w.cv.wait(lk, [&w] { return w.stop || !w.ready.empty(); });
+            w.sleeping = false;  // wait 返回=持锁，与投递侧临界区互斥
             if (w.ready.empty()) break;   // stop 且队列空：收工
             t = w.ready.front();
             w.ready.pop_front();
