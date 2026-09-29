@@ -27,6 +27,9 @@
 //   R8c headlive 头部活跃面（判决25 扩展，2026-09-27）：newest-first 面
 //      [0,depth) 每批可变/尾槽恒零——同深度内容全换（逆序移位，append 做不到）、
 //      缩深 memset 重铸、未声明兜底、宿主尾槽非零哨兵必报
+//   R10 引擎缓存悬垂回归（掼蛋 W4 双模型首爆，2026-09-29）：be1(引擎A) 会话
+//      基线 → be2(引擎B) 注册=容器增长 → be1 再 CreateSession——旧 vector 的
+//      eng_=&back() 裸指针悬垂=此序必 SIGSEGV；deque 修复=两跑逐位同+老会话照常
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
@@ -36,6 +39,7 @@
 #include "inferfarm/backend_factory.h"
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -155,13 +159,14 @@ int main(int argc, char** argv) {
     // r9 子档（argv[2]=="r9"）：③状态池门独立跑——trt 后端一进程一引擎
     //（全局缓存），R9 的玩具引擎须避开 R2-R7 的 gomoku 引擎
     const bool r9_only = argc > 2 && !std::strcmp(argv[2], "r9");
+    const bool r10_only = argc > 2 && !std::strcmp(argv[2], "r10");
     if (only) std::printf("=== 后端过滤：仅 %s 面 ===\n", only);
     const char* kOnnx = "models/gomoku_mlp.fb8.onnx";
     const char* kTrt = "models/gomoku_mlp.fb8.trt";
     std::printf("=== 真模型可选门（工件缺席=SKIP）===\n");
     bool have_ort = FileExists(kOnnx) && !(only && !std::strcmp(only, "trt"));
     bool have_trt = FileExists(kTrt) && !(only && !std::strcmp(only, "ort"))
-                    && !r9_only;
+                    && !r9_only && !r10_only;
     R ort{}, ort2{}, orti{}, trt{}, trt2{}, trti{};
     if (have_ort) {
         ort = Leg("ort", kOnnx, nullptr, 2);
@@ -848,7 +853,102 @@ int main(int argc, char** argv) {
                             "非观测量）\n", rp.games / rp.sec, rh.games / rh.sec);
         }
     }
-    if (!have_ort && !have_trt && !r9_only) {
+
+    // ---------------- R10：W1 引擎缓存悬垂回归（掼蛋 W4 双模型双组首爆，
+    // 2026-09-29 代理报，上游认领）----------------
+    // 序：be1(引擎A) 注册+会话跑批取基线 → be2(引擎B) 注册=缓存容器增长 →
+    // be1 实例**再用**（再 CreateSession）。旧 vector 实现：EnsureEngine 持
+    // 元素裸指针（eng_=&back()），push_back 整体搬移=be1.eng_ 悬垂，快路
+    // `eng_->eng` 检查本身即悬垂解引用 → be1 CreateSession SIGSEGV（Farm::
+    // Init 的组序=组0/组1 LoadSpec 先于任何会话，恰好必踩）。R9 只证两引擎
+    // 共存，未证"A 注册→B 注册→A 再用"交错序=本门补位（旧代码跑本门=信号
+    // 级失败即红）。deque 修复=push_back 不失效既有元素指针。
+    if ((!only || !std::strcmp(only, "trt")) && (have_trt || r10_only)
+        && FileExists("models/gomoku_mlp.fb8.trt")
+        && FileExists("models/state_toy.fb8.trt")) {
+        ModelConfig ca, cb;
+        ca.backend = "trt"; ca.engine_path = "models/gomoku_mlp.fb8.trt";
+        cb.backend = "trt"; cb.engine_path = "models/state_toy_r10copy.trt";
+        InferBackend* be1 = CreateTrtBackend();
+        InferBackend* be2 = CreateTrtBackend();
+        ModelSpec sa, sb;
+        bool ready = be1 && be2 && be1->LoadSpec(ca, 8, sa);
+        const void* ck1 = ready ? be1->DebugEngineCookie() : nullptr;   // 增长前
+        ready = ready && be2->LoadSpec(cb, 8, sb);
+        // 第三路径强制增长：R9/全跑态下 state_toy 引擎可能已在缓存（命中不
+        // 增长）——自拷一份文件副本=同字节异路径=EnsureEngine 必 push_back
+        {
+            std::ifstream src("models/state_toy.fb8.trt", std::ios::binary);
+            std::ofstream dst("models/state_toy_r10copy.trt", std::ios::binary);
+            dst << src.rdbuf();
+        }
+        cb.engine_path = "models/state_toy_r10copy.trt";   // 同字节异路径=缓存必 miss
+        ready = be2->LoadSpec(cb, 8, sb);
+        const void* ck2 = ready ? be1->DebugEngineCookie() : nullptr;   // 增长后
+        if (ready) {
+            CHECK(ck1 && ck1 == ck2,
+                  "R10d 引擎缓存元素地址稳定（旧 vector=搬移即红，确定性不靠堆运气/"
+                  "UB 可见性；ASAN×TRT deserialize 冲突不可用=本钩子是判据）");
+            auto run1 = [&](void* sess, std::vector<float>& out) -> bool {
+                uint32_t x = 0x9E3779B9u * 43u;   // 定内容种子（两跑同输入）
+                for (size_t i = 0; i < sa.ins.size(); i++) {
+                    if (sa.ins[i].population) continue;
+                    size_t rb = 0;
+                    void* row = be1->InputRow(sess, sa.ins[i].name.c_str(), 0, &rb);
+                    if (!row) return false;
+                    if (sa.ins[i].et == DTYPE_F32) {
+                        float* f = (float*)row;
+                        for (size_t j = 0; j < rb / sizeof(float); j++) {
+                            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                            f[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                        }
+                    } else {
+                        std::memset(row, 0, rb);
+                    }
+                }
+                unsigned seq = 0;
+                if (!be1->SubmitBatch(sess, 1, seq)) return false;
+                while (!be1->CompletionReached(sess, seq)) {}
+                be1->CompletionFence();
+                out.clear();
+                for (size_t i = 0; i < sa.outs.size(); i++) {
+                    int w = be1->OutputWidth(sess, sa.outs[i].name.c_str());
+                    const float* src = w > 0
+                        ? be1->OutputRow(sess, sa.outs[i].name.c_str(), 0) : nullptr;
+                    if (!src) return false;
+                    out.insert(out.end(), src, src + w);
+                }
+                return true;
+            };
+            void* sA1 = be1->CreateSession(ca, sa, true);
+            std::vector<float> o1, o2, o3;
+            bool ok1 = sA1 && be1->Warmup(sA1) && run1(sA1, o1);
+            CHECK(ok1, "R10 引擎A 首会话基线");
+            void* sB = be2->CreateSession(cb, sb, true);   // 引擎B 会话（注册已先行）
+            bool okb = sB && be2->Warmup(sB);
+            CHECK(okb, "R10 引擎B 注册+会话（第二路径入缓存=旧 vector 搬移点）");
+            void* sA2 = be1->CreateSession(ca, sa, true);  // be1 再用：旧码悬垂解引用
+            bool ok2 = sA2 && be1->Warmup(sA2) && run1(sA2, o2);
+            CHECK(ok2, "R10a 引擎B 注册后 be1 再 CreateSession（旧 vector 必爆的序）");
+            bool same = ok1 && ok2 && o1.size() == o2.size()
+                && std::memcmp(o1.data(), o2.data(), o1.size() * sizeof(float)) == 0;
+            CHECK(same, "R10b 二次会话输出==基线逐位同（容器增长不扰先注册实例）");
+            bool ok3 = run1(sA1, o3);
+            CHECK(ok3 && o3.size() == o1.size()
+                  && std::memcmp(o1.data(), o3.data(), o1.size() * sizeof(float)) == 0,
+                  "R10c 注册前的老会话照常（context 不受缓存容器影响）");
+            if (sA1) be1->DestroySession(sA1);
+            if (sA2) be1->DestroySession(sA2);
+            if (sB) be2->DestroySession(sB);
+        } else {
+            std::remove("models/state_toy_r10copy.trt");
+            std::printf("SKIP R10: LoadSpec 失败（工件在但引擎不可用）\n");
+        }
+        delete be1;
+        delete be2;
+        std::remove("models/state_toy_r10copy.trt");
+    }
+    if (!have_ort && !have_trt && !r9_only && !r10_only) {
         std::printf("（本目录无模型工件——全部 SKIP 属正常）\n");
         return 0;
     }

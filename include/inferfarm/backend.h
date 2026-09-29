@@ -55,6 +55,10 @@ public:
     // 换心（RW1 blob；TRT=refitter，CPU=直接改权重）。失败=false。
     virtual bool RefitWeights(const char* rw1_path) = 0;
 
+    // 诊断钩子（R10 门用）：实例缓存引擎元素的地址（容器稳定性回归观测——
+    // 仅比对值，不解引用；缺省 nullptr=后端无引擎缓存概念）。
+    virtual const void* DebugEngineCookie() const { return nullptr; }
+
     // 写手线程能否就地发车（满座自驱）：ORT 图会话=PerThreadContext 铁律
     // （创建/热身/回放须同线程=调度台线程），写手线程回放会触发 ORT 侧
     // 重新捕获（CUDA failure 900/901，2026-09-22 五子棋 CNN chains=64 实测）

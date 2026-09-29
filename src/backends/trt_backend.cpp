@@ -31,6 +31,7 @@
 #elif defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>   // _mm_lfence/_mm_pause 的 GCC/Clang 面（用点=TRT 门内）
 #endif
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -112,7 +113,11 @@ struct TrtEngineCache {
 // （LoadSpec 定 path，RefitWeights 随实例——多组各持不同引擎互不串）。
 static nvinfer1::IRuntime* g_trt_rt_shared = nullptr;
 static std::mutex g_engs_mx;
-static std::vector<TrtEngineCache>* g_engs_ptr = nullptr;
+// deque（非 vector）：EnsureEngine 持有元素裸指针（eng_ = &back()），第二个
+// 不同路径引擎 push_back 时 vector 会整体搬移=先注册实例的 eng_ 悬垂
+// （W4 双模型两组两引擎首爆：组0 CreateSession SIGSEGV）。deque 的
+// push_back 不失效既有元素指针（W5 双引擎门只跑单组农场，未覆盖此序）。
+static std::deque<TrtEngineCache>* g_engs_ptr = nullptr;
 
 static bool LoadTrtLib(const ModelConfig& cfg) {
     if (g_trt_create_runtime) return true;
@@ -862,7 +867,19 @@ public:
 
 private:
     int dev_id_ = 0;   // 实例设备（LoadSpec 落定；多卡守卫用）
+    // R10 判据钩子：按实例路径重扫缓存容器取当前元素地址（不读 eng_——
+    // vector 搬移后它是悬垂值，读即 UB；重扫地址对比才确定性暴露"元素搬移"）
+    const void* DebugEngineCookie() const override {
+        if (!g_engs_ptr || eng_path_.empty()) return nullptr;
+        std::lock_guard<std::mutex> lk(g_engs_mx);
+        for (const auto& e : *g_engs_ptr)
+            if (e.path == eng_path_ && e.eng) return (const void*)&e;
+        return nullptr;
+    }
+
     TrtEngineCache* eng_ = nullptr;   // W1：本实例引擎（EnsureEngine 落定；
+    std::string eng_path_;            // R10 钩子面：实例路径独立副本（eng_ 悬垂
+                                      // 时 path 不可从缓存元素读）
                                       // RefitWeights/会话建 context 随实例）
     // ③状态池（backend 实例级——组内银行共享设备池；链→组钉扎=无跨组状态。
     // 首个带 state_pairs 的会话创建时分配一次，零基一次；析构释放）
@@ -936,10 +953,11 @@ private:
             g_trt_rt_shared = (nvinfer1::IRuntime*)rt;
         }
         std::lock_guard<std::mutex> lk(g_engs_mx);
-        if (!g_engs_ptr) g_engs_ptr = new std::vector<TrtEngineCache>();
+        if (!g_engs_ptr) g_engs_ptr = new std::deque<TrtEngineCache>();
         for (auto& e : *g_engs_ptr)
             if (e.path == cfg.engine_path && e.eng) {
                 eng_ = &e;
+                eng_path_ = e.path;
                 return true;   // 同路径复用（多组同引擎：权重共享，refit 随实例）
             }
         const std::string& p = cfg.engine_path;
@@ -972,6 +990,7 @@ private:
         }
         g_engs_ptr->push_back(TrtEngineCache{p, eng});
         eng_ = &g_engs_ptr->back();
+        eng_path_ = p;
         return true;   // 换心走 RefitWeights()（Farm 在 context 创建前调）
     }
 
