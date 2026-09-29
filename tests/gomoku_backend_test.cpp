@@ -391,7 +391,7 @@ int main(int argc, char** argv) {
     //   ② RefitWeights(rw1) → 同输入 ref1 ≠ ref0（换心必变，G5 异 blob TRT 版）
     //   ③ 复采 ref1b == ref1（逐位确定）
     //   ④ 同 blob 二次 refit → ref1c == ref1（refit 幂等）
-    //   ⑤ 全名单外假名 RW1 → 引擎不动（ref2 == ref1；负路径）
+                //   ⑤ 全名单外假名 RW1 → 拒载（fail fast）且引擎不动（ref2 == ref1；负路径）
     // 名单对齐实证：真名 4 项全中（名单外跳过 0）+ missing 拒绝语义由后端
     // ApplyRefitWeights 把守（仓根 tools/refit_mlp_rw1.py 同名单）。R5 同款
     // backend 级采样；前置=腿可用（trt.games != 0=后端在）。
@@ -478,9 +478,10 @@ int main(int argc, char** argv) {
                 static const char* kFake[2] = {"nope.weight", "also_fake.bias"};
                 bool w3 = write_rw1(kRw1, kFake, 2, 0.0f);
                 bool refit3 = w3 && be->RefitWeights(kRw1);
-                std::vector<float> ref2 = refit3 ? sample0() : std::vector<float>{};
-                CHECK(refit3 && biteq7(ref1, ref2),
-                      "R7 名单外假名=引擎不动（负路径）");
+                std::vector<float> ref2 = sample0();   // 拒载=引擎必未动，采样仍是实查
+                CHECK(!refit3 && biteq7(ref1, ref2),
+                      "R7 名单外假名=拒载+引擎不动（负路径；e271290 契约——"
+                      "全名单外=换心空转，由静默跳过改 fail fast，掼蛋 DATA11 §2）");
                 std::remove(kRw1);
                 be->DestroySession(sess);
                 delete be;
