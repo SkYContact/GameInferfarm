@@ -107,6 +107,9 @@ public:
     // ③成对状态行：NewGame 清零组 backend 的池行（链串行⇒无并发访问；
     // 后端在全部会话流 memsetAsync=任意下一读所在流自有序）。
     bool ResetStatePool(int grp, int row);
+    // ③跨组共享状态池接线：sharer_grp 的后端绑定 owner_grp 的池行（须在
+    // 首批发车前调用；两端后端须支持 StatePoolInfo/ShareStatePool）
+    bool ShareStatePool(int owner_grp, int sharer_grp);
     // 组号查询（bank→组；缓存命名空间/诊断用）
     int GroupOf(int bank) const;
     int n_groups() const { return n_groups_; }

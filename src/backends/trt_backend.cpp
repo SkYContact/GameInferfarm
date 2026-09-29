@@ -395,8 +395,7 @@ struct TrtSession {
     // 分配——MbSubmit 是 static，经会话携带）
     bool has_state = false;              // 任一配对成立（恒图外尾段形态）
     std::vector<int> st_in, st_out;      // 输入/输出下标→池号（-1=非状态）
-    std::vector<void*> pool_devs;        // 池号→设备池基址
-    std::vector<int> pool_rows;          // 池号→池行数（幻影行卫的 static 面用）
+    // （③池表已上收 backend 级 st_pools_——ShareStatePool 接线后无需重建会话）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（Claim 写/
                                                   // 发车读；未绑=Init 期冒烟走旧路）
     // ③批量 D2D scratch（填充/散射逐行小拷合并为单次 cudaMemcpyBatchAsync
@@ -587,7 +586,10 @@ public:
                 DestroySession(s);
                 return nullptr;
             }
-            if (st_pools_.empty()) {
+            if (cfg.state_share_grp >= 0) {
+                // ③共享组：不分配池（ShareStatePool 由 Farm 接线；绑定前发车=
+                // SubmitBatch fail fast）。只做面映射（会话须知道哪些是状态面）
+            } else if (st_pools_.empty()) {
                 for (const auto& pr : cfg.state_pairs) {
                     int ii = -1, jj = -1;
                     for (size_t k = 0; k < spec.ins.size() && ii < 0; k++)
@@ -634,16 +636,14 @@ public:
                 for (size_t k = 0; k < spec.outs.size(); k++)
                     if (spec.outs[k].name == pr.out) s->st_out[k] = (int)pi;
             }
-            s->pool_devs.clear();
-            s->pool_rows.clear();
-            for (auto& p : st_pools_) {
-                s->pool_devs.push_back(p.dev);
-                s->pool_rows.push_back(p.rows);
-            }
             s->has_state = true;
-            std::fprintf(stderr, "[trt] 状态池生效: %zu 对 × %d 行"
-                         "（提交侧 D2D 填充+批尾 D2D 散射，状态不过主机）\n",
-                         st_pools_.size(), cfg.state_pool_rows);
+            if (cfg.state_share_grp >= 0)
+                std::fprintf(stderr, "[trt] 状态池共享组就绪: %zu 对（待 Farm"
+                             " 接线绑定持有组）\n", cfg.state_pairs.size());
+            else
+                std::fprintf(stderr, "[trt] 状态池生效: %zu 对 × %d 行"
+                             "（提交侧 D2D 填充+批尾 D2D 散射，状态不过主机）\n",
+                             cfg.state_pairs.size(), cfg.state_pool_rows);
         }
         if (for_bank) st_streams_.push_back(s->stream);   // ResetStatePool 全流面
         return s;
@@ -665,7 +665,7 @@ public:
             CaptureGraph(s);
             if (!s->graph_ok) {   // 在线邮箱冒烟（链路坏=回退流同步，不让首批挂）
                 unsigned seq = 0;
-                if (!MbSubmit(s, s->slots, seq)) { s->mb_ok = false; return false; }
+                if (!this->MbSubmit(s, s->slots, seq)) { s->mb_ok = false; return false; }
                 if (!WaitFlag(s, seq, 5000.0)) { s->mb_ok = false; return true; }
             }
         }
@@ -712,7 +712,7 @@ public:
             }
             unsigned seq = 0;
             double spin = 0;
-            if (!MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
+            if (!this->MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
                 v.clear();
                 return;
             }
@@ -776,6 +776,12 @@ public:
         if (n_rows > s->slots) n_rows = s->slots;
         s->last_n = n_rows;
         const bool st = s->has_state && s->st_pids;
+        if (s->has_state && st_pools_.empty()) {   // ③共享组未接线（Farm 配置
+            // 错误/序错）——池行指针不存在，静默旧路=状态面垃圾，loud 快败
+            std::fprintf(stderr, "[trt] state_pairs 会话未绑定状态池（跨组共享"
+                         "未接线？）——拒发车\n");
+            return false;
+        }
         if (!st && n_rows > (s->slots * 7) / 8) {
             if (g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1, s->stream))
                 return false;
@@ -784,7 +790,7 @@ public:
                 const int pi = st ? (i < s->st_in.size() ? s->st_in[i] : -1) : -1;
                 if (pi >= 0) {   // 状态输入行：池行→输入行（D2D，链粘滞行集）
                     char* dst = (char*)s->ins[i].dev;
-                    char* pool = (char*)s->pool_devs[(size_t)pi];
+                    char* pool = (char*)st_pools_[(size_t)pi].dev;
                     const size_t rb = s->ins[i].meta.row_bytes;
                     const StatePool& pol = st_pools_[(size_t)pi];
                     const size_t prows = (size_t)pol.rows;
@@ -890,6 +896,7 @@ private:
         int rows = 0;             // 逻辑行数（pool 行下标域）
         std::atomic<char>* zero_pending = nullptr;   // [rows] 行待清零旗
                                   // （NewGame 置 1=填充改读零行；DATA8 竞态修）
+        bool external = false;    // ③跨组共享（ShareStatePool 绑定）——析构不释放
     };
     std::vector<StatePool> st_pools_;
     std::vector<void*> st_streams_;   // 全部银行会话流（ResetStatePool 全流
@@ -899,9 +906,37 @@ private:
 public:
     ~TrtBackend() {
         for (auto& p : st_pools_) {
-            if (p.dev && g_cu.Free) g_cu.Free(p.dev);
-            delete[] p.zero_pending;
+            if (p.dev && !p.external && g_cu.Free) g_cu.Free(p.dev);
+            if (!p.external) delete[] p.zero_pending;
         }
+    }
+    // ③跨组共享池：持有组导出/共享组绑定（同 GPU 设备行直读；决策级组路由
+    // W4 形态——单一正典状态=与主机路径语义逐位等价，docs/state-residency §7）
+    int StatePoolInfo(SharedStatePool* out, int cap) override {
+        if ((int)st_pools_.size() > cap) return -1;
+        for (size_t i = 0; i < st_pools_.size(); i++) {
+            out[i].dev = st_pools_[i].dev;
+            out[i].zero_pending = st_pools_[i].zero_pending;
+            out[i].row_bytes = st_pools_[i].row_bytes;
+            out[i].rows = st_pools_[i].rows;
+        }
+        return (int)st_pools_.size();
+    }
+    bool ShareStatePool(const SharedStatePool* pools, int n) override {
+        if (!st_pools_.empty()) return false;   // 已持有/已绑定=重复接线
+        if (n <= 0) return false;
+        for (int i = 0; i < n; i++) {
+            StatePool p;
+            p.dev = pools[i].dev;
+            p.zero_pending = pools[i].zero_pending;
+            p.row_bytes = pools[i].row_bytes;
+            p.rows = pools[i].rows;
+            p.external = true;
+            st_pools_.push_back(p);
+        }
+        std::fprintf(stderr, "[trt] 状态池跨组共享生效: %d 对（绑定他组设备行，"
+                     "本组不持有）\n", n);
+        return true;
     }
     // ③池行清零（NewGame）：链串行⇒该行无并发读者/写者；每条流各 memset
     // 一次⇒该行在任意银行的后续读（自流有序）之前完成
@@ -1009,12 +1044,14 @@ private:
         if (mode <= 0 || n_rows <= 0 || n_rows >= s->slots) return false;
         return s->out_h_bytes >= kD2hPartialMinBytes;
     }
-    // ③批量 D2D 档（FARM_STATE_D2D_BATCH=0 杀手锏回逐行=A/B 口径；符号
-    // 缺席自动回逐行——批 API 为 CUDA12.8+ 可选符号）
+    // ③批量 D2D 档：**缺省关**（2026-09-29 判决：掼蛋 PFD workload 池路径
+    // 罕见指纹漂移逐臂排除后定谳=批 API 本身——逐行 MemcpyAsync 4/4×57k 局
+    // 零翻面且实测零差（892.7 vs 893.4 局/s，D2D 本就在显存、批量省的提交
+    // 税在 Linux 不存在）。FARM_STATE_D2D_BATCH=1 opt-in 仅供 A/B 回归
     static bool StBatchOn() {
         static const int mode = [] {
             const char* e = std::getenv("FARM_STATE_D2D_BATCH");
-            return e ? std::atoi(e) : 1;
+            return e ? std::atoi(e) : 0;
         }();
         return mode > 0 && g_cu.MemcpyBatchOk();
     }
@@ -1044,16 +1081,16 @@ private:
     // ③状态尾段（状态会话恒图外；pids 未绑=Init 期冒烟走旧路）：状态输出行
     // D2D 散射回池（不过主机）+非状态输出前缀 D2H+盖章殿后（流序契约不变：
     // 旗标到=散射与 D2H 均已执行）
-    static bool EnqueueStateTail(TrtSession* s, int n_rows) {
+    bool EnqueueStateTail(TrtSession* s, int n_rows) {
         s->sb.clear();   // 防御：早退不留陈旧条目（填充批已在 Submit 清空）
         const bool batch = StBatchOn();
         for (size_t oi = 0; oi < s->outs.size(); oi++) {
             const int pi = oi < s->st_out.size() ? s->st_out[oi] : -1;
             const size_t rb = (size_t)s->outs[oi].meta.width * sizeof(float);
             if (pi >= 0) {
-                char* pool = (char*)s->pool_devs[(size_t)pi];
+                char* pool = (char*)st_pools_[(size_t)pi].dev;
                 const char* src = (const char*)s->outs[oi].dev;
-                const size_t prows = (size_t)s->pool_rows[(size_t)pi];
+                const size_t prows = (size_t)st_pools_[(size_t)pi].rows;
                 for (int r = 0; r < n_rows; r++) {
                     const int pid = s->st_pids[r].load(std::memory_order_relaxed);
                     if (pid < 0 || (size_t)pid >= prows)
@@ -1085,7 +1122,7 @@ private:
     // 当前值）] / [在线=4B H2D→enqueueV3→输出 D2H→盖章 逐个入队 stream]；
     // 大输出模型非满批 → 计算图/在线 enqueue + 图外部分行 D2H；
     // ③状态会话（pids 已绑）→ 恒计算图/在线 + 图外状态尾段
-    static bool MbSubmit(TrtSession* s, int n_rows, unsigned& seq_out) {
+    bool MbSubmit(TrtSession* s, int n_rows, unsigned& seq_out) {
         seq_out = ++s->mb_seq;
         const bool st = s->has_state && s->st_pids;
         if (!s->mb_ok) {   // 流同步降级：发射即等完（提交税同步税都在）
@@ -1096,9 +1133,9 @@ private:
                     const int pi = oi < s->st_out.size() ? s->st_out[oi] : -1;
                     const size_t rb = (size_t)s->outs[oi].meta.width * sizeof(float);
                     if (pi >= 0) {
-                        char* pool = (char*)s->pool_devs[(size_t)pi];
+                        char* pool = (char*)st_pools_[(size_t)pi].dev;
                         const char* src = (const char*)s->outs[oi].dev;
-                        const size_t prows = (size_t)s->pool_rows[(size_t)pi];
+                        const size_t prows = (size_t)st_pools_[(size_t)pi].rows;
                         for (int r = 0; r < n_rows; r++) {
                             const int pid = s->st_pids[r].load(
                                 std::memory_order_relaxed);
@@ -1207,7 +1244,7 @@ private:
     // 小输出的正路）+ 计算图 [4B seq H2D→enqueueV3]（大输出模型部分行 D2H 档
     // 的前缀图——D2H/盖章由 MbSubmit 图外按 n_rows 动态入队，图内静态形状拷
     // 不了"前 n 行"）
-    static void CaptureGraph(TrtSession* s) {
+    void CaptureGraph(TrtSession* s) {
         if (!s->mb_ok || !g_cu.StreamBeginCapture || !g_cu.StreamEndCapture
             || !g_cu.GraphInstantiate || !g_cu.GraphLaunch || !g_cu.GraphDestroy) {
             std::fprintf(stderr, "[trt] 图捕获前置不满足（邮箱/符号缺失）——降级仅邮箱\n");
@@ -1263,7 +1300,7 @@ private:
         }
         unsigned seq = 0;
         double spin = 0;
-        if (!MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
+        if (!this->MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
             std::fprintf(stderr, "[trt] 图验证发射/旗标超时——降级仅邮箱\n");
             g_cu.GraphDestroy(s->graph); s->graph = nullptr;
             s->graph_ok = false;

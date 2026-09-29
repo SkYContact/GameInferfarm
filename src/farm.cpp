@@ -168,6 +168,18 @@ bool Farm::Init(FarmConfig cfg) {
                          d.model.backend.c_str());
             return false;
         }
+        if (d.model.state_share_grp >= 0) {
+            const int sg = d.model.state_share_grp;
+            if (sg >= (int)devs.size() || sg == (int)di
+                || devs[(size_t)sg].model.state_pairs.empty()
+                || devs[(size_t)sg].model.state_share_grp >= 0) {
+                std::fprintf(stderr, "[farm] state_share_grp=%d 非法（须指向声明"
+                             " state_pairs 且自身不共享的组）\n", sg);
+                return false;
+            }
+            std::fprintf(stderr, "[farm] 组 %zu 状态池共享自组 %d（跨组路由语义："
+                         "单一正典状态=与主机路径逐位等价）\n", di, sg);
+        }
         d.model.state_pool_rows = cfg_.chains;
         has_state_ = true;
         state_grps_.push_back((int)di);
@@ -364,6 +376,19 @@ bool Farm::Init(FarmConfig cfg) {
             return false;
         }
         bank_ = &bank_obj_;
+        // ③跨组共享状态池接线（决策级组路由×池路径，W4 形态）：share 组
+        // 绑定持有组池行。银行已建（持有组首会话已分配池）且未发车=安全序
+        for (size_t di = 0; di < devs.size(); di++) {
+            const int sg = devs[di].model.state_share_grp;
+            if (sg < 0) continue;
+            if (!bank_->ShareStatePool(sg, (int)di)) {
+                std::fprintf(stderr, "[farm] 状态池跨组共享接线失败（组 %zu ← 组"
+                             "%d；后端不支持或持有组无池）\n", di, sg);
+                bank_->Shutdown();
+                bank_ = nullptr;
+                return false;
+            }
+        }
         if (g0_deferred) group_specs_[0] = spec_;   // 延迟收割回填组 0 spec
                                                     //（HashSlot 按组查的面）
         if (g0_deferred) {

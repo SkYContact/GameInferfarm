@@ -438,8 +438,7 @@ struct OrtSess {
     // 非状态输出，D2H 照旧）。pool_devs/pool_rows=后端池表快照。状态不过
     // 主机：提交侧池行 D2D 填充输入、收割侧状态输出 D2D 散射回池。
     std::vector<int> st_in, st_out;
-    std::vector<void*> pool_devs;
-    std::vector<int> pool_rows;
+    // （③池表在 backend 级 st_pools_——含跨组共享绑定，会话不持快照）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（BindStatePids）
     bool has_state = false;
     // ---- 升格权重面（overridable initializer，RefitWeights 通道）----
@@ -505,19 +504,21 @@ struct OrtSess {
     OrtRunOptions* ro = nullptr;
 };
 
+class OrtBackend : public InferBackend {
+public:
 // ③状态尾段散射：状态输出行 D2D 散射回池（不过主机）。流选择与会话发射
 // 通道一致（async=用户流、fence=EP 统一流、同步=阻塞 memcpy）——散射与
 // Run 同流序 ⇒ 旗标/同步到=散射已落定；下一批填充同流（或链串行）天然
 // 有序。pid 越界行不散射（陈旧 pid 会把垃圾写进他链池行=状态投毒；与
 // 填充侧同卫）
-static bool StateScatter(OrtSess* s, int n_rows) {
+bool StateScatter(OrtSess* s, int n_rows) {
     for (size_t j = 0; j < s->outs.size(); j++) {
         const int pi = j < s->st_out.size() ? s->st_out[j] : -1;
         if (pi < 0) continue;
-        char* pool = (char*)s->pool_devs[(size_t)pi];
+        char* pool = (char*)st_pools_[(size_t)pi].dev;
         const char* src = (const char*)s->outs[j].dev;
         const size_t rb = (size_t)s->outs[j].meta.width * 4;
-        const size_t prows = (size_t)s->pool_rows[(size_t)pi];
+        const size_t prows = (size_t)st_pools_[(size_t)pi].rows;
         for (int r = 0; r < n_rows; r++) {
             const int pid = s->st_pids[r].load(std::memory_order_relaxed);
             if (pid < 0 || (size_t)pid >= prows) continue;
@@ -539,8 +540,6 @@ static bool StateScatter(OrtSess* s, int n_rows) {
     return true;
 }
 
-class OrtBackend : public InferBackend {
-public:
     const char* Name() const override { return dml_ ? "ort-dml" : "ort"; }
 
     // ---- 会话注册表+RW1 stash（RefitWeights 广播面，镜像 cpu_backend）----
@@ -571,14 +570,42 @@ public:
         size_t row_bytes = 0;
         int rows = 0;
         std::atomic<char>* zero_pending = nullptr;   // [rows] NewGame 延迟清零旗
+        bool external = false;    // ③跨组共享（ShareStatePool 绑定）——析构不释放
     };
     std::vector<StatePool> st_pools_;
 
     ~OrtBackend() {
         for (auto& p : st_pools_) {
-            if (p.dev && g_cu.Free) g_cu.Free(p.dev);
-            delete[] p.zero_pending;
+            if (p.dev && !p.external && g_cu.Free) g_cu.Free(p.dev);
+            if (!p.external) delete[] p.zero_pending;
         }
+    }
+    // ③跨组共享池（同 trt_backend）：持有组导出/共享组绑定
+    int StatePoolInfo(SharedStatePool* out, int cap) override {
+        if ((int)st_pools_.size() > cap) return -1;
+        for (size_t i = 0; i < st_pools_.size(); i++) {
+            out[i].dev = st_pools_[i].dev;
+            out[i].zero_pending = st_pools_[i].zero_pending;
+            out[i].row_bytes = st_pools_[i].row_bytes;
+            out[i].rows = st_pools_[i].rows;
+        }
+        return (int)st_pools_.size();
+    }
+    bool ShareStatePool(const SharedStatePool* pools, int n) override {
+        if (!st_pools_.empty()) return false;
+        if (n <= 0) return false;
+        for (int i = 0; i < n; i++) {
+            StatePool p;
+            p.dev = pools[i].dev;
+            p.zero_pending = pools[i].zero_pending;
+            p.row_bytes = pools[i].row_bytes;
+            p.rows = pools[i].rows;
+            p.external = true;
+            st_pools_.push_back(p);
+        }
+        std::fprintf(stderr, "[ort] 状态池跨组共享生效: %d 对（绑定他组设备行，"
+                     "本组不持有）\n", n);
+        return true;
     }
     // 池行清零（NewGame，DATA8 竞态修复同 TRT）：置 pending 旗（无 CUDA 调用
     // ——worker 线程不碰驱动），该行下次填充改读池末保留零行（散射随批覆写
@@ -844,6 +871,11 @@ public:
         s->synced_for_seq = false;
         // ③状态会话（pids 已绑；Warmup 期未绑=旧路冒烟，镜像 trt_backend）
         const bool st = s->has_state && s->st_pids && !s->dml;
+        if (st && st_pools_.empty()) {   // ③共享组未接线——loud 快败（同 trt）
+            std::fprintf(stderr, "[ort] state_pairs 会话未绑定状态池（跨组共享"
+                         "未接线？）——拒发车\n");
+            return false;
+        }
         const long long dep_t0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         // 批尾毒化（路由模式死行协议，判决16）：未领槽位 [n, slots) 的路由键
@@ -1146,7 +1178,7 @@ public:
                     const int pi = i < s->st_in.size() ? s->st_in[i] : -1;
                     if (pi < 0) continue;
                     char* dst = (char*)s->ins[i].dev;
-                    char* pool = (char*)s->pool_devs[(size_t)pi];
+                    char* pool = (char*)st_pools_[(size_t)pi].dev;
                     const size_t rb = s->ins[i].meta.row_bytes;
                     const StatePool& pol = st_pools_[(size_t)pi];
                     const size_t prows = (size_t)pol.rows;
@@ -2340,7 +2372,10 @@ private:
                 DestroySession(s);
                 return nullptr;
             }
-            if (st_pools_.empty()) {
+            if (cfg.state_share_grp >= 0) {
+                // ③共享组：不分配池（Farm 经 ShareStatePool 接线；绑定前发车=
+                // SubmitBatch fail fast）。只做面映射
+            } else if (st_pools_.empty()) {
                 for (const auto& pr : cfg.state_pairs) {
                     int ii = -1, jj = -1;
                     for (size_t k = 0; k < s->ins.size() && ii < 0; k++)
@@ -2389,16 +2424,14 @@ private:
                 for (size_t k = 0; k < s->outs.size(); k++)
                     if (s->outs[k].meta.name == pr.out) s->st_out[k] = (int)pi;
             }
-            s->pool_devs.clear();
-            s->pool_rows.clear();
-            for (auto& p : st_pools_) {
-                s->pool_devs.push_back(p.dev);
-                s->pool_rows.push_back(p.rows);
-            }
             s->has_state = true;
-            std::fprintf(stderr, "[ort] 状态池生效: %zu 对 × %d 行"
-                         "（提交侧 D2D 填充+收割侧 D2D 散射，状态不过主机）\n",
-                         st_pools_.size(), cfg.state_pool_rows);
+            if (cfg.state_share_grp >= 0)
+                std::fprintf(stderr, "[ort] 状态池共享组就绪: %zu 对（待 Farm"
+                             " 接线绑定持有组）\n", cfg.state_pairs.size());
+            else
+                std::fprintf(stderr, "[ort] 状态池生效: %zu 对 × %d 行"
+                             "（提交侧 D2D 填充+收割侧 D2D 散射，状态不过主机）\n",
+                             cfg.state_pairs.size(), cfg.state_pool_rows);
         }
         if (spec_out) {
             spec_out->backend = dml ? "ort-dml" : "ort";

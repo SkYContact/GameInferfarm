@@ -303,6 +303,24 @@ int BankScheduler::GroupOf(int bank) const {
     return impl_->banks[(size_t)bank].grp;
 }
 
+bool BankScheduler::ShareStatePool(int owner_grp, int sharer_grp) {
+    if (!impl_) return false;
+    Impl& I = *impl_;
+    InferBackend* be_own = nullptr;
+    InferBackend* be_shr = nullptr;
+    for (int i = 0; i < banks_; i++) {
+        if (I.banks[(size_t)i].grp == owner_grp && !be_own)
+            be_own = I.banks[(size_t)i].be;
+        if (I.banks[(size_t)i].grp == sharer_grp && !be_shr)
+            be_shr = I.banks[(size_t)i].be;
+    }
+    if (!be_own || !be_shr) return false;
+    InferBackend::SharedStatePool tabs[16];
+    const int n = be_own->StatePoolInfo(tabs, 16);
+    if (n <= 0) return false;
+    return be_shr->ShareStatePool(tabs, n);
+}
+
 bool BankScheduler::ResetStatePool(int grp, int row) {
     if (!impl_) return false;
     Impl& I = *impl_;

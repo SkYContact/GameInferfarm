@@ -90,6 +90,29 @@ public:
         return false;
     }
 
+    // ③跨组共享状态池（决策级组路由 × 池路径，W4 形态）：持有组导出池表，
+    // 共享组绑定同一批设备行（同 GPU D2D；链串行+收割完成序=跨流安全；
+    // 单一正典状态=与主机路径语义逐位等价）。零基旗（zero_pending）也共享
+    // ——NewGame 双组复位=同一原子旗双写，良性。缺省拒（不支持的后端
+    // Farm 接线时 fail fast）。
+    struct SharedStatePool {
+        void* dev;                      // 池基址 [(rows+1) × row_bytes]
+        std::atomic<char>* zero_pending; // [rows] NewGame 延迟清零旗（共享）
+        size_t row_bytes;
+        int rows;
+    };
+    // 持有组导出（out 由调用方分配；cap≥对数）。返回对数（0=无池，-1=cap
+    // 不足，负值一律按不支持处理）。
+    virtual int StatePoolInfo(SharedStatePool* out, int cap) {
+        (void)out; (void)cap;
+        return 0;
+    }
+    // 共享组绑定（须在首批发车前；绑定后本组会话的填充/散射直接读共享行）。
+    virtual bool ShareStatePool(const SharedStatePool* pools, int n) {
+        (void)pools; (void)n;
+        return false;
+    }
+
     // 能力位：LoadSpec 需要建"探测会话"（枚举元数据即毁——ORT≈0.1s/次，
     // 清单模式 56 腿/代≈5.6s/代纯探测税）的后端可声明 true：Farm 对组 0
     // 砍探测，改由首个真实银行会话经 CreateSessionWithSpec 顺带产出 spec。

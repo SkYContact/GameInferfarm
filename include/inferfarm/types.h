@@ -149,6 +149,13 @@ struct ModelConfig {
                                       // state_pool_rows（Farm 填 chains）
     int state_pool_rows = 0;         // 池行数（≥最大 chain_id+1；Farm Init 填
                                       // cfg.chains；后端分配设备池零基一次）
+    int state_share_grp = -1;        // ③跨组共享状态池（决策级组路由×池路径）：
+                                      // ≥0=本组不分配池，绑定该组的池行（同
+                                      // GPU 设备常驻；链串行+收割完成序=跨流
+                                      // 安全；单一正典状态=与主机路径语义逐位
+                                      // 等价）。state_pairs 仍须声明（会话要
+                                      // 知道哪些面是状态面），只是不持有池。
+                                      // Farm Init 后接线；未接线即发车=fail fast
     std::string refit_weights;        // 可选：init 期一次性换心（RW1 blob 路径；多设备组
                                       // 不支持=fail fast）
     CpuModelDecl cpu;                 // backend=="cpu" 时生效；backend=="ncnn" 时
