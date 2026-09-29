@@ -1146,7 +1146,7 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 if (!gc.model.state_pairs.empty()
                     && !b.be->BindStatePids(b.sess, b.sp_ids)) {
                     std::fprintf(stderr, "[bank] 组 %d 后端不支持成对状态行"
-                                 "（state_pairs 声明须配 trt）\n", g);
+                                 "（state_pairs 声明须配 trt/ort）\n", g);
                     ok = false;
                     break;
                 }

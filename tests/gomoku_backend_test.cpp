@@ -1011,6 +1011,45 @@ int main(int argc, char** argv) {
                             "非观测量）\n", rp.games / rp.sec, rh.games / rh.sec);
         }
     }
+    // ---------------- R9o：③状态行 ort 面（v2，ort_backend 状态池）----------------
+    // 同一玩具 onnx，同一对拍纪律：池路径==主机路径同 seed 逐位同（池错/
+    // 粘滞错/清零漏/散射漏必指纹红）+复跑同。三通道（同步/async/fence）由
+    // FARM_ORT_ASYNC 环境变量切换，本腿不设=缺省同步面。
+    if (!only || !std::strcmp(only, "ort") || !std::strcmp(only, "r9o")) {
+        const char* kToyOnnx = "models/state_toy.fb8.onnx";
+        if (!FileExists(kToyOnnx)) {
+            std::printf("SKIP R9o: 无 %s（tools/bake_state_toy.py）\n", kToyOnnx);
+        } else {
+            auto r9o_leg = [&](bool pool) -> R {
+                FarmConfig cfg;
+                cfg.name = "r9o";
+                cfg.chains = 4;
+                cfg.games = 16;   // 每链 4 局=换局清零进主门
+                cfg.seed0 = 20260929u;
+                cfg.banks = 2;
+                cfg.slots = 8;
+                cfg.workers = 4;
+                cfg.stagger_ms = 1;
+                cfg.model.backend = "ort";
+                cfg.model.model_path = kToyOnnx;
+                if (pool) cfg.model.state_pairs.push_back({"S_prev", "S_next"});
+                Farm farm;
+                if (!farm.Init(cfg)) { g_fail++; return R{0, 0, 0}; }
+                double sec = farm.RunLeg(StateToyMake, (void*)(pool ? 1 : 0));
+                return R{farm.tally().fingerprint, farm.tally().games_done, sec};
+            };
+            R rh = r9o_leg(false);
+            R rp = r9o_leg(true);
+            R rp2 = r9o_leg(true);
+            CHECK(rh.games == 16, "R9o 主机路径腿完成（16 局）");
+            CHECK(rp.games == 16 && rp.fp == rh.fp,
+                  "R9o-a ort 池路径==主机路径逐位同（池错/清零漏必红=主门）");
+            CHECK(rp2.fp == rp.fp, "R9o-b ort 池路径复跑逐位同");
+            if (rh.games == 16 && rp.games == 16)
+                std::printf("[R9o] ort 池 %.0f 局/s / 主机 %.0f 局/s\n",
+                            rp.games / rp.sec, rh.games / rh.sec);
+        }
+    }
 
     // ---------------- R10：W1 引擎缓存悬垂回归（掼蛋 W4 双模型双组首爆，
     // 2026-09-29 代理报，上游认领）----------------

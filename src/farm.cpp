@@ -149,8 +149,8 @@ bool Farm::Init(FarmConfig cfg) {
         d.banks = cfg_.banks;
         devs.push_back(d);
     }
-    // ③成对状态行前置校验（docs/state-residency-design.md）：v1 限 trt 后端
-    // +银行制（inline/cpu/ort 声明即拒）；池行数=chains（池下标 v1=chain_id）
+    // ③成对状态行前置校验（docs/state-residency-design.md）：限 trt/ort 后端
+    // +银行制（inline/cpu 声明即拒）；池行数=chains（池下标 v1=chain_id）
     has_state_ = false;
     state_grps_.clear();
     state_outs_grp_.assign(devs.size(), {});
@@ -162,9 +162,9 @@ bool Farm::Init(FarmConfig cfg) {
                          "设备池）\n");
             return false;
         }
-        if (d.model.backend != "trt") {
-            std::fprintf(stderr, "[farm] state_pairs 暂限 trt 后端（%s 声明即拒；"
-                         "cpu=无设备池概念，ort=后续补）\n",
+        if (d.model.backend != "trt" && d.model.backend != "ort") {
+            std::fprintf(stderr, "[farm] state_pairs 暂限 trt/ort 后端（%s 声明即拒；"
+                         "cpu=无设备池概念）\n",
                          d.model.backend.c_str());
             return false;
         }

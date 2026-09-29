@@ -433,6 +433,15 @@ struct OrtSess {
     bool pop_mode = false;    // population 路由模式（cfg.population_input 命中）
     std::vector<int> mid_like;   // 路由键输入下标（1-D i64 非 population——批尾
                                  // 毒化目标；路由图约定：i64 标量列=mid）
+    // ---- ③成对状态行（docs/state-residency-design.md；镜像 trt_backend）----
+    // st_in[i]=输入 i 的池下标（-1=非状态面，H2D 照旧）；st_out[j] 同（-1=
+    // 非状态输出，D2H 照旧）。pool_devs/pool_rows=后端池表快照。状态不过
+    // 主机：提交侧池行 D2D 填充输入、收割侧状态输出 D2D 散射回池。
+    std::vector<int> st_in, st_out;
+    std::vector<void*> pool_devs;
+    std::vector<int> pool_rows;
+    const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（BindStatePids）
+    bool has_state = false;
     // ---- 升格权重面（overridable initializer，RefitWeights 通道）----
     bool any_weight = false;      // 存在权重面（SubmitBatch fail-fast 门加速度器）
     bool weights_seeded = false;  // 全部权重面已从 stash 播种（Warmup 置位；
@@ -496,6 +505,40 @@ struct OrtSess {
     OrtRunOptions* ro = nullptr;
 };
 
+// ③状态尾段散射：状态输出行 D2D 散射回池（不过主机）。流选择与会话发射
+// 通道一致（async=用户流、fence=EP 统一流、同步=阻塞 memcpy）——散射与
+// Run 同流序 ⇒ 旗标/同步到=散射已落定；下一批填充同流（或链串行）天然
+// 有序。pid 越界行不散射（陈旧 pid 会把垃圾写进他链池行=状态投毒；与
+// 填充侧同卫）
+static bool StateScatter(OrtSess* s, int n_rows) {
+    for (size_t j = 0; j < s->outs.size(); j++) {
+        const int pi = j < s->st_out.size() ? s->st_out[j] : -1;
+        if (pi < 0) continue;
+        char* pool = (char*)s->pool_devs[(size_t)pi];
+        const char* src = (const char*)s->outs[j].dev;
+        const size_t rb = (size_t)s->outs[j].meta.width * 4;
+        const size_t prows = (size_t)s->pool_rows[(size_t)pi];
+        for (int r = 0; r < n_rows; r++) {
+            const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+            if (pid < 0 || (size_t)pid >= prows) continue;
+            bool ok;
+            if (s->async)
+                ok = g_cu.MemcpyAsync(pool + (size_t)pid * rb,
+                                      src + (size_t)r * rb, rb, 3,
+                                      s->stream) == 0;
+            else if (s->fence)
+                ok = g_cu.MemcpyAsync(pool + (size_t)pid * rb,
+                                      src + (size_t)r * rb, rb, 3,
+                                      s->fence_stream) == 0;
+            else
+                ok = g_cu.Memcpy(pool + (size_t)pid * rb,
+                                 src + (size_t)r * rb, rb, 3) == nullptr;
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
 class OrtBackend : public InferBackend {
 public:
     const char* Name() const override { return dml_ ? "ort-dml" : "ort"; }
@@ -518,6 +561,40 @@ public:
             if (sessions_[i] == s) { sessions_.erase(sessions_.begin() + (long)i); break; }
     }
 
+
+    // ③状态池（backend 实例级——组内银行共享设备池，镜像 trt_backend；链→
+    // 组钉扎=无跨组状态。首个带 state_pairs 的 CUDA 会话创建时分配一次，
+    // 零基一次；析构释放）
+    struct StatePool {
+        void* dev = nullptr;      // 设备池 [(rows+1) × row_bytes]——末行=保留
+                                  // 零行（init 清一次永不散射）
+        size_t row_bytes = 0;
+        int rows = 0;
+        std::atomic<char>* zero_pending = nullptr;   // [rows] NewGame 延迟清零旗
+    };
+    std::vector<StatePool> st_pools_;
+
+    ~OrtBackend() {
+        for (auto& p : st_pools_) {
+            if (p.dev && g_cu.Free) g_cu.Free(p.dev);
+            delete[] p.zero_pending;
+        }
+    }
+    // 池行清零（NewGame，DATA8 竞态修复同 TRT）：置 pending 旗（无 CUDA 调用
+    // ——worker 线程不碰驱动），该行下次填充改读池末保留零行（散射随批覆写
+    // 新态=流序天然正确）
+    bool ResetStatePool(int row) override {
+        if (st_pools_.empty()) return false;
+        for (auto& p : st_pools_) {
+            if (row < 0 || row >= p.rows) return false;
+            p.zero_pending[row].store(1, std::memory_order_release);
+        }
+        return true;
+    }
+    bool BindStatePids(void* session, const std::atomic<int>* pids) override {
+        ((OrtSess*)session)->st_pids = pids;
+        return true;
+    }
 
     // ORT 图会话绑调度台线程（PerThreadContext 铁律）+ DML 同步提交不可自驱：
     // 两条路线统一禁写手自驱，发车一律走调度台
@@ -765,6 +842,8 @@ public:
         s->seq++;
         s->last_n = n_rows;
         s->synced_for_seq = false;
+        // ③状态会话（pids 已绑；Warmup 期未绑=旧路冒烟，镜像 trt_backend）
+        const bool st = s->has_state && s->st_pids && !s->dml;
         const long long dep_t0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         // 批尾毒化（路由模式死行协议，判决16）：未领槽位 [n, slots) 的路由键
@@ -807,9 +886,9 @@ public:
             }
             if (!s->any_append) {
             // 前缀 H2D：同步拷贝（返回即完成——与 ORT 内部流旗标无关，零竞态；
-            // n>7/8·slots 走整块；population 面跳过）。无 append 面=原路径逐
-            // 指令不变（any_append 门=零行为差保证，判决25）
-            if (n_rows > (s->slots * 7) / 8) {
+            // n>7/8·slots 走整块；population/weight/③状态面跳过）。无 append
+            // 面=原路径逐指令不变（any_append 门=零行为差保证，判决25）
+            if (!st && n_rows > (s->slots * 7) / 8) {
                 if (!h2d(s->in_d_arena, s->in_h_arena, s->in_h_bytes))
                     return false;
                 s->dep_h2d_bytes += s->in_h_bytes;
@@ -821,7 +900,8 @@ public:
                 // 尾段毒化照旧单拷。
                 size_t nb = 0;
                 for (size_t i = 0; i < s->ins.size(); i++) {
-                    if (s->ins[i].meta.population || s->ins[i].meta.weight) continue;
+                    if (s->ins[i].meta.population || s->ins[i].meta.weight
+                        || (st && s->st_in[i] >= 0)) continue;
                     s->hb_dst[(size_t)nb] = s->ins[i].dev;
                     s->hb_src[(size_t)nb] = s->ins[i].host;
                     s->hb_sizes[(size_t)nb] = (size_t)n_rows * s->ins[i].meta.row_bytes;
@@ -862,7 +942,8 @@ public:
                     }
             } else {
                 for (size_t i = 0; i < s->ins.size(); i++) {
-                    if (s->ins[i].meta.population || s->ins[i].meta.weight) continue;
+                    if (s->ins[i].meta.population || s->ins[i].meta.weight
+                        || (st && s->st_in[i] >= 0)) continue;
                     if (!h2d(s->ins[i].dev, s->ins[i].host,
                              (size_t)n_rows * s->ins[i].meta.row_bytes))
                         return false;
@@ -907,6 +988,7 @@ public:
                 for (size_t i = 0; i < s->ins.size() && ok; i++) {
                     OrtIn& in = s->ins[i];
                     if (in.meta.population || in.meta.weight) continue;
+                    if (st && s->st_in[i] >= 0) continue;   // ③状态面不过 H2D（farm 护栏=状态×append 互斥，此处只防 full 面）
                     if (!in.meta.append && !in.meta.headlive) {
                         emit(in.dev, in.host,
                              (size_t)n_rows * in.meta.row_bytes);
@@ -1054,6 +1136,47 @@ public:
                         }
                     }
             }
+            // ③状态输入行填充：池行→设备输入行（D2D，链粘滞行集）。流与
+            // 发射通道一致（async=用户流 / fence=EP 流，Run 同流有序；同步
+            // 模式=阻塞 memcpy，与既有 H2D 锚同纪律）。DATA8：pending 行读
+            // 池末保留零行（NewGame 语义=状态归零；散射随批覆写）——消费即
+            // 清旗
+            if (st) {
+                for (size_t i = 0; i < s->ins.size(); i++) {
+                    const int pi = i < s->st_in.size() ? s->st_in[i] : -1;
+                    if (pi < 0) continue;
+                    char* dst = (char*)s->ins[i].dev;
+                    char* pool = (char*)s->pool_devs[(size_t)pi];
+                    const size_t rb = s->ins[i].meta.row_bytes;
+                    const StatePool& pol = st_pools_[(size_t)pi];
+                    const size_t prows = (size_t)pol.rows;
+                    for (int r = 0; r < n_rows; r++) {
+                        const int pid = s->st_pids[r].load(
+                            std::memory_order_relaxed);
+                        if (pid < 0 || (size_t)pid >= prows)
+                            continue;   // 幻影行（cursor 虚增未领号）——行内容
+                                        // 垃圾无害，填充跳过
+                        const char* srcp = pool + (size_t)pid * rb;
+                        if (pol.zero_pending[pid].load(
+                                std::memory_order_acquire)) {
+                            srcp = pool + prows * rb;   // 保留零行
+                            pol.zero_pending[pid].store(0,
+                                std::memory_order_relaxed);
+                        }
+                        bool ok;
+                        if (s->async)
+                            ok = g_cu.MemcpyAsync(dst + (size_t)r * rb, srcp,
+                                                  rb, 3, s->stream) == 0;
+                        else if (s->fence)
+                            ok = g_cu.MemcpyAsync(dst + (size_t)r * rb, srcp,
+                                                  rb, 3, s->fence_stream) == 0;
+                        else
+                            ok = g_cu.Memcpy(dst + (size_t)r * rb, srcp,
+                                             rb, 3) == nullptr;
+                        if (!ok) return false;
+                    }
+                }
+            }
             const long long dep_t1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             if (!RunOnce(s, s->ro)) return false;
@@ -1065,12 +1188,16 @@ public:
                 // CUDA 回调线程置完成旗标+ReleaseSemaphore（调度台 WMO 直等
                 // 信号量；零轮询零量子）。图外常规异步，零捕获语义参与。
                 s->flight_done.store(false, std::memory_order_relaxed);
-                for (size_t j = 0; j < s->outs.size(); j++)
+                for (size_t j = 0; j < s->outs.size(); j++) {
+                    if (st && j < s->st_out.size() && s->st_out[j] >= 0)
+                        continue;   // ③状态输出不过 D2H（散射回池代替）
                     if (g_cu.MemcpyAsync(s->outs[j].host, s->outs[j].dev,
                                          (size_t)s->last_n
                                              * (size_t)s->outs[j].meta.width * 4,
                                          2, s->fence_stream))
                         return false;
+                }
+                if (st && !StateScatter(s, s->last_n)) return false;
                 if (g_cu.LaunchHostFunc(s->fence_stream, &FenceReleaseCb,
                                         &s->fence_cb_ctx))
                     return false;
@@ -1098,12 +1225,18 @@ public:
             if (s->async) {
                 // 前缀 D2H 同流入队（序=Run 后）+ 事件盖戳——事件完成=输出已
                 // 驻留 host arena（pinned，标准可见性语义）。收割=EventQuery。
-                for (size_t j = 0; j < s->outs.size(); j++)
+                // ③状态会话：状态输出散射回池（同流）+非状态前缀 D2H+盖戳
+                // 殿后——旗标到=散射与 D2H 均已执行（流序契约不变）
+                for (size_t j = 0; j < s->outs.size(); j++) {
+                    if (st && j < s->st_out.size() && s->st_out[j] >= 0)
+                        continue;
                     if (g_cu.MemcpyAsync(s->outs[j].host, s->outs[j].dev,
                                          (size_t)s->last_n
                                              * (size_t)s->outs[j].meta.width * 4,
                                          2, s->stream))
                         return false;
+                }
+                if (st && !StateScatter(s, s->last_n)) return false;
                 if (g_cu.EventRecord(s->event, s->stream)) return false;
             }
         } else {
@@ -1146,10 +1279,15 @@ public:
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev_id);
         g_cu.DeviceSynchronize();
         int n = s->last_n;
-        for (size_t j = 0; j < s->outs.size(); j++)
+        const bool st = s->has_state && s->st_pids;
+        for (size_t j = 0; j < s->outs.size(); j++) {
+            if (st && j < s->st_out.size() && s->st_out[j] >= 0)
+                continue;   // ③状态输出不过 D2H
             if (g_cu.Memcpy(s->outs[j].host, s->outs[j].dev,
                             (size_t)n * (size_t)s->outs[j].meta.width * 4, 2))
                 return false;
+        }
+        if (st && !StateScatter(s, n)) return false;   // 阻塞散射（同步锚）
         s->synced_for_seq = true;
         return true;
     }
@@ -2183,6 +2321,84 @@ private:
                 DestroySession(s);
                 return nullptr;
             }
+        }
+        // ③成对状态行解析（镜像 trt_backend）：backend 级设备池首会话分配一次
+        //（零基同步 memset）；会话记录池指针。行字节不等或名字未命中=fail
+        // fast。DML 无 CUDA 面=声明即拒。
+        s->st_in.assign(s->ins.size(), -1);
+        s->st_out.assign(s->outs.size(), -1);
+        if (!cfg.state_pairs.empty()) {
+            if (s->dml) {
+                std::fprintf(stderr, "[ort] state_pairs 暂不支持 dml EP"
+                             "（无 CUDA 设备池面）\n");
+                DestroySession(s);
+                return nullptr;
+            }
+            if (cfg.state_pool_rows <= 0) {
+                std::fprintf(stderr, "[ort] state_pairs 声明但 state_pool_rows=%d"
+                             "（Farm 应填 chains）\n", cfg.state_pool_rows);
+                DestroySession(s);
+                return nullptr;
+            }
+            if (st_pools_.empty()) {
+                for (const auto& pr : cfg.state_pairs) {
+                    int ii = -1, jj = -1;
+                    for (size_t k = 0; k < s->ins.size() && ii < 0; k++)
+                        if (s->ins[k].meta.name == pr.in) ii = (int)k;
+                    for (size_t k = 0; k < s->outs.size() && jj < 0; k++)
+                        if (s->outs[k].meta.name == pr.out) jj = (int)k;
+                    const size_t rb_in =
+                        ii >= 0 ? s->ins[(size_t)ii].meta.row_bytes : 0;
+                    const size_t rb_out =
+                        jj >= 0 ? (size_t)s->outs[(size_t)jj].meta.width * 4 : 1;
+                    if (ii < 0 || jj < 0 || !rb_in || rb_in != rb_out) {
+                        std::fprintf(stderr, "[ort] state_pair %s↔%s 非法（in_idx=%d"
+                                     " out_idx=%d 行字节 %zu↔%zu 须相等且非零）\n",
+                                     pr.in.c_str(), pr.out.c_str(), ii, jj, rb_in, rb_out);
+                        DestroySession(s);
+                        return nullptr;
+                    }
+                    StatePool p;
+                    p.row_bytes = rb_in;
+                    p.rows = cfg.state_pool_rows;
+                    p.zero_pending = new std::atomic<char>[(size_t)p.rows];
+                    for (int t = 0; t < p.rows; t++) p.zero_pending[t].store(0);
+                    if (g_cu.SetDevice) g_cu.SetDevice(cfg.device_id);
+                    if (g_cu.Malloc(&p.dev, p.row_bytes * (size_t)(p.rows + 1))
+                        || g_cu.Memset(p.dev, 0,
+                                       p.row_bytes * (size_t)(p.rows + 1))) {
+                        std::fprintf(stderr, "[ort] 状态池分配/零基失败（%d 行 × %zuB）\n",
+                                     p.rows, p.row_bytes);
+                        if (p.dev) g_cu.Free(p.dev);
+                        delete[] p.zero_pending;
+                        DestroySession(s);
+                        return nullptr;
+                    }
+                    st_pools_.push_back(p);
+                }
+            } else if (st_pools_.size() != cfg.state_pairs.size()) {
+                std::fprintf(stderr, "[ort] state_pairs 数目 %zu 与首会话 %zu 不一致\n",
+                             cfg.state_pairs.size(), st_pools_.size());
+                DestroySession(s);
+                return nullptr;
+            }
+            for (size_t pi = 0; pi < cfg.state_pairs.size(); pi++) {
+                const auto& pr = cfg.state_pairs[pi];
+                for (size_t k = 0; k < s->ins.size(); k++)
+                    if (s->ins[k].meta.name == pr.in) s->st_in[k] = (int)pi;
+                for (size_t k = 0; k < s->outs.size(); k++)
+                    if (s->outs[k].meta.name == pr.out) s->st_out[k] = (int)pi;
+            }
+            s->pool_devs.clear();
+            s->pool_rows.clear();
+            for (auto& p : st_pools_) {
+                s->pool_devs.push_back(p.dev);
+                s->pool_rows.push_back(p.rows);
+            }
+            s->has_state = true;
+            std::fprintf(stderr, "[ort] 状态池生效: %zu 对 × %d 行"
+                         "（提交侧 D2D 填充+收割侧 D2D 散射，状态不过主机）\n",
+                         st_pools_.size(), cfg.state_pool_rows);
         }
         if (spec_out) {
             spec_out->backend = dml ? "ort-dml" : "ort";
