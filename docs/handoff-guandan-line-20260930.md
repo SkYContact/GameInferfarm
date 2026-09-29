@@ -11,10 +11,18 @@
 > fail-fast（e271290；DATA11 §2 报修=旧快照误读，重试本体 7a48eef 已有）/
 > segvcatch 入仓（1bb506b）/patch_fence population 支持（7013cd3）/
 > /tmp 易失件已归档 ~/inferfarm-project/archive/gd-tmp-forensics-20260929
-> .tar.gz。A 项三刀全要 TRT 维持挂起；C 项无触发维持按需。明细=
-> gd:notes/FRAMEWORK_REPLY14.md。遗留：ort/trt 面 R 门复验待 GPU 窗
-> （本机锁被占）；G19 前置变体挂死案（框架码两态相同、测试侧共聚）
-> 17 连净后挂低优先复验账。
+> .tar.gz。明细=gd:notes/FRAMEWORK_REPLY14.md。
+>
+> **清账补记二（2026-09-29 GPU 锁内会话）：A 项 DATA10 结案**——根因=
+> 掼蛋侧 adapter 的 CollectOutputs 在首决策漏报状态 dest（stateful_ 探测
+> 跑在首次 AssembleInto 之前），主机路径从第一天起丢 dec-1 状态输出、
+> dec-2 喂零；**池路径全程忠实（散射无损+填充忠实+图/context 终审无罪，
+> 设备级三读回点实证）**。修复=乘客侧三行（合成图契约下 dest 按模型真相
+> 申报），修复后 4245 逐决策同+4279 seat-pool 判别局翻面消失。方向反转：
+> 池无回归，评估腿可切回池配置。全文=gd:notes/FRAMEWORK_REPLY15.md；
+> 修复件=archive/gd-sandbox-fixed-gdstate-20260929.tar.gz。ort/trt 面
+> R 门复验同步清零（34+15 ok ALL PASS，R7 负路径按 fail-fast 契约更新
+> a17088d）。C 项无触发维持按需。
 
 ## 1. 速度谱终账（gd 复合图 fb64，4096 链）
 
