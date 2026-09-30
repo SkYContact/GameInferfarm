@@ -47,6 +47,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <memory>
 #include <vector>
 
 using namespace inferfarm;
@@ -108,16 +109,16 @@ static LegResult RunOne(int banks, bool fibers, int workers, uint32_t seed0,
     cfg.cache_log2 = cache_log2;
     cfg.model.backend = "cpu";
     cfg.model.cpu = ToyModelDecl(cfg.slots);
-    Farm farm;
-    if (!farm.Init(cfg)) {
+    auto farm = std::make_unique<Farm>();
+    if (!farm->Init(cfg)) {
         std::printf("FATAL: farm init 失败（banks=%d fibers=%d）\n", banks, (int)fibers);
         g_fail++;
         return {0, 0, 0, 0, -1};
     }
-    farm.RunLeg(MakeToyAdapter, nullptr);
-    const FarmTally& t = farm.tally();
+    farm->RunLeg(MakeToyAdapter, nullptr);
+    const FarmTally& t = farm->tally();
     LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total, t.decisions};
-    Census* c = farm.census();
+    Census* c = farm->census();
     r.live = c->live.load();
     r.R = c->state[2].load();
     r.Q = c->state[1].load();
@@ -236,11 +237,11 @@ int main() {
             cfg.workers = 4;
             cfg.model.backend = "cpu";
             cfg.model.cpu = ToyModelDecl(cfg.slots);
-            Farm farm;
-            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
-            if (!farm.RefitWeights(blob)) { g_fail++; return LegResult{0, 0, 0, 0, -2}; }
-            farm.RunLeg(MakeToyAdapter, nullptr);
-            const FarmTally& t = farm.tally();
+            auto farm = std::make_unique<Farm>();
+            if (!farm->Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            if (!farm->RefitWeights(blob)) { g_fail++; return LegResult{0, 0, 0, 0, -2}; }
+            farm->RunLeg(MakeToyAdapter, nullptr);
+            const FarmTally& t = farm->tally();
             LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
                         t.decisions};
             r.fp = t.fingerprint;   // 指纹必须回填（漏填=异 blob 门空比较的教训）
@@ -271,10 +272,10 @@ int main() {
                 cfg.stagger_ms = 1;
                 cfg.model.backend = "cpu";
                 cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
-                Farm farm;
-                if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
-                farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
-                const FarmTally& t = farm.tally();
+                auto farm = std::make_unique<Farm>();
+                if (!farm->Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+                farm->RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+                const FarmTally& t = farm->tally();
                 LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
                             t.decisions};
                 r.fp = t.fingerprint;
@@ -427,10 +428,10 @@ int main() {
                 b.banks = 1;
                 cfg.devices = {a, b};
             }
-            Farm farm;
-            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
-            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
-            const FarmTally& t = farm.tally();
+            auto farm = std::make_unique<Farm>();
+            if (!farm->Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            farm->RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            const FarmTally& t = farm->tally();
             LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
                         t.decisions};
             r.fp = t.fingerprint;
@@ -469,10 +470,10 @@ int main() {
             b.banks = 1;
             b.slots = 4;
             cfg.devices = {a, b};
-            Farm farm;
-            CHECK(farm.Init(cfg), "G8b 混形状农场起（fb8+fb4）");
-            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
-            const FarmTally& t = farm.tally();
+            auto farm = std::make_unique<Farm>();
+            CHECK(farm->Init(cfg), "G8b 混形状农场起（fb8+fb4）");
+            farm->RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            const FarmTally& t = farm->tally();
             CHECK(t.decisions == s1.decisions && t.fingerprint == s1.fp,
                   "G8b 混批形状=单组逐位同（含指纹；游标/窗满/越界三界按组）");
         }
@@ -501,10 +502,10 @@ int main() {
             cfg.model.backend = "cpu";
             cfg.model.cpu = mk_decl(cfg.slots, 0);
             cfg.model.cpu.weight_seed = wseed;
-            Farm farm;
-            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
-            farm.RunLeg(MakeToyAdapter, nullptr);
-            const FarmTally& t = farm.tally();
+            auto farm = std::make_unique<Farm>();
+            if (!farm->Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            farm->RunLeg(MakeToyAdapter, nullptr);
+            const FarmTally& t = farm->tally();
             LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
                         t.decisions};
             r.fp = t.fingerprint;
@@ -523,15 +524,15 @@ int main() {
             cfg.cache_log2 = cache_log2;
             cfg.model.backend = "cpu";
             cfg.model.cpu = mk_decl(cfg.slots, kP);
-            Farm farm;
-            if (!farm.Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
+            auto farm = std::make_unique<Farm>();
+            if (!farm->Init(cfg)) { g_fail++; return LegResult{0, 0, 0, 0, -1}; }
             std::vector<float> flat = CpuBuildMlpFlat(cfg.model.cpu, wseed);
             std::vector<float> pop(flat.size() * (size_t)kP);
             for (int p = 0; p < kP; p++)
                 memcpy(pop.data() + p * flat.size(), flat.data(), flat.size() * 4);
-            if (!farm.SetPopulation(pop.data())) { g_fail++; return LegResult{0, 0, 0, 0, -2}; }
-            farm.RunLeg(MakeToyAdapter, nullptr);
-            const FarmTally& t = farm.tally();
+            if (!farm->SetPopulation(pop.data())) { g_fail++; return LegResult{0, 0, 0, 0, -2}; }
+            farm->RunLeg(MakeToyAdapter, nullptr);
+            const FarmTally& t = farm->tally();
             LegResult r{t.first_wins, t.first_total, t.second_wins, t.second_total,
                         t.decisions};
             r.fp = t.fingerprint;
@@ -564,8 +565,8 @@ int main() {
             cfg.cache_log2 = 12;
             cfg.model.backend = "cpu";
             cfg.model.cpu = mk_decl(cfg.slots, kP);
-            Farm farm;
-            CHECK(farm.Init(cfg), "G9d 农场起");
+            auto farm = std::make_unique<Farm>();
+            CHECK(farm->Init(cfg), "G9d 农场起");
             std::vector<float> fa = CpuBuildMlpFlat(cfg.model.cpu, 4242u);
             std::vector<float> fb = CpuBuildMlpFlat(cfg.model.cpu, 12345u);
             std::vector<float> pa(fa.size() * (size_t)kP), pb(fb.size() * (size_t)kP);
@@ -573,12 +574,12 @@ int main() {
                 memcpy(pa.data() + p * fa.size(), fa.data(), fa.size() * 4);
                 memcpy(pb.data() + p * fb.size(), fb.data(), fb.size() * 4);
             }
-            CHECK(farm.SetPopulation(pa.data()), "G9d 第一代写入");
-            farm.RunLeg(MakeToyAdapter, nullptr);
-            unsigned long long fp1 = farm.tally().fingerprint;
-            CHECK(farm.SetPopulation(pb.data()), "G9d 第二代写入");
-            farm.RunLeg(MakeToyAdapter, nullptr);
-            unsigned long long fp2 = farm.tally().fingerprint;
+            CHECK(farm->SetPopulation(pa.data()), "G9d 第一代写入");
+            farm->RunLeg(MakeToyAdapter, nullptr);
+            unsigned long long fp1 = farm->tally().fingerprint;
+            CHECK(farm->SetPopulation(pb.data()), "G9d 第二代写入");
+            farm->RunLeg(MakeToyAdapter, nullptr);
+            unsigned long long fp2 = farm->tally().fingerprint;
             CHECK(fp1 == rt1.fp && fp2 == alt.fp,
                   "G9d 同农场连换两代=各自新鲜农场逐位同（代次失效端到端）");
         }
@@ -856,8 +857,8 @@ int main() {
                 cfg.model.backend = "ort";
                 cfg.model.model_path = kM16;
                 if (append) cfg.model.append_inputs.push_back("own");
-                Farm farm;
-                if (!farm.Init(cfg)) return 0;   // *ok 保持 false=上层 SKIP
+                auto farm = std::make_unique<Farm>();
+                if (!farm->Init(cfg)) return 0;   // *ok 保持 false=上层 SKIP
                 struct Adapter16 : gomoku::GomokuAdapter {
                     explicit Adapter16(int chain) : GomokuAdapter(chain) {}
                     static float Pat(int k) {
@@ -881,11 +882,11 @@ int main() {
                                                                 : depth);
                     }
                 };
-                farm.RunLeg([](int chain, void*) -> GameAdapter* {
+                farm->RunLeg([](int chain, void*) -> GameAdapter* {
                     return new Adapter16(chain);
                 }, nullptr);
                 *ok = true;
-                return farm.tally().fingerprint;
+                return farm->tally().fingerprint;
             };
             bool ok16 = false;
             // G16a 主门：增量开 vs 强制全量（FARM_H2D_DELTA=0 杀手锏=点名面
@@ -941,10 +942,10 @@ int main() {
                 cfg.model.fullwrite_inputs.push_back("own");
                 cfg.model.fullwrite_inputs.push_back("opp");
             }
-            Farm farm;
-            if (!farm.Init(cfg)) { g_fail++; return 0; }
-            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
-            return farm.tally().fingerprint;
+            auto farm = std::make_unique<Farm>();
+            if (!farm->Init(cfg)) { g_fail++; return 0; }
+            farm->RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            return farm->tally().fingerprint;
         };
         unsigned long long fp_zero = g17_leg(false);
         CHECK(fp_zero != 0, "G17 清零基线腿完成（16 局）");
@@ -973,11 +974,11 @@ int main() {
             cfg.stagger_ms = 1;
             cfg.model.backend = "cpu";
             cfg.model.cpu = gomoku::GomokuModelDecl(cfg.slots);
-            Farm farm;
-            if (!farm.Init(cfg)) { g_fail++; TestSetEnv("FARM_FIXED_BATCH="); return 0; }
-            farm.RunLeg(gomoku::MakeGomokuAdapter, nullptr);
+            auto farm = std::make_unique<Farm>();
+            if (!farm->Init(cfg)) { g_fail++; TestSetEnv("FARM_FIXED_BATCH="); return 0; }
+            farm->RunLeg(gomoku::MakeGomokuAdapter, nullptr);
             TestSetEnv("FARM_FIXED_BATCH=");
-            return farm.tally().fingerprint;
+            return farm->tally().fingerprint;
         };
         unsigned long long fp0 = g18_leg(false);
         CHECK(fp0 != 0, "G18 基线腿完成（16 局）");
@@ -1108,14 +1109,14 @@ int main() {
                 b.fixed_batch = fb1;
                 cfg.devices = {a, b};
             }
-            Farm farm;
+            auto farm = std::make_unique<Farm>();
             AdapterFactory make = [](int chain, void* user) -> GameAdapter* {
                 RouteCfg* p = (RouteCfg*)user;
                 return new RouteToyAdapter(chain, p->ctx, p->mode, p->face);
             };
-            if (!farm.Init(cfg)) { g_fail++; return FarmTally{}; }
-            farm.RunLeg(make, &rcfg);
-            return farm.tally();
+            if (!farm->Init(cfg)) { g_fail++; return FarmTally{}; }
+            farm->RunLeg(make, &rcfg);
+            return farm->tally();
         };
         FarmTally tA = leg(&cA, 0, false, false, 0, -1, -1);   // 专组 A（单组）
         FarmTally tB = leg(&cB, 0, false, true, 0, -1, -1);    // 专组 B（单组，异 IO 模型）
@@ -1169,14 +1170,14 @@ int main() {
             b.model.cpu = declB(8);
             b.banks = 1;
             cfg.devices = {a, b};
-            Farm farm;
+            auto farm = std::make_unique<Farm>();
             AdapterFactory make = [](int chain, void* user) -> GameAdapter* {
                 RouteCfg* p = (RouteCfg*)user;
                 return new RouteToyAdapter(chain, p->ctx, p->mode, p->face);
             };
-            CHECK(farm.Init(cfg), "G19 越界门农场起");
-            farm.RunLeg(make, &rcfg);
-            const FarmTally& t = farm.tally();
+            CHECK(farm->Init(cfg), "G19 越界门农场起");
+            farm->RunLeg(make, &rcfg);
+            const FarmTally& t = farm->tally();
             // dec 在路由校验前已计数=违约决策也算尝试；判负纪律=每局故障+收卷
             CHECK(t.infer_fails == 2 && t.games_done == 2,
                   "G19e 越界组号判负纪律（每局判负，农场不崩）");

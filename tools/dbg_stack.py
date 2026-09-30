@@ -4,7 +4,7 @@
 CreateProcess(DEBUG_ONLY_THIS_PROCESS) 跑目标，首个异常时从 RSP 扫栈，
 过滤出落在主模块映像内的返回地址，对照 .map 反查最近符号。
 """
-import ctypes, ctypes.wintypes as wt, sys, re, struct
+import ctypes, ctypes.wintypes as wt, sys, re, struct, time
 
 k32 = ctypes.windll.kernel32
 DEBUG_ONLY_THIS_PROCESS = 0x2
@@ -81,10 +81,53 @@ def main():
         if code == EXCEPTION_DEBUG_EVENT:
             rec = ev.u.Exception
             if rec.ExceptionCode == EXCEPTION_CODE:
-                print("STACK OVERFLOW at 0x%X" % rec.ExceptionAddress)
+                print("STACK OVERFLOW at 0x%X (tid=%d)" % (rec.ExceptionAddress, ev.dwThreadId))
+                # 关键：抓【出错线程】的上下文（fiber 跑在工人线程上，
+                # 主线程 pi.hThread 的现场与本崩溃无关）
+                THREAD_GET_CONTEXT = 0x0008
+                THREAD_QUERY_INFORMATION = 0x0040
+                ftid = ev.dwThreadId
+                k32.OpenThread.restype = wt.HANDLE
+                hthr = None
+                for _ in range(50):
+                    hthr = k32.OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                          False, ftid)
+                    if hthr:
+                        break
+                    time.sleep(0.01)
                 ctx = CONTEXT(); ctx.ContextFlags = 0x100003  # FULL
-                k32.GetThreadContext(hthr, ctypes.byref(ctx))
+                if not hthr or not k32.GetThreadContext(hthr, ctypes.byref(ctx)):
+                    print("GetThreadContext fail err=%d hthr=%r" % (k32.GetLastError(), hthr))
+                    k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)
+                    break
+                if not ctx.Rip:
+                    print("ctx.Rip=0, retry"); k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE); continue
                 print("RSP=0x%X RIP=0x%X" % (ctx.Rsp, ctx.Rip))
+                # RSP 落点定性：VirtualQueryEx 看分配区（线程栈 vs fiber 堆块）
+                class MBI(ctypes.Structure):
+                    _fields_ = [("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
+                                ("AllocationProtect", wt.DWORD), ("pad", wt.DWORD),
+                                ("RegionSize", ctypes.c_uint64), ("State", wt.DWORD),
+                                ("Protect", wt.DWORD), ("Type", wt.DWORD)]
+                k32.VirtualQueryEx.restype = ctypes.c_size_t
+                mbi = MBI()
+                if k32.VirtualQueryEx(hproc, ctypes.c_void_p(ctx.Rsp), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                    print("region: Base=0x%X AllocBase=0x%X Size=0x%X State=0x%X Type=0x%X depth_from_AllocBase=0x%X"
+                          % (mbi.BaseAddress, mbi.AllocationBase, mbi.RegionSize, mbi.State, mbi.Type,
+                             ctx.Rsp - mbi.AllocationBase))
+                # RIP 现场机器码（第一现场字节，绕过 map 符号歧义）
+                cbuf = (ctypes.c_char * 64)()
+                cg = ctypes.c_size_t()
+                if k32.ReadProcessMemory(hproc, ctypes.c_void_p(ctx.Rip - 32), cbuf, 64, ctypes.byref(cg)):
+                    code = bytes(cbuf)
+                    print("code @RIP-32:", code[:32].hex(' '))
+                    print("code @RIP   :", code[32:].hex(' '))
+                buf0 = (ctypes.c_char * 320)()
+                got0 = ctypes.c_size_t()
+                if k32.ReadProcessMemory(hproc, ctypes.c_void_p(ctx.Rsp), buf0, 320, ctypes.byref(got0)):
+                    vals0 = struct.unpack("<40Q", bytes(buf0)[: 320])
+                    for i, v in enumerate(vals0[:14]):
+                        print("   raw[%d] 0x%X" % (i, v))
                 # 读映像范围
                 if image_base:
                     lo, hi = image_base, image_base + 0x1000000
