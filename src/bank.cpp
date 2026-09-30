@@ -822,6 +822,9 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
 // 挂起写手（组内等待——他组轮转不惊醒，免唤醒风暴）
 static void BankTryRotate(BankScheduler::Impl& I, int g) {
     if (g < 0 || g >= I.n_groups) return;
+    Census* rc = I.cen;
+    const bool rprof = rc && rc->on && rc->FineSample();
+    const long long r0 = rprof ? NowNsI() : 0;
     if (I.fill_idx[g].load(std::memory_order_acquire) >= 0) {
         // 已有 FILL 银行：补唤醒滞留 waiters（零行 FILL 死锁洞，收割剥离档
         // 首跑定谳 2026-09-30——写手 park 落在本组还池轮转之后=无人叫醒领号，
@@ -847,8 +850,11 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
         FiberPostBegin();
         for (void* fib : wake) FiberPost(fib);
         FiberPostEnd();
+        if (rprof) rc->seg_rot_wake_ns.fetch_add(NowNsI() - r0, std::memory_order_relaxed);
+        if (rprof) rc->seg_rot_samp_n.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    const long long rlock0 = rprof ? NowNsI() : 0;
     int i = -1;
     std::deque<void*> wake;
     {
@@ -881,6 +887,8 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
         }
     }
     if (i < 0) return;
+    if (rprof)
+        rc->seg_rot_lock_ns.fetch_add(NowNsI() - rlock0, std::memory_order_relaxed);
     BankCtl& b = I.banks[(size_t)i];
     // 轮转唤醒批化（DATA14 第 2 条）：waiters 惊群 wake list 本就是集中发
     // ——套批模式后只入队，列表尾按工人位图各 notify 一次（高等待者世界
@@ -891,13 +899,22 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
     // -1=幻影行标记（迟来领号者 cursor 虚增后二次检查败退、未写 pid——发车
     // n=cursor 会含此行；后端填充/散射跳过 -1 行，与收割侧 reqs==null 的
     // "作废槽跳过"教义对齐。不归位=陈旧 pid 把幻影行垃圾散射进他链池行=投毒）
-    if (b.sp_ids)
+    if (b.sp_ids) {
+        const long long rsp0 = rprof ? NowNsI() : 0;
         for (int t = 0; t < b.slots; t++)
             b.sp_ids[t].store(-1, std::memory_order_relaxed);
+        if (rprof)
+            rc->seg_rot_sp_ns.fetch_add(NowNsI() - rsp0, std::memory_order_relaxed);
+    }
     b.state.store(BK_FILL, std::memory_order_release);
     I.fill_idx[g].store(i, std::memory_order_release);
+    const long long rw0 = rprof ? NowNsI() : 0;
     for (void* fib : wake) FiberPost(fib);
     FiberPostEnd();
+    if (rprof) {
+        rc->seg_rot_wake_ns.fetch_add(NowNsI() - rw0, std::memory_order_relaxed);
+        rc->seg_rot_samp_n.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // 窗口报告（每 3000 回信一行；收割剥离档=收割线程打=统计向量独占无锁，
@@ -955,10 +972,12 @@ if ((int)I.lat.size() >= 3000) {   // P0-4（2026-09-24 审计）：3×sort+
         const long long hn = cen->seg_harv_n.load();
         const long long hs = cen->seg_harv_samp_n.load();
         const long long ps = cen->post_samp_n.load();
+        const long long rs = cen->seg_rot_samp_n.load();
         std::printf("[banksched] 段/周期: wait=%.3f poll=%.3f close=%.3f 发车=%.3f"
                     " harvest=%.3f[拷%.3f 唤%.3f/行%.3fµs n=%lld"
                     " post钩/锁/唤=%.3f/%.3f/%.3fµs]"
-                    " rot=%.3f resid=%.3f | Σ=%.3f vs cycle=%.3f"
+                    " rot=%.3f[锁%.3f sp%.3f 唤%.3f n=%lld] resid=%.3f"
+                    " | Σ=%.3f vs cycle=%.3f"
                     " 迭代/批=%.1f 自驱发车/批=%.2f\n",
                     wait, poll, close, dep, harv,
                     hs ? (double)cen->seg_harv_copy_ns.load() / 1e6 / hs : 0.0,
@@ -969,7 +988,12 @@ if ((int)I.lat.size() >= 3000) {   // P0-4（2026-09-24 审计）：3×sort+
                     ps ? (double)cen->post_hook_ns.load() / 1e3 / ps : 0.0,
                     ps ? (double)cen->post_lock_ns.load() / 1e3 / ps : 0.0,
                     ps ? (double)cen->post_wake_ns.load() / 1e3 / ps : 0.0,
-                    rot, resid,
+                    rot,
+                    rs ? (double)cen->seg_rot_lock_ns.load() / 1e6 / rs : 0.0,
+                    rs ? (double)cen->seg_rot_sp_ns.load() / 1e6 / rs : 0.0,
+                    rs ? (double)cen->seg_rot_wake_ns.load() / 1e6 / rs : 0.0,
+                    rs,
+                    resid,
                     wait + poll + close + dep + harv + rot + resid,
                     wall / d, itn / d,
                     (double)(cen->seg_self_dep_n.load() - sd_prev) / d);

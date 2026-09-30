@@ -58,6 +58,12 @@ public:
     std::atomic<long long> seg_harv_copy_ns{0}, seg_harv_post_ns{0};
     std::atomic<long long> seg_harv_n{0}, seg_harv_post_n{0};
     std::atomic<long long> seg_harv_samp_n{0};   // 细分样本批数（抽样均分母）
+    // 轮转细分（2026-09-30，掼蛋 §0u rot 0.77ms/周期靶点）：BankTryRotate
+    // 内部三段——锁内段（池 pop+唤醒名单）/ sp_ids 归位 / FiberPost 投回。
+    // 细分计时只在 fine 档打（FineSample 同分级纪律），粗档 seg_rot_ns 恒全量。
+    std::atomic<long long> seg_rot_lock_ns{0}, seg_rot_sp_ns{0},
+        seg_rot_wake_ns{0};
+    std::atomic<long long> seg_rot_samp_n{0};
     // FiberPost 三段细分（唤醒链定谳第二刀）：钩子/锁+入队/唤醒。
     // **细档分级（DATA14 判决：全量逐行三段计时=2.3× 观测税）**：细分计时
     // 仅在 fine 档打——fine=2 全量（FARM_CENSUS=2，取证短开）；fine=1 抽样

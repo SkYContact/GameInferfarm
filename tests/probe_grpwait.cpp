@@ -11,6 +11,7 @@
 // GPU 协议：~/gpu_lock.sh acquire 后再跑，数字只在锁内有效。
 #include "inferfarm/bank.h"
 #include "inferfarm/backend_factory.h"
+#include "inferfarm/census.h"
 
 #include <atomic>
 #include <chrono>
@@ -51,7 +52,7 @@ int main(int argc, char** argv) {
     bc.slots = slots;
     bc.window_ms = bc.window_floor = 0.2;
     BankScheduler sched;
-    sched.Bind(*bes[0], nullptr);
+    sched.Bind(*bes[0], CensusGlobal());   // FARM_CENSUS=1 → [banksched] 段账
     std::vector<BankGroupCfg> gs;
     for (int g = 0; g < groups; g++) {
         BankGroupCfg gcfg;
