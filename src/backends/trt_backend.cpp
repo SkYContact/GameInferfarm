@@ -1510,7 +1510,13 @@ private:
 
     static void FillPattern(TrtSession* s, int seed) {
         for (auto& i : s->ins) {
-            size_t n = i.meta.row_bytes * (size_t)s->slots / i.meta.esize;
+            // pop 面=整平面 P≠slots（同族坑第三处：按 slots 填=写 P 倍界外
+            // ——YGO pop[2,660303] slots=64 时 169MB 越界砸穿进程，热身期
+            // 秒崩；玩具床 P/slots 比小+flat 短=溢出落自家 arena 尾页被掩盖，
+            // R12 门全绿的验收盲区，2026-09-30）
+            const size_t rows = (size_t)(i.meta.population ? i.meta.dims[0]
+                                                           : s->slots);
+            size_t n = i.meta.row_bytes * rows / i.meta.esize;
             if (i.meta.et == DTYPE_F32) {
                 float* p = (float*)i.host;
                 for (size_t e = 0; e < n; e++)

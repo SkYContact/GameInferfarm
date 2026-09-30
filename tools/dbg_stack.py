@@ -55,7 +55,14 @@ class CONTEXT(ctypes.Structure):
                 ("rest", ctypes.c_byte * 512)]
 
 def main():
-    exe = sys.argv[1]
+    # `--` 之后原样作为目标命令行（dbg_stack.py <exe> <map> [flags] -- <target args...>）
+    argv = sys.argv[1:]
+    tgt = []
+    if "--" in argv:
+        i = argv.index("--")
+        tgt = argv[i + 1:]
+        argv = argv[:i]
+    exe = argv[0]
     mapf = sys.argv[2] if len(sys.argv) > 2 else None
     syms = []
     if mapf:
@@ -66,20 +73,33 @@ def main():
         syms.sort()
     si = STARTUPINFO(); si.cb = ctypes.sizeof(si)
     pi = PROCESS_INFORMATION()
-    if not k32.CreateProcessW(exe, None, None, None, False,
+    cmdline = exe + (" " + " ".join('"%s"' % a for a in tgt) if tgt else "")
+    if not k32.CreateProcessW(exe, cmdline, None, None, False,
                               DEBUG_ONLY_THIS_PROCESS, None, None,
                               ctypes.byref(si), ctypes.byref(pi)):
         print("CreateProcess fail", ctypes.get_last_error()); return 1
     ev = DEBUG_EVENT()
     image_base = None
     hproc = pi.hProcess; hthr = pi.hThread
+    t0 = time.time()
     while True:
-        if not k32.WaitForDebugEvent(ctypes.byref(ev), 10000):
-            print("timeout, no crash"); break
+        if not k32.WaitForDebugEvent(ctypes.byref(ev), 5000):
+            if time.time() - t0 > 150:
+                print("timeout 150s, no crash"); break
+            continue
         code = ev.dwDebugEventCode
         status = DBG_CONTINUE
         if code == EXCEPTION_DEBUG_EVENT:
             rec = ev.u.Exception
+            if rec.ExceptionCode in (0xC0000005, 0xC0000409) and rec.ExceptionCode != EXCEPTION_CODE:
+                print("EXC 0x%X at 0x%X (tid=%d)" % (rec.ExceptionCode, rec.ExceptionAddress, ev.dwThreadId))
+                # 落入扫描分支（复用溢出路径的现场转储）
+                ev.u.Exception.ExceptionCode = EXCEPTION_CODE
+                rec = ev.u.Exception
+            if rec.ExceptionCode == 0xE06D7363 and "--cpp" in sys.argv:
+                print("CPP THROW at 0x%X (tid=%d)" % (rec.ExceptionAddress, ev.dwThreadId))
+                k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)
+                break
             if rec.ExceptionCode == EXCEPTION_CODE:
                 print("STACK OVERFLOW at 0x%X (tid=%d)" % (rec.ExceptionAddress, ev.dwThreadId))
                 # 关键：抓【出错线程】的上下文（fiber 跑在工人线程上，
@@ -161,6 +181,10 @@ def main():
             # CreateProcessInfo: hFile(8)+hProcess(8)+hThread(8)+lpBaseOfImage(8)
             image_base = ctypes.cast(ctypes.byref(ev.u, 24), ctypes.POINTER(ctypes.c_uint64)).contents.value
             print("image base 0x%X" % image_base)
+        if code == 5:  # EXIT_PROCESS_DEBUG_EVENT
+            ec = ctypes.cast(ctypes.byref(ev.u, 8), ctypes.POINTER(ctypes.c_uint64)).contents.value
+            print("child exit code=0x%X" % ec)
+            break
         k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, status)
     k32.TerminateProcess(hproc, 1)
     return 0
