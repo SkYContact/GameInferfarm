@@ -19,6 +19,7 @@
 // NVIDIA_TF32_OVERRIDE=0，运行端必须一致（不一致拒建 context——fail fast）。
 #include "inferfarm/backend.h"
 #include "inferfarm/refit.h"
+#include "inferfarm/state_touch.h"
 #include "cudart_dyn.h"
 #include "state_gather.h"
 #include <algorithm>
@@ -454,34 +455,11 @@ struct TrtSession {
     std::vector<void*> touch_pools;
 };
 
-// 触池注册表（进程级，key=池 dev 指针——跨 backend 实例同一把钥匙：池共享
-// 形态下 ShareStatePool 只拷池指针、他组会话不在本实例 st_sessions_ 里，
-// 跨流序在跨组形态从未兑现（DATA17 同源洞）。注册表把"读/写同一池"的会话
-// 连进同一 wait 面，洞即闭合）。锁只护表结构本身；快照出的会话指针生命期
-// 由既有停机序保证（调度台/收割腿全部 join 后才 DestroySession——与旧
-// st_sessions_ 裸遍历同一不变量，未收紧）。
-static std::mutex g_stpool_mx;
-static std::map<void*, std::vector<TrtSession*>> g_stpool_touch;
+// 触池注册表（2026-10-01 上收公共面 include/inferfarm/state_touch.h——ort
+// 镜像共用同一张表=跨后端池共享同钥匙）。
 
-static void StTouchAdd(TrtSession* s, void* pool_dev) {
-    if (!pool_dev) return;
-    std::lock_guard<std::mutex> lk(g_stpool_mx);
-    auto& v = g_stpool_touch[pool_dev];
-    for (TrtSession* o : v)
-        if (o == s) return;
-    v.push_back(s);
-}
-
-static void StTouchRemove(TrtSession* s) {
-    std::lock_guard<std::mutex> lk(g_stpool_mx);
-    for (auto it = g_stpool_touch.begin(); it != g_stpool_touch.end();) {
-        auto& v = it->second;
-        for (size_t i = 0; i < v.size();)
-            if (v[i] == s) { v.erase(v.begin() + (long)i); }
-            else i++;
-        if (v.empty()) it = g_stpool_touch.erase(it);
-        else ++it;
-    }
+static void StTouchAddTrt(TrtSession* s, void* pool_dev) {
+    StTouchAdd(pool_dev, s, s->ev_state);
 }
 
 // 会话按 st_in/st_out 映射登记触池（pools=本实例池表；映射值=池下标）
@@ -489,13 +467,13 @@ static void StTouchMap(TrtSession* s,
                        const std::vector<void*>& pool_devs) {
     for (int pi : s->st_in)
         if (pi >= 0 && pi < (int)pool_devs.size())
-            StTouchAdd(s, pool_devs[(size_t)pi]);
+            StTouchAddTrt(s, pool_devs[(size_t)pi]);
     for (int pi : s->st_out)
         if (pi >= 0 && pi < (int)pool_devs.size()) {
             bool dup = false;
             for (int q : s->st_in)
                 if (q == pi) { dup = true; break; }
-            if (!dup) StTouchAdd(s, pool_devs[(size_t)pi]);
+            if (!dup) StTouchAddTrt(s, pool_devs[(size_t)pi]);
         }
 }
 
@@ -785,6 +763,10 @@ public:
             // 跨流序事件（DATA17 定谳；可选符号缺席=退化旧行为，单组无恙）
             if (g_cu.EventCreateWithFlags && g_cu.EventRecord)
                 g_cu.EventCreateWithFlags(&s->ev_state, 0x2 /*DisableTiming*/);
+            // 触池表刷新（登记在 ev_state 创建之前=存了 nullptr，Add 对已存
+            // 条目原地更新事件——wait 面必须见真事件）
+            if (s->has_state)
+                for (void* pd : s->touch_pools) StTouchAddTrt(s, pd);
             st_sessions_.push_back(s);
         }
         return s;
@@ -951,7 +933,8 @@ public:
         }
         const double tw0 = s->ev_a ? std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
-        if (s->ev_a) g_cu.EventRecord(s->ev_a, s->stream);   // 流头（h2d 前=GPA 全串行链）
+        // （旧 ev_a 流头记录点已撤——事件差口径改"引擎+散射纯 GPU 段"，记录
+        // 点移至填充入流后/发射前，见 SubmitBatch 尾段注释）
         // population 脏旗（判决16）：代际换权重后的单次全量 H2D（pop 非每槽
         // 输入，不参与前缀拷；同流序先于发射=正确性由流序保证）
         if (s->pop_dirty) {
@@ -1057,10 +1040,13 @@ public:
                 }
         }
         if (!StBatchFlush(s)) return false;   // 状态填充批：单次提交
-        // 排水拆解：ev_a=流头（h2d 前）、ev_b=流尾（盖章后）——事件差=本批
-        // GPU 侧全串行链（h2d+图+盖章）。CPU 侧分两段：h2d 入队墙钟 / 发射
-        // 调用墙钟。事件在旗标跃迁处结算。
+        // 排水拆解：ev_a=**填充入流后、发射前**、ev_b=流尾（盖章后）——事件
+        // 差=引擎+散射纯 GPU 段（h2d/fill 排除——CPU-paced fill 会把等待灌进
+        // 事件差=负观测差怪象根因，2026-10-01 移位定谳；引擎侧记账口径自此
+        // 干净，旧数字含 fill 不可直比）。h2d 段仍由 CPU 墙钟单列（h2d_ms）。
+        // 事件在旗标跃迁处结算。
         if (s->ev_a) {
+            g_cu.EventRecord(s->ev_a, s->stream);
             const double th1 = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             const bool ok2 = MbSubmit(s, n_rows, seq_out);
@@ -1408,29 +1394,24 @@ private:
     // 事件未完成才真 wait——序保证与原实现逐位同（完成=无需序，未完成=补序）。
     bool SgWaitOthers(TrtSession* s) {
         if (!g_cu.StreamWaitEvent) return true;
-        TrtSession* others[64];
+        StTouchEntry others[64];
         int n_others = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_stpool_mx);
-            for (void* pd : s->touch_pools) {
-                auto it = g_stpool_touch.find(pd);
-                if (it == g_stpool_touch.end()) continue;
-                for (TrtSession* o : it->second) {
-                    if (o == s) continue;
-                    bool dup = false;
-                    for (int k = 0; k < n_others; k++)
-                        if (others[k] == o) { dup = true; break; }
-                    if (!dup && n_others < 64) others[n_others++] = o;
-                }
+        for (void* pd : s->touch_pools) {
+            StTouchEntry sub[64];
+            const int ns = StTouchOthers(s, pd, sub, 64);
+            for (int i = 0; i < ns && n_others < 64; i++) {
+                bool dup = false;
+                for (int k = 0; k < n_others; k++)
+                    if (others[k].sess == sub[i].sess) { dup = true; break; }
+                if (!dup) others[n_others++] = sub[i];
             }
         }
         for (int k = 0; k < n_others; k++) {
-            TrtSession* o = others[k];
-            if (!o->ev_state) continue;
+            if (!others[k].ev_state) continue;
             if (g_cu.EventQuery
-                && g_cu.EventQuery(o->ev_state) == 0 /*cudaSuccess=已完成*/)
+                && g_cu.EventQuery(others[k].ev_state) == 0 /*cudaSuccess=已完成*/)
                 continue;
-            if (g_cu.StreamWaitEvent(s->stream, o->ev_state, 0)) return false;
+            if (g_cu.StreamWaitEvent(s->stream, others[k].ev_state, 0)) return false;
         }
         return true;
     }

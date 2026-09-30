@@ -44,6 +44,7 @@
 // （玩具 MLP，DML 调度开销绑定）。
 #include "inferfarm/backend.h"
 #include "inferfarm/refit.h"
+#include "inferfarm/state_touch.h"
 #include "cudart_dyn.h"
 #include "onnxruntime_c_api.h"
 #include <atomic>
@@ -441,6 +442,11 @@ struct OrtSess {
     // （③池表在 backend 级 st_pools_——含跨组共享绑定，会话不持快照）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（BindStatePids）
     bool has_state = false;
+    // 跨流序镜像（2026-10-01，trt 同款：触池注册表+散射后 record/触池操作前
+    // wait；见 trt_backend SgWaitOthers 注）。dml 会话无 CUDA 流=恒缺席（状
+    // 态门本就 !dml）。读侧 acquire=与 Claim/Abandon release 写逐点配对。
+    void* ev_state = nullptr;
+    std::vector<void*> touch_pools;
     // ---- 升格权重面（overridable initializer，RefitWeights 通道）----
     bool any_weight = false;      // 存在权重面（SubmitBatch fail-fast 门加速度器）
     bool weights_seeded = false;  // 全部权重面已从 stash 播种（Warmup 置位；
@@ -511,7 +517,53 @@ public:
 // Run 同流序 ⇒ 旗标/同步到=散射已落定；下一批填充同流（或链串行）天然
 // 有序。pid 越界行不散射（陈旧 pid 会把垃圾写进他链池行=状态投毒；与
 // 填充侧同卫）
+// 跨流序（DATA17 定谳 ort 镜像，2026-10-01）：本会话入流任何"读/写共享池行"
+// 的操作前，等触池他席的最近散射事件（EventQuery 已完成=跳过——散射 GPU 侧
+// 已全局收敛，不挂无谓依赖）。stream=本操作将入队的流（async=用户流，
+// fence=EP 流）。事件缺席/无他席=零代价。
+bool OrtSgWait(OrtSess* s, void* stream) {
+    if (!g_cu.StreamWaitEvent || !stream) return true;
+    StTouchEntry others[64];
+    int n_others = 0;
+    for (void* pd : s->touch_pools) {
+        StTouchEntry sub[64];
+        const int ns = StTouchOthers(s, pd, sub, 64);
+        for (int i = 0; i < ns && n_others < 64; i++) {
+            bool dup = false;
+            for (int k = 0; k < n_others; k++)
+                if (others[k].sess == sub[i].sess) { dup = true; break; }
+            if (!dup) others[n_others++] = sub[i];
+        }
+    }
+    for (int k = 0; k < n_others; k++) {
+        if (!others[k].ev_state) continue;
+        if (g_cu.EventQuery
+            && g_cu.EventQuery(others[k].ev_state) == 0 /*cudaSuccess=已完成*/)
+            continue;
+        if (g_cu.StreamWaitEvent(stream, others[k].ev_state, 0)) return false;
+    }
+    return true;
+}
+// 触池登记（st_in/st_out 映射值=池下标→dev 指针；Add 对已存条目原地更新
+// ev_state=登记先于事件创建的时序安全）
+static void StTouchMapOrt(OrtSess* s, void* ev_state,
+                          const std::vector<void*>& pool_devs) {
+    auto add = [&](int pi) {
+        if (pi < 0 || pi >= (int)pool_devs.size()) return;
+        void* pd = pool_devs[(size_t)pi];
+        for (void* q : s->touch_pools)
+            if (q == pd) { StTouchAdd(pd, s, ev_state); return; }
+        s->touch_pools.push_back(pd);
+        StTouchAdd(pd, s, ev_state);
+    };
+    for (int pi : s->st_in) add(pi);
+    for (int pi : s->st_out) add(pi);
+}
+
 bool StateScatter(OrtSess* s, int n_rows) {
+    const bool cu_stream = s->async || s->fence;   // 同步路径=阻塞 memcpy 已全序
+    void* st_stream = s->async ? s->stream : s->fence_stream;
+    if (cu_stream && !OrtSgWait(s, st_stream)) return false;
     for (size_t j = 0; j < s->outs.size(); j++) {
         const int pi = j < s->st_out.size() ? s->st_out[j] : -1;
         if (pi < 0) continue;
@@ -537,6 +589,10 @@ bool StateScatter(OrtSess* s, int n_rows) {
             if (!ok) return false;
         }
     }
+    // 散射殿后 record（他席可见点；同步路径无流=skip——阻塞返回已全序）
+    if (cu_stream && s->ev_state && g_cu.EventRecord
+        && g_cu.EventRecord(s->ev_state, st_stream))
+        return false;
     return true;
 }
 
@@ -602,6 +658,14 @@ bool StateScatter(OrtSess* s, int n_rows) {
             p.rows = pools[i].rows;
             p.external = true;
             st_pools_.push_back(p);
+        }
+        // 触池登记（跨组洞闭合，trt 同款）：共享组全部状态会话入 wait 面
+        if (!sessions_.empty()) {
+            std::vector<void*> devs;
+            devs.reserve(st_pools_.size());
+            for (const auto& p : st_pools_) devs.push_back(p.dev);
+            for (OrtSess* s : sessions_)
+                if (s->has_state) StTouchMapOrt(s, s->ev_state, devs);
         }
         std::fprintf(stderr, "[ort] 状态池跨组共享生效: %d 对（绑定他组设备行，"
                      "本组不持有）\n", n);
@@ -790,6 +854,7 @@ bool StateScatter(OrtSess* s, int n_rows) {
     void DestroySession(void* session) override {
         OrtSess* s = (OrtSess*)session;
         if (!s) return;
+        StTouchRemove(s);   // 触池登记摘除（wait 面防悬挂）
         Untrack(s);   // 注册表先摘除（refit 广播面不再指向将毁会话）
         if (s->helper) {   // 发射线程先停（Join 后再动会话对象）
             {
@@ -805,6 +870,7 @@ bool StateScatter(OrtSess* s, int n_rows) {
         if (s->iob) a->ReleaseIoBinding(s->iob);
         if (s->ro) a->ReleaseRunOptions(s->ro);
         if (s->event && g_cu.EventDestroy) g_cu.EventDestroy(s->event);
+        if (s->ev_state && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_state);
         if (s->fence_sem) ortplt::FenceSemClose(s->fence_sem);   // fence 完成信号量
         // （=2 用户流与 fence 桥接的事件均 host 自建——此处统一销毁）
         if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
@@ -1174,6 +1240,9 @@ bool StateScatter(OrtSess* s, int n_rows) {
             // 池末保留零行（NewGame 语义=状态归零；散射随批覆写）——消费即
             // 清旗
             if (st) {
+                if ((s->async || s->fence)
+                    && !OrtSgWait(s, s->async ? s->stream : s->fence_stream))
+                    return false;   // 触池操作前补跨流序（散射(他流)→本流 gather）
                 for (size_t i = 0; i < s->ins.size(); i++) {
                     const int pi = i < s->st_in.size() ? s->st_in[i] : -1;
                     if (pi < 0) continue;
@@ -2425,6 +2494,12 @@ private:
                     if (s->outs[k].meta.name == pr.out) s->st_out[k] = (int)pi;
             }
             s->has_state = true;
+            if (!st_pools_.empty()) {   // owner 路径：池已在——按映射登记触池
+                std::vector<void*> devs;
+                devs.reserve(st_pools_.size());
+                for (const auto& p : st_pools_) devs.push_back(p.dev);
+                StTouchMapOrt(s, nullptr, devs);   // ev_state 随后创建时刷新
+            }
             if (cfg.state_share_grp >= 0)
                 std::fprintf(stderr, "[ort] 状态池共享组就绪: %zu 对（待 Farm"
                              " 接线绑定持有组）\n", cfg.state_pairs.size());
@@ -2436,6 +2511,13 @@ private:
         if (spec_out) {
             spec_out->backend = dml ? "ort-dml" : "ort";
             spec_out->slots = slots;
+        }
+        // 跨流序事件（CUDA 会话；dml 无流恒缺席）。创建后刷新触池表（登记时
+        // ev_state 还是 null——Add 对已存条目原地更新）。
+        if (s->has_state && !dml && for_bank
+            && g_cu.EventCreateWithFlags && g_cu.EventRecord) {
+            g_cu.EventCreateWithFlags(&s->ev_state, 0x2 /*DisableTiming*/);
+            for (void* pd : s->touch_pools) StTouchAdd(pd, s, s->ev_state);
         }
         // 路由键识别（population 模式）：1-D i64 非 population 输入=mid 类
         //（weight 面排除——升格的 1-D i64 权重若被当路由键批尾毒化=权重被打烂）
