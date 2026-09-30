@@ -407,7 +407,10 @@ struct TrtSession {
     // population 路由（判决16，镜像 ort_backend）：pop 面=整平面 dim0=P≠slots，
     // 不参与前缀拷——代际换权重后脏旗全量 H2D；mid 路由键批尾毒化（死行协议）
     bool pop_dirty = false;
+    // pop carve 在输入 arena 中的段（满批整块 H2D 跳过它——pop 面归脏旗管，
+    // 不然每批白付 P×flat_w 的 PCIe 税；pop_end=对齐后段尾，两段夹出非 pop 区）
     bool pop_mode = false;
+    size_t pop_off = 0, pop_end = 0;
     std::vector<int> mid_like;   // 路由键输入下标（1-D i64 非 population/weight）
     std::vector<int> st_in, st_out;      // 输入/输出下标→池号（-1=非状态）
     // （③池表已上收 backend 级 st_pools_——ShareStatePool 接线后无需重建会话）
@@ -588,8 +591,15 @@ public:
         // population 输入=mid 类（批尾毒化目标；weight 面排除）
         if (!cfg.population_input.empty())
             for (size_t i = 0; i < s->ins.size(); i++) {
-                if (s->ins[i].meta.population) s->pop_mode = true;
-                else if (s->ins[i].meta.et == DTYPE_I64
+                if (s->ins[i].meta.population) {
+                    s->pop_mode = true;
+                    const size_t pb = s->ins[i].meta.row_bytes
+                        * (size_t)s->ins[i].meta.dims[0];
+                    s->pop_off = (size_t)((char*)s->ins[i].host
+                                          - (char*)s->in_h_arena);
+                    s->pop_end = s->pop_off
+                        + (pb + kAlign - 1) / kAlign * kAlign;
+                } else if (s->ins[i].meta.et == DTYPE_I64
                          && s->ins[i].meta.dims.size() == 1
                          && !s->ins[i].meta.weight)
                     s->mid_like.push_back((int)i);
@@ -895,8 +905,24 @@ public:
                        (size_t)(s->slots - n_rows) * m.meta.row_bytes);
             }
         if (!st && n_rows > (s->slots * 7) / 8) {
-            if (g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1, s->stream))
-                return false;
+            if (!s->pop_mode) {
+                if (g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena,
+                                     s->in_h_bytes, 1, s->stream))
+                    return false;
+            } else {
+                // pop 面整平面不走前缀（脏旗管）——两段夹出非 pop 区，
+                // 满批免搬 P×flat_w（YGO 5.3MB/批的 PCIe 税）
+                if (s->pop_off > 0
+                    && g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena,
+                                        s->pop_off, 1, s->stream))
+                    return false;
+                if (s->pop_end < s->in_h_bytes
+                    && g_cu.MemcpyAsync((char*)s->in_d_arena + s->pop_end,
+                                        (char*)s->in_h_arena + s->pop_end,
+                                        s->in_h_bytes - s->pop_end,
+                                        1, s->stream))
+                    return false;
+            }
         } else {
             for (size_t i = 0; i < s->ins.size(); i++) {
                 const int pi = st ? (i < s->st_in.size() ? s->st_in[i] : -1) : -1;
