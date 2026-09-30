@@ -150,6 +150,9 @@ if (INFERFARM_BUILD_TESTS)
     target_include_directories(state_gather_bench PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+    # SgWaitOthers 解链判决实验（90k 墙；真 GPU 手动跑，GPU 协议锁内）
+    add_executable(probe_grpwait tests/probe_grpwait.cpp)
+    target_link_libraries(probe_grpwait PRIVATE inferfarm)
 
     enable_testing()
     add_test(NAME farm_test COMMAND farm_test)
