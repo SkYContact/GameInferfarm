@@ -823,7 +823,11 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
 static void BankTryRotate(BankScheduler::Impl& I, int g) {
     if (g < 0 || g >= I.n_groups) return;
     Census* rc = I.cen;
-    const bool rprof = rc && rc->on && rc->FineSample();
+    // 轮转细分恒量（census on 即测，不走 fine 门）：轮转=每批一次的事件
+    //（三次时钟读 ~100ns 对 ms 级周期=零头），fine 1/256 抽样在饿 GPU
+    // regime 每窗口真实轮转仅 ~12 次=样本期望 ~0（掼蛋 §0u rot n=0 案，
+    // 2026-09-30 定谳：非线程路径差异，是"真实轮转稀疏×抽样率"联合）。
+    const bool rprof = rc && rc->on;
     const long long r0 = rprof ? NowNsI() : 0;
     if (I.fill_idx[g].load(std::memory_order_acquire) >= 0) {
         // 已有 FILL 银行：补唤醒滞留 waiters（零行 FILL 死锁洞，收割剥离档

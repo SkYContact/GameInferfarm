@@ -60,7 +60,8 @@ public:
     std::atomic<long long> seg_harv_samp_n{0};   // 细分样本批数（抽样均分母）
     // 轮转细分（2026-09-30，掼蛋 §0u rot 0.77ms/周期靶点）：BankTryRotate
     // 内部三段——锁内段（池 pop+唤醒名单）/ sp_ids 归位 / FiberPost 投回。
-    // 细分计时只在 fine 档打（FineSample 同分级纪律），粗档 seg_rot_ns 恒全量。
+    // **恒量不走 fine 门**：轮转=每批一次（三次时钟读~100ns=零头），fine
+    // 抽样在真实轮转稀疏的 regime（饿 GPU）样本期望~0（rot n=0 案）。
     std::atomic<long long> seg_rot_lock_ns{0}, seg_rot_sp_ns{0},
         seg_rot_wake_ns{0};
     std::atomic<long long> seg_rot_samp_n{0};
