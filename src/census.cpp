@@ -67,6 +67,8 @@ long long Census::NowNsI() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+
+
 void Census::ResetLeg() {
     if (!on) return;
     live.store(0);
@@ -419,7 +421,8 @@ void Census::StopPrinter() {
     if (cn > 0 || sn > 0) {
         std::printf("[bankprof-worker] 领取 n=%lld 次/行: try=%.4fms/次[清零=%.4f 自旋外=%.4f]"
                     " 等池登记=%.5fms | 快自旋=%.4fms/决策组 | 提交前段 n=%lld %.4fms/次"
-                    " | 小拷贝+卸载=%.4fms/次 | 自驱发车=%lld 次\n",
+                    " | 小拷贝+卸载=%.4fms/次 | 自驱发车=%lld 次"
+                    " | 第三刀: 跨挂起污染=已拆除(读数不可信,见 bank.cpp 批注)\n",
                     cn,
                     cn ? (double)claim_try_ns.load() / 1e6 / cn : 0.0,
                     cn ? (double)claim_zero_ns.load() / 1e6 / cn : 0.0,

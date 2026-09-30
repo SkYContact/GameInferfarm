@@ -387,6 +387,15 @@ struct TrtSession {
     void* mb_seq_dev = nullptr;
     unsigned mb_seq = 0;
     bool mb_ok = false;
+    // 排水拆解（09-29 飞行窗）：ev_a=发射前（h2d 入队后）、ev_b=发射后（盖章
+    // 后=流尾）——EventElapsedTime=GPU 侧真实串行时长；与收割观测的飞行窗墙钟
+    // 之差=观测/提交延迟。事件在旗标到（完成跃迁）时结算。
+    void* ev_a = nullptr;
+    void* ev_b = nullptr;
+    bool ev_pending = false;
+    double ev_t_launch = 0;
+    long long fl_n = 0;
+    double fl_gpu_ms = 0, fl_wall_ms = 0, h2d_ms = 0, lch_ms = 0;
     // CUDA Graph 批捕获
     void* graph = nullptr;
     bool graph_ok = false;
@@ -512,6 +521,15 @@ public:
             std::fprintf(stderr, "[trt] 专用流创建失败\n");
             DestroySession(s);   // 中段失败完整回收（防泄漏）
             return nullptr;
+        }
+        // 排水拆解事件（可选符号：缺席=拆账静默缺席，行为零变化）
+        if (g_cu.EventCreateWithFlags && g_cu.EventRecord) {
+            int ra = g_cu.EventCreateWithFlags(&s->ev_a, 0);
+            int rb = g_cu.EventCreateWithFlags(&s->ev_b, 0);
+            if (ra || rb)
+                std::fprintf(stderr, "[trt-flight] 事件创建失败 ra=%d rb=%d（拆账缺席）\n", ra, rb);
+        } else {
+            std::fprintf(stderr, "[trt-flight] 事件符号缺席（拆账缺席）\n");
         }
         const size_t kAlign = 256;
         // 输入单块 arena（256B 对齐 carve；IOBinding/setTensorAddress 绑 carve
@@ -761,6 +779,8 @@ public:
         if (s->out_h_arena) g_cu.FreeHost(s->out_h_arena);
         if (s->out_d_arena) g_cu.Free(s->out_d_arena);
         if (s->mb_host) g_cu.FreeHost(s->mb_host);
+        if (s->ev_a && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_a);
+        if (s->ev_b && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_b);
         if (s->mb_seq_dev) g_cu.Free(s->mb_seq_dev);
         if (s->sg_tbl_d) g_cu.Free(s->sg_tbl_d);
         delete[] s->sg_tbl_h;
@@ -792,6 +812,9 @@ public:
                          "未接线？）——拒发车\n");
             return false;
         }
+        const double tw0 = s->ev_a ? std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+        if (s->ev_a) g_cu.EventRecord(s->ev_a, s->stream);   // 流头（h2d 前=GPA 全串行链）
         if (!st && n_rows > (s->slots * 7) / 8) {
             if (g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1, s->stream))
                 return false;
@@ -842,6 +865,22 @@ public:
             }
         }
         if (!StBatchFlush(s)) return false;   // 状态填充批：单次提交
+        // 排水拆解：ev_a=流头（h2d 前）、ev_b=流尾（盖章后）——事件差=本批
+        // GPU 侧全串行链（h2d+图+盖章）。CPU 侧分两段：h2d 入队墙钟 / 发射
+        // 调用墙钟。事件在旗标跃迁处结算。
+        if (s->ev_a) {
+            const double th1 = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const bool ok2 = MbSubmit(s, n_rows, seq_out);
+            g_cu.EventRecord(s->ev_b, s->stream);
+            const double tl1 = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            s->ev_pending = true;
+            s->ev_t_launch = tl1;
+            s->h2d_ms += th1 - tw0;
+            s->lch_ms += tl1 - th1;
+            return ok2;
+        }
         return MbSubmit(s, n_rows, seq_out);
     }
 
@@ -860,7 +899,36 @@ public:
             return true;
         }
         volatile unsigned* flag = (volatile unsigned*)s->mb_host;
-        return *flag == seq;
+        if (*flag != seq) return false;
+        // 排水拆解结算（完成跃迁）：GPU 侧串行时长（事件差）vs 飞行窗墙钟
+        // （发射→观测）——差值=观测/收割延迟。每 1024 批打一行。
+        if (s->ev_pending && g_cu.EventElapsedTime) {
+            float gpu_ms = -1.f;
+            int rc = g_cu.EventElapsedTime(&gpu_ms, s->ev_a, s->ev_b);
+            if (rc == 0 && gpu_ms >= 0) {
+                const double now = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                s->fl_n++;
+                s->fl_gpu_ms += gpu_ms;
+                s->fl_wall_ms += now - s->ev_t_launch;
+                if (s->fl_n % 128 == 0) {
+                    std::printf("[trt-flight] n=%lld GPU侧串行=%.3fms 飞行墙=%.3fms "
+                                "观测差=%.3fms | 发射前段: h2d入队=%.3fms 发射调用=%.3fms\n",
+                                s->fl_n, s->fl_gpu_ms / s->fl_n,
+                                s->fl_wall_ms / s->fl_n,
+                                (s->fl_wall_ms - s->fl_gpu_ms) / s->fl_n,
+                                s->h2d_ms / s->fl_n, s->lch_ms / s->fl_n);
+                    std::fflush(stdout);
+                }
+            } else {
+                static std::atomic<int> once{0};
+                if (once.fetch_add(1) == 0)
+                    std::fprintf(stderr, "[trt-flight] 首次结算失败 rc=%d gpu_ms=%f"
+                                 "（后续静默）\n", rc, gpu_ms);
+            }
+            s->ev_pending = false;
+        }
+        return true;
     }
     void CompletionFence() override { _mm_lfence(); }
 

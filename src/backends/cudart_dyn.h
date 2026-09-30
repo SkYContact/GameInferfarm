@@ -58,6 +58,7 @@ struct Cudart {
     int (*EventQuery)(void*) = nullptr;
     int (*EventSynchronize)(void*) = nullptr;
     int (*EventDestroy)(void*) = nullptr;
+    int (*EventElapsedTime)(float*, void*, void*) = nullptr;   // (ms, evA, evB) 排水拆解
     // 流捕获态查询（fence 诊断；可选符号）：0=None 1=Global 2=ThreadLocal
     // 3=Relaxed（cudaStreamCaptureStatus）
     int (*StreamIsCapturing)(void*, int*) = nullptr;
@@ -127,6 +128,7 @@ struct Cudart {
         EventQuery = (int (*)(void*))g("cudaEventQuery");
         EventSynchronize = (int (*)(void*))g("cudaEventSynchronize");
         EventDestroy = (int (*)(void*))g("cudaEventDestroy");
+        EventElapsedTime = (int (*)(float*, void*, void*))g("cudaEventElapsedTime");
         MemcpyBatch13 = (int (*)(void* const*, const void* const*, const size_t*,
                                  size_t, void*, size_t*, size_t, void*))
             g("cudaMemcpyBatchAsync");

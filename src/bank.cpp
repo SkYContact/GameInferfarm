@@ -3,6 +3,7 @@
 #include "inferfarm/bank.h"
 #include "inferfarm/affinity.h"
 #include "inferfarm/fiber_pool.h"
+#include "platform_compat.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -51,6 +52,20 @@ static const int kClaimSpins = [] {
 }();
 static constexpr long long kDrainDiagMask = 0x3FFFF;   // drain 长等诊断打印分频
 static constexpr int kInlineSpinBeforeYield = 4000;    // inline 完成等待转让出
+
+// 凑批门槛（2026-09-29，用户令"TRT 至少追平 ORT"）：批密度稀释自锁攻侧解——
+// 到达率是延迟的内生变量（批小→慢→链相位散→到达更稀→更慢），窗口/银行旋钮
+// 全打在死环上（实测 window 2/5ms 与 banks 2/3/8/12 全负优化）。taken<FILLMIN
+// 时窗延到 FILLTMAX：批大→每行成本塌→吞吐升→到达自填。缺省 0=关（现役行为）。
+static const int kBankFillMin = [] {
+    const char* e = std::getenv("YGO_BANK_FILLMIN");
+    return e ? std::atoi(e) : 0;
+}();
+static const double kBankFillTmaxMs = [] {
+    const char* e = std::getenv("YGO_BANK_FILLTMAX_MS");
+    double v = e ? std::atof(e) : 0.0;
+    return v > 0 ? v : 5.0;
+}();
 
 static double NowMsD() {
     return std::chrono::duration<double, std::milli>(
@@ -477,6 +492,8 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
         I.cen->sub_n.fetch_add(1, std::memory_order_relaxed);
     }
     if (r->fiber) {
+        // 第三刀批注（09-29）：挂起边界线程 CPU 差分仪器读数数千倍失真，已拆
+        // 除（构成定罪改由既有分段完成：乘客真实 CPU ~0.02ms/决策，98% 等待）。
         FiberSuspend(FWait_Infer);   // 链钟：在飞等待段按 infer 桶入账
     } else {
         std::unique_lock<std::mutex> lk(done.mx);
@@ -1020,7 +1037,11 @@ static void BankLoop(BankScheduler::Impl& I) {
                     window_t0[g] = now;
                 }
                 bool full = taken >= b.slots;   // 界=本银行形状（异构批形状）
-                bool expired = (now - window_t0[g]) >= window_ms;
+                double eff_win = window_ms;   // 凑批门槛：见 kBankFillMin 注（自锁破除）
+                if (kBankFillMin > 0 && taken < kBankFillMin
+                    && kBankFillTmaxMs > eff_win)
+                    eff_win = kBankFillTmaxMs;
+                bool expired = (now - window_t0[g]) >= eff_win;
                 if (full || expired) {
                     // 关舱（CAS 输=写手已自驱）→ 先轮转开新窗（drain/提交不堵
                     // 下一窗，批间流水重叠）→ 再 drain+发车本舱
