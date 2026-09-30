@@ -227,3 +227,15 @@
   复位 -1+Claim 领槽再清一道。漏复位=上一任写手的陈旧声明被本批判读=
   按错段传输=静默漏传（正确性由整行兜底的 fail-safe 挡住，但增量收益
   静默消失且哨兵会报良性违约——两头难查）。
+- **乘客 pending 严禁 thread 态（fiber 同工人交错串槽案，2026-09-30）**：
+  同工人跑多个 fiber（链钉扎 c%K 只保证"回家"，不保证独占线程时刻），
+  bridge 的 pending（bank/slot）存 thread_local 会在"Claim 失败（如 W2
+  路由组越界：dev>=组数，每个越界决策都败）"后残留前任 fiber 的槽——
+  下一个 fiber 的 Pending() 误报有 pending → 拿别人槽提交 = 前主泄漏 +1、
+  本槽双减 -1 → inflight=-1 → **远端 drain 永等死锁**（YGO 座位路由
+  groups=1 案）。修法=乘客侧 pending 按 fiber 作用域（FiberCurrent()
+  cookie 键或住游戏帧）；框架侧已硬化：SubmitWait/Abandon 校验槽所有权
+  （open+owner），违约当场拒绝+响亮指路**不代减**（真主完工照减，账面
+  自洽）——这类违约从远端死锁变成当场的可读错误；G20 门=路由越界×
+  陈旧提交的记账完好回归。同款坑位暗示：任何"per-decision 状态"都要过
+  一遍 fiber 作用域审查（t_fb/t_fb_mid/t_bank_dst 全家都是 thread 态）。

@@ -1184,6 +1184,53 @@ int main() {
         }
     }
 
+    // G20：组路由越界 × 槽所有权违约的记账完好门（09-30 死锁案回归门）。
+    // 案情：乘客 pending 存 thread 态，W2 路由越界（groups=1 × seat 路由）
+    // 让 Claim 常态失败 → 残留 pending 被"误认领" → foreign submit 双减
+    // inflight → 远端 drain 永等。框架侧契约：路由越界判负显性化（一次性
+    // 告警）；违约提交/弃槽当场拒绝不代减（真主完工照减，账面自洽）。
+    {
+        auto g20 = std::make_unique<Farm>();
+        FarmConfig cfg;
+        cfg.name = "g20";
+        cfg.chains = 2;
+        cfg.games = 8;
+        cfg.seed0 = 99;
+        cfg.fibers = false;   // 线程腿：所有权走同线程路径（cookie=0）
+        cfg.workers = 2;
+        cfg.banks = 2;
+        cfg.slots = 8;
+        cfg.window_ms = 0.2;
+        cfg.stagger_ms = 1;
+        cfg.model.backend = "cpu";
+        cfg.model.cpu = ToyModelDecl(cfg.slots);
+        if (!g20->Init(cfg)) {
+            std::printf("FAIL: G20 farm init\n");
+            g_fail++;
+        } else {
+            BankScheduler* bk = g20->bank();
+            float dbuf[64] = {0};
+            OutputDest d1{"policy", dbuf, 64};
+            int b = -1, s = -1;
+            CHECK(!bk->Claim(b, s, 99), "G20a 路由组越界 Claim 判负（groups=1）");
+            CHECK(bk->Claim(b, s, -1), "G20b 正常认领");
+            CHECK(bk->Abandon(b, s), "G20c 首次 Abandon 生效");
+            CHECK(!bk->Abandon(b, s), "G20d 双 Abandon 违约拒绝（不代减）");
+            CHECK(!bk->SubmitWait(b, s, &d1, 1),
+                  "G20e Abandon 后 SubmitWait 违约拒绝");
+            int b2 = -1, s2 = -1;
+            CHECK(bk->Claim(b2, s2, -1), "G20f 复认领");
+            CHECK(bk->SubmitWait(b2, s2, &d1, 1), "G20g 正常提交完工");
+            CHECK(!bk->SubmitWait(b2, s2, &d1, 1),
+                  "G20h 双 SubmitWait 违约拒绝（不代减）");
+            // 收尾腿：违约全被拒后账面必须无损（修复前 inflight=-1 → 本腿
+            // drain 永等=测试挂死即红）
+            g20->RunLeg(MakeToyAdapter, nullptr);
+            CHECK(g20->tally().games_done > 0,
+                  "G20i 违约拒绝后账面无损，收尾腿正常");
+        }
+    }
+
     std::printf("=== 完成：%s（%d 失败）===\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

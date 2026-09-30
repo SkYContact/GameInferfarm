@@ -124,6 +124,12 @@ struct alignas(64) BankCtl {            // 64B 对齐：相邻银行的 cursor/i
     // 发车读（drain 握手给 happens-before）；后端 Init 期 BindStatePids 取
     // 数组地址——每批零接口流量。生命周期=银行池（会话销毁前有效）。
     std::atomic<int>* sp_ids = nullptr;   // [slots]（建池 new/Shutdown delete）
+    // 槽所有权（09-30 死锁案硬化）：认领者 fiber cookie（线程腿=0，同线程
+    // 提交天然自洽）。SubmitWait/Abandon 前校验 open+owner，违约=响亮指路
+    // +判负不代减（真主完工照减，账面自洽）——把"乘客 pending 存 thread
+    // 态"类协议违约从远端死锁变成当场的可读错误。
+    std::atomic<uint8_t>* opn = nullptr;    // [slots] 1=已认领未核销
+    std::atomic<uintptr_t>* own = nullptr;  // [slots] 认领者 cookie（0=线程腿）
     int fixed_batch = 0;                  // 本组固批（W3 按组化；InitGroups 从
                                           // 组配置拷入；0=关）
     // 在途航班（单发=线性生命周期）。非原子字段，同步边=state：
@@ -226,7 +232,20 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
     if (!banks_) return false;
     Impl& I = *impl_;
     const int g = dev < 0 ? 0 : dev;
-    if (g >= Impl::kMaxGrp || g >= I.n_groups) return false;
+    if (g >= Impl::kMaxGrp || g >= I.n_groups) {
+        // 路由组越界（W2 决策级路由：乘客把组号/座位号传过了 --groups）：
+        // 失败是常态性的（每个越界决策都败），一次性响亮指路——沉默判负会让
+        // 乘客侧出现"某座位全盲"这类难查读数（09-30 YGO 座位路由 groups=1 案）
+        static std::atomic<int> route_warned{0};
+        if (route_warned.fetch_add(1) == 0)
+            std::fprintf(stderr,
+                         "[bank] Claim 路由组 %d >= 组数 %d——路由/座位配置与 "
+                         "--groups 不匹配，该路由全部判负（按座分派双引擎须 "
+                         "groups>=2；若 pending 存 thread_local 亦须改 fiber "
+                         "作用域，见 bank.h 协议注）\n",
+                         g, I.n_groups);
+        return false;
+    }
     const long long ts0 = I.cen && I.cen->on ? NowNsI() : 0;
     auto try_claim = [&](int& b_out, int& s_out) -> bool {
         const long long tp0 = I.cen && I.cen->on ? NowNsI() : 0;
@@ -250,6 +269,16 @@ bool BankScheduler::Claim(int& bank, int& slot, int dev, int pool_pid) {
         }
         b_out = fi;
         s_out = v;
+        if (b.opn) {   // 槽所有权登记（违约检测面，见 BankCtl 注）：上一任未
+                       // 核销仍认领=泄漏信号，响亮一声（真泄漏会使 inflight
+                       // 不归零=drain 长等，本行帮乘客把起点钉在案发现场）
+            if (b.opn[v].load(std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[bank] 认领重叠：bank=%d slot=%d 上一任未核销"
+                             "（泄漏 +1 候选）\n", fi, v);
+            b.own[v].store((uintptr_t)FiberCurrent(), std::memory_order_relaxed);
+            b.opn[v].store(1, std::memory_order_relaxed);
+        }
         // ③池下标记账（成对状态行）：槽独占期单写者；release 与发车侧的
         // drain 握手（req 提交原子链）合成 happens-before
         if (pool_pid >= 0 && b.sp_ids)
@@ -435,6 +464,36 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
         I.Notify();
         return false;
     }
+    // 槽所有权校验（09-30 死锁案硬化）：提交者必须是认领者本人。违约典型=
+    // 乘客把 pending 存 thread 态（thread_local）——同工人多 fiber 交错时
+    // 拿到前任 fiber 的槽=foreign submit：真主泄漏 +1、本槽双减 -1 →
+    // inflight 失衡 → 远端 drain 永等。此处拒绝且**不代减**（真主完工照减，
+    // 账面自洽），把远端死锁变成当场的可读错误。
+    if (b.opn && !b.opn[(size_t)slot].load(std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[bank] SubmitWait 拒绝：bank=%d slot=%d 未认领/已核销"
+                     "——乘客协议违约（Claim 后必须恰好一次 SubmitWait/"
+                     "Abandon；Claim 失败=本前向无 pending）。最常见因="
+                     "pending 存 thread_local：同工人多 fiber 交错会串槽，"
+                     "pending 须按 fiber 作用域（FiberCurrent() cookie 键）"
+                     "或住游戏帧\n",
+                     bank, slot);
+        return false;   // 不代减：真主完工照减，账面自洽
+    }
+    if (b.opn && b.own) {
+        const uintptr_t cur = (uintptr_t)FiberCurrent();
+        const uintptr_t ow = b.own[(size_t)slot].load(std::memory_order_relaxed);
+        if (ow && cur && ow != cur) {
+            std::fprintf(stderr,
+                         "[bank] SubmitWait 拒绝：bank=%d slot=%d 非本 fiber "
+                         "认领（owner=%p cur=%p）——pending 存 thread_local 的"
+                         "典型串槽：同工人多 fiber 交错，改 fiber 作用域"
+                         "（cookie 键）或住游戏帧；本前向判负不代减\n",
+                         bank, slot, (void*)ow, (void*)cur);
+            return false;   // 不代减：真主完工照减，账面自洽
+        }
+        b.opn[(size_t)slot].store(0, std::memory_order_relaxed);   // 核销
+    }
     if (n_dests > BankReq::kMaxDests) {
         // 申报超额：失败完成（判负纪律）。静默截断=把缺失输出当有效结果——
         // 绝不。占额照减（本槽视为完工；reqs 槽位未登记，发车按作废槽跳过）。
@@ -502,11 +561,38 @@ bool BankScheduler::SubmitWait(int bank, int slot, const OutputDest* dests, int 
     return !done.fail;
 }
 
-void BankScheduler::Abandon(int bank, int slot) {
-    if (!banks_ || bank < 0 || bank >= banks_) return;
+bool BankScheduler::Abandon(int bank, int slot) {
+    if (!banks_ || bank < 0 || bank >= banks_) return false;
     Impl& I = *impl_;
     BankCtl& b = I.banks[(size_t)bank];
-    if (slot < 0 || slot >= b.slots) return;
+    if (slot < 0 || slot >= b.slots) return false;
+    // 槽所有权校验（同 SubmitWait，09-30 死锁案硬化）：重复 Abandon/非本人
+    // 弃槽=完工重复照减 → inflight 失衡。违约拒绝不代减+响亮指路。
+    if (b.opn) {
+        if (!b.opn[(size_t)slot].load(std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[bank] Abandon 拒绝：bank=%d slot=%d 未认领/已核销"
+                         "——重复弃槽=完工重复照减（inflight 失衡远端死锁的"
+                         "典型来源）；本弃槽不生效\n",
+                         bank, slot);
+            return false;
+        }
+        if (b.own) {
+            const uintptr_t cur = (uintptr_t)FiberCurrent();
+            const uintptr_t ow =
+                b.own[(size_t)slot].load(std::memory_order_relaxed);
+            if (ow && cur && ow != cur) {
+                std::fprintf(stderr,
+                             "[bank] Abandon 拒绝：bank=%d slot=%d 非本 fiber "
+                             "认领（owner=%p cur=%p）——pending 存 thread_local"
+                             " 的典型串槽：改 fiber 作用域（cookie 键）或住游戏"
+                             "帧；本弃槽不生效不代减\n",
+                             bank, slot, (void*)ow, (void*)cur);
+                return false;
+            }
+        }
+        b.opn[(size_t)slot].store(0, std::memory_order_relaxed);   // 核销
+    }
     b.reqs[(size_t)slot] = nullptr;                        // 作废槽：发车跳过
     if (b.sp_ids)
         b.sp_ids[(size_t)slot].store(-1, std::memory_order_release);   // DATA17
@@ -518,6 +604,7 @@ void BankScheduler::Abandon(int bank, int slot) {
     // 不 Notify：inflight-- 只被 close-drain 的自旋等待（不依赖 cv）；全弃批的
     // 关舱由窗闹钟兜底。缓存命中路径高频走此（判决13）——每次 notify_all 会把
     // 调度台打成唤醒风暴（实测 53% 命中反慢 2.4× 的主因）。
+    return true;
 }
 
 static long long harv_sample = 0;   // harvest 细分抽样尺（调度台单写；粗档
@@ -1342,6 +1429,12 @@ bool BankScheduler::InitGroups(const BankConfig& cfg,
                 // 取用；非状态农场 BindStatePids 缺省 no-op 恒 false=零开销）
                 b.sp_ids = new std::atomic<int>[(size_t)gslots];
                 for (int t = 0; t < gslots; t++) b.sp_ids[t].store(-1);
+                b.opn = new std::atomic<uint8_t>[(size_t)gslots];
+                b.own = new std::atomic<uintptr_t>[(size_t)gslots];
+                for (int t = 0; t < gslots; t++) {
+                    b.opn[t].store(0, std::memory_order_relaxed);
+                    b.own[t].store(0, std::memory_order_relaxed);
+                }
                 if (!gc.model.state_pairs.empty()
                     && !b.be->BindStatePids(b.sess, b.sp_ids)) {
                     std::fprintf(stderr, "[bank] 组 %d 后端不支持成对状态行"
@@ -1492,8 +1585,11 @@ void BankScheduler::Shutdown() {
             b.be->DestroySession(b.sess);
             b.sess = nullptr;
         }
-    for (auto& b : I.banks)   // ③池下标数组（会话已毁=绑定失效，随后释放）
+    for (auto& b : I.banks) {   // ③池下标数组（会话已毁=绑定失效，随后释放）
         if (b.sp_ids) { delete[] b.sp_ids; b.sp_ids = nullptr; }
+        if (b.opn) { delete[] b.opn; b.opn = nullptr; }
+        if (b.own) { delete[] b.own; b.own = nullptr; }
+    }
 #ifdef _WIN32
     // 内核等待对象（通知信号量/HR 定时器/唤醒事件）=Windows 面专属；POSIX
     // 面这些指针恒 null（Init 创建段同旗标守卫），段整体不参与编译。

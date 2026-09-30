@@ -126,9 +126,17 @@ public:
     // （含 n_dests>kMaxOutputDests 超额申报：失败完成，占额已代减——调用方
     // 此后不得再 Abandon 本槽，与协议防御分支同约定）。
     // ⚠ 组装与提交之间不得有挂起点（drain 有界的前提）。
+    // ⚠ 槽所有权（09-30 死锁案硬化）：SubmitWait/Abandon 校验"本槽由本
+    //   fiber 认领且未核销"——违约（foreign submit/重复完工）当场拒绝+响亮
+    //   指路且**不代减**（真主完工照减，账面自洽）。
+    // ⚠ 乘客契约：**pending（bank/slot）必须按 fiber 作用域存放**（Fiber()
+    //   cookie 键或住游戏帧）——同工人多 fiber 交错，thread_local 会串槽；
+    //   Claim 失败（含 W2 路由组越界：dev>=组数，每个越界决策都败）=本前向
+    //   无 pending，直接判负即可，不得复用任何旧槽号。
     bool SubmitWait(int bank, int slot, const OutputDest* dests, int n_dests);
-    // 弃槽（异常路径）：作废槽（发车跳过）+完工照减（drain 不堵）
-    void Abandon(int bank, int slot);
+    // 弃槽（异常路径）：作废槽（发车跳过）+完工照减（drain 不堵）。
+    // false=违约拒绝（未认领/已核销/非本人认领——未生效，不得重试改提交）
+    bool Abandon(int bank, int slot);
 
     // population 面写入（演化路由，判决16）：写满指定银行的种群平面+置脏
     // （cuda 下次批全量 H2D；cpu/dml 即时生效）。前置条件=腿已返回。
