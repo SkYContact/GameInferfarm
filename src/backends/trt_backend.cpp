@@ -33,6 +33,7 @@
 #include <x86intrin.h>   // _mm_lfence/_mm_pause 的 GCC/Clang 面（用点=TRT 门内）
 #endif
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -439,7 +440,55 @@ struct TrtSession {
     // 状态尾散射后 record；其它会话的 fill/scatter 入流前 wait 全体他席
     // 事件（同组 FIFO 情形事件早已完成=零代价；跨组情形=补上丢失的执行序）。
     void* ev_state = nullptr;
+    // 本会话触池表（池 dev 指针，去重）：SgWaitOthers 按池粒度登记的依据。
+    // owner 会话=CreateSession 映射期填；共享组会话=ShareStatePool 接线期填。
+    std::vector<void*> touch_pools;
 };
+
+// 触池注册表（进程级，key=池 dev 指针——跨 backend 实例同一把钥匙：池共享
+// 形态下 ShareStatePool 只拷池指针、他组会话不在本实例 st_sessions_ 里，
+// 跨流序在跨组形态从未兑现（DATA17 同源洞）。注册表把"读/写同一池"的会话
+// 连进同一 wait 面，洞即闭合）。锁只护表结构本身；快照出的会话指针生命期
+// 由既有停机序保证（调度台/收割腿全部 join 后才 DestroySession——与旧
+// st_sessions_ 裸遍历同一不变量，未收紧）。
+static std::mutex g_stpool_mx;
+static std::map<void*, std::vector<TrtSession*>> g_stpool_touch;
+
+static void StTouchAdd(TrtSession* s, void* pool_dev) {
+    if (!pool_dev) return;
+    std::lock_guard<std::mutex> lk(g_stpool_mx);
+    auto& v = g_stpool_touch[pool_dev];
+    for (TrtSession* o : v)
+        if (o == s) return;
+    v.push_back(s);
+}
+
+static void StTouchRemove(TrtSession* s) {
+    std::lock_guard<std::mutex> lk(g_stpool_mx);
+    for (auto it = g_stpool_touch.begin(); it != g_stpool_touch.end();) {
+        auto& v = it->second;
+        for (size_t i = 0; i < v.size();)
+            if (v[i] == s) { v.erase(v.begin() + (long)i); }
+            else i++;
+        if (v.empty()) it = g_stpool_touch.erase(it);
+        else ++it;
+    }
+}
+
+// 会话按 st_in/st_out 映射登记触池（pools=本实例池表；映射值=池下标）
+static void StTouchMap(TrtSession* s,
+                       const std::vector<void*>& pool_devs) {
+    for (int pi : s->st_in)
+        if (pi >= 0 && pi < (int)pool_devs.size())
+            StTouchAdd(s, pool_devs[(size_t)pi]);
+    for (int pi : s->st_out)
+        if (pi >= 0 && pi < (int)pool_devs.size()) {
+            bool dup = false;
+            for (int q : s->st_in)
+                if (q == pi) { dup = true; break; }
+            if (!dup) StTouchAdd(s, pool_devs[(size_t)pi]);
+        }
+}
 
 class TrtBackend : public InferBackend {
 public:
@@ -705,6 +754,13 @@ public:
                     if (spec.outs[k].name == pr.out) s->st_out[k] = (int)pi;
             }
             s->has_state = true;
+            if (!st_pools_.empty()) {   // owner 路径：池已在（首会话刚建或复用）
+                                        // ——按映射登记触池（跨组 wait 面成员）
+                std::vector<void*> devs;
+                devs.reserve(st_pools_.size());
+                for (const auto& p : st_pools_) devs.push_back(p.dev);
+                StTouchMap(s, devs);
+            }
             if (cfg.state_share_grp >= 0)
                 std::fprintf(stderr, "[trt] 状态池共享组就绪: %zu 对（待 Farm"
                              " 接线绑定持有组）\n", cfg.state_pairs.size());
@@ -813,6 +869,7 @@ public:
     void DestroySession(void* session) override {
         TrtSession* s = (TrtSession*)session;
         if (!s) return;
+        StTouchRemove(s);   // 触池登记摘除（wait 面防悬挂）
         for (size_t i = 0; i < st_streams_.size(); i++)   // ③流表摘除（防悬挂——
             if (st_streams_[i] == s->stream) {            // ResetStatePool 全流面）
                 st_streams_.erase(st_streams_.begin() + (long)i);
@@ -1142,6 +1199,15 @@ public:
             p.external = true;
             st_pools_.push_back(p);
         }
+        // 触池登记（跨组洞闭合）：共享组全部状态会话入 wait 面——他组散射
+        // 事件此后对本组 gather/scatter 可见（此前跨组形态零序=DATA17 同源）
+        if (!st_sessions_.empty()) {
+            std::vector<void*> devs;
+            devs.reserve(st_pools_.size());
+            for (const auto& p : st_pools_) devs.push_back(p.dev);
+            for (TrtSession* s : st_sessions_)
+                if (s->has_state) StTouchMap(s, devs);
+        }
         std::fprintf(stderr, "[trt] 状态池跨组共享生效: %d 对（绑定他组设备行，"
                      "本组不持有）\n", n);
         return true;
@@ -1300,13 +1366,38 @@ private:
             }
         }
     }
-    // 跨流序（DATA17 定谳）：本会话入流任何"读/写共享池行"的操作前，等
-    // 全体他席会话的最近状态事件。同组 FIFO 情形事件早已完成=零代价；
-    // 跨组半局换道情形=补回丢失的执行序（散射(他流)→本流 gather/scatter）。
-    bool SgWaitOthers(TrtSession* s) {   // 非 static：读 st_sessions_ 注册表
+    // 跨流序（DATA17 定谳）：本会话入流任何"读/写共享池行"的操作前，等全体
+    // 触池他席的最近状态事件。两级收窄（原=实例内全体无差别）：
+    //   ①按池粒度：只等真正共享池的会话（全局注册表——跨组共享形态由此入
+    //     面，洞闭合）；
+    //   ②EventQuery 探完成：事件已完成（或从未 record）=散射 GPU 侧已全局
+    //     收敛，跳过 StreamWaitEvent——流内不挂无谓依赖，各银行流自由重叠
+    //     （原实现 N 条银行流每批两两握手=退化串行链，90k 墙主嫌疑）。
+    // 事件未完成才真 wait——序保证与原实现逐位同（完成=无需序，未完成=补序）。
+    bool SgWaitOthers(TrtSession* s) {
         if (!g_cu.StreamWaitEvent) return true;
-        for (TrtSession* o : st_sessions_) {
-            if (o == s || !o->ev_state) continue;
+        TrtSession* others[64];
+        int n_others = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_stpool_mx);
+            for (void* pd : s->touch_pools) {
+                auto it = g_stpool_touch.find(pd);
+                if (it == g_stpool_touch.end()) continue;
+                for (TrtSession* o : it->second) {
+                    if (o == s) continue;
+                    bool dup = false;
+                    for (int k = 0; k < n_others; k++)
+                        if (others[k] == o) { dup = true; break; }
+                    if (!dup && n_others < 64) others[n_others++] = o;
+                }
+            }
+        }
+        for (int k = 0; k < n_others; k++) {
+            TrtSession* o = others[k];
+            if (!o->ev_state) continue;
+            if (g_cu.EventQuery
+                && g_cu.EventQuery(o->ev_state) == 0 /*cudaSuccess=已完成*/)
+                continue;
             if (g_cu.StreamWaitEvent(s->stream, o->ev_state, 0)) return false;
         }
         return true;
