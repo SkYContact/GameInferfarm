@@ -84,7 +84,9 @@ bool Farm::Init(FarmConfig cfg) {
     // FARM_* env 覆盖（快速实验通道；显式 Config 为准，env 只在未显式动过时
     // 覆盖——此处取"env 优先"与 YGO 产线一致：便于不改码扫参）
     if (const char* e = getenv("FARM_FIBERS")) cfg_.fibers = atoi(e) == 1;
-    if (const char* e = getenv("FARM_CENSUS")) cfg_.census = atoi(e) == 1;
+    if (const char* e = getenv("FARM_CENSUS"))
+        cfg_.census = atoi(e) >= 1;   // 二档制：1=粗+抽样 2=细全量（==1 会把
+                                      // 2 档静默关掉，掼蛋 §0u 首读踩坑）
     cfg_.workers = EnvInt("FARM_FIBER_WORKERS", cfg_.workers);
     cfg_.banks = EnvInt("FARM_BANKS", cfg_.banks);
     cfg_.window_floor = EnvDouble("FARM_BANK_WINDOW_FLOOR", cfg_.window_floor);

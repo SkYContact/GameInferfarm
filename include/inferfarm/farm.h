@@ -16,7 +16,8 @@
 //                             事件（Win10 1803+；量子税 ~1ms→过冲 50-600µs
 //                             口径；opt-in 默认关=零行为差）
 //    FARM_STAGGER_MS          点火错峰（10ms 甜点）
-//    FARM_CENSUS=1            取证层（~5% 税，仅取证开）
+//    FARM_CENSUS=1            取证层（~5% 税，仅取证开）；2=细档全量
+//                             （三段逐行计时 2.3× 税，短开取证）
 //    FARM_WORKER_AFFINITY     工人绑核列表 "0,2-7,phys"（affinity.h；phys=
 //                             物理核代表号——判决2 的机器面；空=不绑）
 //    FARM_SCHED_AFFINITY      调度台绑核列表（spin=1 自旋核钉扎防迁移）
