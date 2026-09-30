@@ -91,11 +91,25 @@ static thread_local int t_nosuspend = 0;           // 契约 1 断言计数（Sc
 static IFiberBackend* g_be = nullptr;              // 切换后端（RunLeg 期选定，池寿命）
 static inline void SpinPause() {                   // x86 PAUSE（SMT 对端不阻塞执行口）
 #if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+    _mm_pause();   // MSVC：GCC builtin 不可用（09-30 合流首编译爆，老坑律）
+#else
     __builtin_ia32_pause();
+#endif
 #else
     ;
 #endif
 }
+#if defined(_MSC_VER)
+#include <intrin.h>
+static inline int Ctz64(unsigned long long m) {    // GCC __builtin_ctzll 的 MSVC 等价
+    unsigned long i;
+    _BitScanForward64(&i, m);
+    return (int)i;
+}
+#else
+static inline int Ctz64(unsigned long long m) { return __builtin_ctzll(m); }
+#endif
 
 // ---------------- 等待侧桥（银行层/任何等待点调用）----------------
 void* FiberCurrent() { return t_fi_task; }
@@ -191,7 +205,7 @@ void FiberPostEnd() {
         uint64_t m = t_post_wake[i];
         t_post_wake[i] = 0;
         while (m) {
-            const int w = (int)(i << 6) + __builtin_ctzll(m);
+            const int w = (int)(i << 6) + Ctz64(m);
             m &= m - 1;
             // 只叫醒在睡的：sleeping 无锁读的竞争窗=工人正醒着干活（本批
             // 早前行可能已把它叫醒）——跳过省 notify；真在睡则旗已置位可见。

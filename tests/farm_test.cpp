@@ -159,7 +159,10 @@ static bool WriteFile(const char* path, const std::vector<char>& b) {
 }
 
 int main() {
+    // 无缓冲 stdout：栈溢出/硬崩时已打印的门名必须活着（缓冲会在崩溃时丢字）
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== inferfarm 确定性门 ===\n");
+    std::fflush(stdout);
 
     // G1：银行 vs inline（fiber 同参数）
     LegResult bank1 = RunOne(2, true, 4, 4242);
