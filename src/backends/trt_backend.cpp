@@ -426,6 +426,11 @@ struct TrtSession {
     int slots = 64;
     int dev = 0;      // 会话设备（多卡：分配/流/图/邮箱全落此设备）
     int last_n = 0;
+    // 跨流序（DATA17 定谳：共享状态池+跨组半局换道=散射(组0流)与 gather/
+    // scatter(组1流) 无序——单流 FIFO 拦不住跨流。每会话一枚状态事件，
+    // 状态尾散射后 record；其它会话的 fill/scatter 入流前 wait 全体他席
+    // 事件（同组 FIFO 情形事件早已完成=零代价；跨组情形=补上丢失的执行序）。
+    void* ev_state = nullptr;
 };
 
 class TrtBackend : public InferBackend {
@@ -671,7 +676,13 @@ public:
                              "（提交侧 D2D 填充+批尾 D2D 散射，状态不过主机）\n",
                              cfg.state_pairs.size(), cfg.state_pool_rows);
         }
-        if (for_bank) st_streams_.push_back(s->stream);   // ResetStatePool 全流面
+        if (for_bank) {
+            st_streams_.push_back(s->stream);   // ResetStatePool 全流面
+            // 跨流序事件（DATA17 定谳；可选符号缺席=退化旧行为，单组无恙）
+            if (g_cu.EventCreateWithFlags && g_cu.EventRecord)
+                g_cu.EventCreateWithFlags(&s->ev_state, 0x2 /*DisableTiming*/);
+            st_sessions_.push_back(s);
+        }
         return s;
     }
 
@@ -770,6 +781,9 @@ public:
                 st_streams_.erase(st_streams_.begin() + (long)i);
                 break;
             }
+        for (size_t i = 0; i < st_sessions_.size(); i++)
+            if (st_sessions_[i] == s) { st_sessions_.erase(st_sessions_.begin() + (long)i); break; }
+        if (s->ev_state && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_state);
         if (s->graph && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph);
         if (s->graph_c && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph_c);
         if (s->ctx) delete s->ctx;
@@ -806,6 +820,7 @@ public:
         if (n_rows > s->slots) n_rows = s->slots;
         s->last_n = n_rows;
         const bool st = s->has_state && s->st_pids;
+        bool st_fill_waited = false;   // 跨流序 wait 每批一次
         if (s->has_state && st_pools_.empty()) {   // ③共享组未接线（Farm 配置
             // 错误/序错）——池行指针不存在，静默旧路=状态面垃圾，loud 快败
             std::fprintf(stderr, "[trt] state_pairs 会话未绑定状态池（跨组共享"
@@ -827,6 +842,10 @@ public:
                     const size_t rb = s->ins[i].meta.row_bytes;
                     const StatePool& pol = st_pools_[(size_t)pi];
                     const size_t prows = (size_t)pol.rows;
+                    if (!st_fill_waited) {   // 本批一次（多状态面共享同序）
+                        st_fill_waited = true;
+                        if (!SgWaitOthers(s)) return false;
+                    }
                     if (StGatherOn()) {   // DATA13：单 launch gather 全面
                         if (!SgRun(s, dst, pool, pol, /*zero_ok=*/true, n_rows,
                                    rb, 0))
@@ -983,6 +1002,7 @@ private:
         bool external = false;    // ③跨组共享（ShareStatePool 绑定）——析构不释放
     };
     std::vector<StatePool> st_pools_;
+    std::vector<TrtSession*> st_sessions_;   // 状态会话表（跨流 wait 面）
     std::vector<void*> st_streams_;   // 全部银行会话流（ResetStatePool 全流
                                       // memset=任意下一读所在流自有序；同零值
                                       // 多流写良性）
@@ -1176,6 +1196,17 @@ private:
             }
         }
     }
+    // 跨流序（DATA17 定谳）：本会话入流任何"读/写共享池行"的操作前，等
+    // 全体他席会话的最近状态事件。同组 FIFO 情形事件早已完成=零代价；
+    // 跨组半局换道情形=补回丢失的执行序（散射(他流)→本流 gather/scatter）。
+    bool SgWaitOthers(TrtSession* s) {   // 非 static：读 st_sessions_ 注册表
+        if (!g_cu.StreamWaitEvent) return true;
+        for (TrtSession* o : st_sessions_) {
+            if (o == s || !o->ev_state) continue;
+            if (g_cu.StreamWaitEvent(s->stream, o->ev_state, 0)) return false;
+        }
+        return true;
+    }
     // 建表+H2D+单 launch（rc!=0 即 false——失败纪律同 memcpy，上层判负）。
     // 表缓冲按 slots 一次分配逐批复用；安全由会话生命周期保证（旗标殿后=
     // 复用时上一批 H2D 必已执行）。
@@ -1226,6 +1257,8 @@ private:
     // 旗标到=散射与 D2H 均已执行）
     bool EnqueueStateTail(TrtSession* s, int n_rows) {
         s->sb.clear();   // 防御：早退不留陈旧条目（填充批已在 Submit 清空）
+        if (!SgWaitOthers(s)) return false;   // 本散射等他席最近散射（跨流
+        // 行序：旧局末散射不得晚于新局散射覆写同行——NewGame 延迟零行案）
         const bool batch = StBatchOn();
         for (size_t oi = 0; oi < s->outs.size(); oi++) {
             const int pi = oi < s->st_out.size() ? s->st_out[oi] : -1;
@@ -1262,6 +1295,9 @@ private:
             }
         }
         if (!StBatchFlush(s)) return false;   // 散射批：单次提交
+        if (s->ev_state && g_cu.EventRecord
+            && g_cu.EventRecord(s->ev_state, s->stream))
+            return false;   // 他席可见点（散射全部入流后）
         if (g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream))
             return false;
         return true;

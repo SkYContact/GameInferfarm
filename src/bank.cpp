@@ -508,6 +508,12 @@ void BankScheduler::Abandon(int bank, int slot) {
     BankCtl& b = I.banks[(size_t)bank];
     if (slot < 0 || slot >= b.slots) return;
     b.reqs[(size_t)slot] = nullptr;                        // 作废槽：发车跳过
+    if (b.sp_ids)
+        b.sp_ids[(size_t)slot].store(-1, std::memory_order_release);   // DATA17
+        // 定谳：弃槽必须同步降格为幻影行——pid 残留会让设备面散射把输出
+        // arena 的陈旧垃圾写进该 pid 的无辜链池行（单点污染全程扩散），且
+        // 弃槽 fill 建表会误消费无辜链的 zero_pending 旗（NewGame 零行语义
+        // 丢失）。收割端主机路径素有 reqs==null 卫，设备面唯 sp_ids 可据。
     b.inflight.fetch_sub(1, std::memory_order_acq_rel);    // 完工照减（drain 不堵）
     // 不 Notify：inflight-- 只被 close-drain 的自旋等待（不依赖 cv）；全弃批的
     // 关舱由窗闹钟兜底。缓存命中路径高频走此（判决13）——每次 notify_all 会把

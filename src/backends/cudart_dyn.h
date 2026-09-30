@@ -62,6 +62,9 @@ struct Cudart {
     // 流捕获态查询（fence 诊断；可选符号）：0=None 1=Global 2=ThreadLocal
     // 3=Relaxed（cudaStreamCaptureStatus）
     int (*StreamIsCapturing)(void*, int*) = nullptr;
+    // 跨流序（DATA17：共享状态池跨组换道=散射/gather 跨流无序——本符号+
+    // EventRecord 补执行序；可选符号缺席=退化旧行为）
+    int (*StreamWaitEvent)(void*, void*, unsigned int) = nullptr;
     // CUDA 12.8+ 批拷贝（P1-5 稀疏批 H2D 判决实验；可选符号——缺席/失败自动
     // 回退逐输入路径）。**ABI 双形态（2026-09-29 坑律入档，③D2D 批量化首跑
     // 段错误定谳）**：cu12(12.8/12.9)=9 参——numAttrs 后带 size_t* failIdx
@@ -137,6 +140,7 @@ struct Cudart {
         RuntimeGetVersion = (int (*)(int*))g("cudaRuntimeGetVersion");
         LaunchHostFunc = (int (*)(void*, void (*)(void*), void*))g("cudaLaunchHostFunc");
         StreamIsCapturing = (int (*)(void*, int*))g("cudaStreamIsCapturing");
+        StreamWaitEvent = (int (*)(void*, void*, unsigned int))g("cudaStreamWaitEvent");
     }
 
 #ifdef _WIN32
