@@ -30,6 +30,11 @@
 //   R10 引擎缓存悬垂回归（掼蛋 W4 双模型首爆，2026-09-29）：be1(引擎A) 会话
 //      基线 → be2(引擎B) 注册=容器增长 → be1 再 CreateSession——旧 vector 的
 //      eng_=&back() 裸指针悬垂=此序必 SIGSEGV；deque 修复=两跑逐位同+老会话照常
+//   R12 population 路由 TRT/ORT 覆盖门（判决16，2026-09-30）：玩具路由图
+//      y[r]=pop[mid[r]]·x[r]——均匀 pop 复跑逐位同/mid 恒 0 垃圾槽不参与/
+//      mid 路由生效+换代→换回精确还原（脏旗端到端）/部分批尾毒化不污染。
+//      工件 models/pop_toy.fb8.{onnx,trt}（tools/bake_pop_toy.py+bake_fb8_trt.py，
+//      缺席=SKIP）
 //
 // 工件烤制：python tools/bake_gomoku_mlp.py --slots 8 --hidden 64 \
 //   --out models/gomoku_mlp.fb8.onnx --trt models/gomoku_mlp.fb8.trt
@@ -1144,6 +1149,168 @@ int main(int argc, char** argv) {
         delete be1;
         delete be2;
         std::remove("models/state_toy_r10copy.trt");
+    }
+    // ---------------- R12：population 路由 TRT/ORT 覆盖门（判决16，
+    // 2026-09-30）----------------
+    // 此前 population 只走 ort/cpu（TRT 前缀拷协议未覆盖 pop 面=LoadSpec 拒载）。
+    // 玩具路由图 y[r]=pop[mid[r]]·x[r]（tools/bake_pop_toy.py + bake_fb8_trt.py）：
+    //   R12a 均匀 pop+mid 恒 0 复跑逐位同（脏旗 H2D 挂起态无害）
+    //   R12b 异权重 pop 下 mid 恒 0 == 均匀 pop 逐位（路由读的是 mid 指的行，
+    //        垃圾槽不参与——死行协议根基）
+    //   R12c mid[r]=r%P 路由生效（fp 必变）+ 复跑 + 换代→换回精确还原（脏旗
+    //        二次 H2D 端到端）
+    //   R12d 部分批 n=3 行 0..2 == 满批逐位（mid 批尾毒化不越界不污染）
+    {
+        const char* kPopOnnx = "models/pop_toy.fb8.onnx";
+        const char* kPopTrt = "models/pop_toy.fb8.trt";
+        auto r12 = [&](const char* tag, InferBackend* be, ModelConfig m) {
+            if (!be) { std::printf("SKIP R12 %s: 后端不可用\n", tag); return; }
+            ModelSpec spec;
+            if (!be->LoadSpec(m, 8, spec)) {
+                std::printf("SKIP R12 %s: LoadSpec 失败\n", tag);
+                delete be;
+                return;
+            }
+            bool pop_face = false;
+            for (auto& i : spec.ins)
+                if (i.population) pop_face = true;
+            if (!pop_face) {
+                std::printf("SKIP R12 %s: spec 无 population 面\n", tag);
+                delete be;
+                return;
+            }
+            void* sess = be->CreateSession(m, spec, /*for_bank=*/true);
+            if (!sess || !be->Warmup(sess)) {
+                std::printf("SKIP R12 %s: 会话/热身不可用\n", tag);
+                if (sess) be->DestroySession(sess);
+                delete be;
+                return;
+            }
+            const int S = 8, P = 4, O = spec.outs[0].width;
+            const size_t XF = spec.ins[0].row_bytes / 4;   // x 行宽（f32）
+            // W 平面生成（P 槽：seed 槽 0；seed+p*7919 异权重槽 p≥1）
+            auto wgen = [](uint32_t seed, size_t n, std::vector<float>& w) {
+                w.resize(n);
+                uint32_t x = seed;
+                for (size_t j = 0; j < n; j++) {
+                    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                    w[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                }
+            };
+            auto mk_pop = [&](bool uniform, uint32_t seed,
+                              std::vector<float>& pop_plane) {
+                std::vector<float> w0;
+                wgen(seed, (size_t)O * XF, w0);
+                pop_plane = w0;
+                pop_plane.resize((size_t)P * (size_t)O * XF);
+                std::memcpy(pop_plane.data(), w0.data(), w0.size() * 4);
+                if (!uniform)
+                    for (int p = 1; p < P; p++) {
+                        std::vector<float> wp;
+                        wgen(seed + (uint32_t)p * 7919u, (size_t)O * XF, wp);
+                        std::memcpy(pop_plane.data() + (size_t)p * wp.size(),
+                                    wp.data(), wp.size() * 4);
+                    }
+            };
+            // 一次满批/n 行跑：uniform 控 pop 均匀性；mid_row 给路由键；
+            // mid 尾槽 [n,S) 填 0（部分批时由后端毒化兜底——本门同时验）。
+            // out=全部 n 行输出拼平。
+            auto run = [&](const std::vector<int64_t>& mid_row, bool uniform,
+                           uint32_t seed, int n, std::vector<float>& out) -> bool {
+                std::vector<float> pop_plane;
+                mk_pop(uniform, seed, pop_plane);
+                if (!be->SetPopulation(sess, "pop", pop_plane.data())) return false;
+                for (size_t i = 0; i < spec.ins.size(); i++) {
+                    if (spec.ins[i].population) continue;
+                    if (spec.ins[i].et == DTYPE_F32) {
+                        for (int r = 0; r < n; r++) {
+                            size_t rb = 0;
+                            void* row = be->InputRow(
+                                sess, spec.ins[i].name.c_str(), r, &rb);
+                            if (!row) return false;
+                            uint32_t x = 0x9E3779B9u * (uint32_t)(r + 1);
+                            float* f = (float*)row;
+                            for (size_t j = 0; j < rb / 4; j++) {
+                                x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                                f[j] = (float)((int)(x & 0xFFFF) - 32768) / 32768.0f;
+                            }
+                        }
+                    } else {
+                        size_t rb = 0;
+                        void* row = be->InputRow(
+                            sess, spec.ins[i].name.c_str(), 0, &rb);
+                        if (!row) return false;
+                        int64_t* mm = (int64_t*)row;
+                        for (int r = 0; r < S; r++)
+                            mm[r] = r < n ? mid_row[(size_t)r] : 0;
+                    }
+                }
+                unsigned seq = 0;
+                if (!be->SubmitBatch(sess, n, seq)) return false;
+                while (!be->CompletionReached(sess, seq)) {}
+                be->CompletionFence();
+                out.clear();
+                for (int r = 0; r < n; r++) {
+                    const float* src = be->OutputRow(sess, "y", r);
+                    if (!src) return false;
+                    out.insert(out.end(), src, src + O);
+                }
+                return true;
+            };
+            auto biteq = [](const std::vector<float>& a, const std::vector<float>& b) {
+                return a.size() == b.size()
+                    && !std::memcmp(a.data(), b.data(), a.size() * sizeof(float));
+            };
+            std::vector<int64_t> mid0((size_t)S, 0), midr((size_t)S);
+            for (int r = 0; r < S; r++) midr[(size_t)r] = r % P;
+            std::vector<float> a1, a2, b, c1, c2;
+            bool ok = run(mid0, true, 1234u, S, a1)
+                      && run(mid0, true, 1234u, S, a2);
+            CHECK(ok, (std::string(tag) + " R12a 腿完成（均匀 pop 满批×2）").c_str());
+            CHECK(biteq(a1, a2), (std::string(tag) + " R12a 均匀 pop 复跑逐位同").c_str());
+            ok = run(mid0, false, 1234u, S, b);
+            CHECK(ok && biteq(a1, b), (std::string(tag)
+                  + " R12b mid 恒 0：异权重垃圾槽不参与（==均匀 pop 逐位）").c_str());
+            ok = run(midr, false, 1234u, S, c1) && run(midr, false, 1234u, S, c2);
+            CHECK(ok && !biteq(a1, c1), (std::string(tag)
+                  + " R12c mid 路由生效（fp 必变）").c_str());
+            CHECK(ok && biteq(c1, c2), (std::string(tag)
+                  + " R12c 路由腿复跑逐位同").c_str());
+            ok = run(midr, true, 1234u, S, a2)   // 顶掉一代（脏旗翻面）
+                 && run(midr, false, 1234u, S, c1);   // 换回=精确还原
+            CHECK(ok && biteq(c1, c2), (std::string(tag)
+                  + " R12c 换代→换回精确还原（SetPopulation 脏旗端到端）").c_str());
+            {   // R12d 部分批 n=3（尾槽 mid 由本门填 0 后端毒化兜底——双保险语义）
+                std::vector<float> p3;
+                bool ok3 = run(midr, false, 1234u, 3, p3);
+                bool same = ok3 && p3.size() == (size_t)3 * O
+                            && !std::memcmp(p3.data(), c1.data(),
+                                            p3.size() * sizeof(float));
+                CHECK(same, (std::string(tag)
+                      + " R12d 部分批 n=3 行0..2 == 满批逐位（尾毒化不污染）").c_str());
+            }
+            be->DestroySession(sess);
+            delete be;
+        };
+        if (FileExists(kPopTrt)) {
+            ModelConfig m;
+            m.backend = "trt";
+            m.engine_path = kPopTrt;
+            m.population_input = "pop";
+            r12("trt", have_trt ? CreateTrtBackend() : nullptr, m);
+        } else {
+            std::printf("SKIP R12 trt: 无 %s（tools/bake_pop_toy.py + bake_fb8_trt.py）\n",
+                        kPopTrt);
+        }
+        if (have_ort && FileExists(kPopOnnx)) {
+            ModelConfig m;
+            m.backend = "ort";
+            m.model_path = kPopOnnx;
+            m.population_input = "pop";
+            r12("ort", CreateOrtBackend(), m);
+        } else {
+            std::printf("SKIP R12 ort: 无 %s\n", kPopOnnx);
+        }
     }
     if (!have_ort && !have_trt && !r9_only && !r10_only) {
         std::printf("（本目录无模型工件——全部 SKIP 属正常）\n");

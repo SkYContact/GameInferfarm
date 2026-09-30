@@ -404,6 +404,11 @@ struct TrtSession {
     // ③成对状态行（设备常驻池）：本会话解析结果（池指针拷贝自 backend 级
     // 分配——MbSubmit 是 static，经会话携带）
     bool has_state = false;              // 任一配对成立（恒图外尾段形态）
+    // population 路由（判决16，镜像 ort_backend）：pop 面=整平面 dim0=P≠slots，
+    // 不参与前缀拷——代际换权重后脏旗全量 H2D；mid 路由键批尾毒化（死行协议）
+    bool pop_dirty = false;
+    bool pop_mode = false;
+    std::vector<int> mid_like;   // 路由键输入下标（1-D i64 非 population/weight）
     std::vector<int> st_in, st_out;      // 输入/输出下标→池号（-1=非状态）
     // （③池表已上收 backend 级 st_pools_——ShareStatePool 接线后无需重建会话）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（Claim 写/
@@ -437,12 +442,6 @@ class TrtBackend : public InferBackend {
 public:
     const char* Name() const override { return "trt"; }
     bool LoadSpec(const ModelConfig& cfg, int slots, ModelSpec& out) override {
-        if (!cfg.population_input.empty()) {
-            std::fprintf(stderr, "[trt] population 路由（演化）暂不支持 TRT 后端"
-                         "——路由图走 ort/cpu（判决16：pop 为图输入，TRT 前缀拷"
-                         "协议未覆盖该面）\n");
-            return false;
-        }
         if (!LoadTrtLib(cfg) || !g_cu.Load(DefaultCudaDir(cfg))) return false;
         dev_id_ = cfg.device_id;   // 多卡：engine 反序列化落定设备（同架构双卡
         if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);   // 可共享 engine；>0 本机未测）
@@ -466,7 +465,20 @@ public:
                 m.esize = DtypeSize(et);
                 nvinfer1::Dims d = eng->getTensorShape(nm);
                 for (int j = 0; j < d.nbDims; j++) m.dims.push_back(d.d[j]);
-                if ((int)m.dims[0] != slots) {
+                m.population = !cfg.population_input.empty()
+                               && nm == cfg.population_input;   // 路由模式标记
+                if (m.population) {
+                    if (m.et != DTYPE_F32) {
+                        std::fprintf(stderr, "[trt] population 输入 %s 须 f32\n", nm);
+                        return false;
+                    }
+                    // dim0=P（种群数）≠ slots 合法——整平面面，不参与前缀拷
+                    if (m.dims[0] < 1 || m.dims.size() < 2) {
+                        std::fprintf(stderr, "[trt] population 输入 %s 形状非法"
+                                     "（须 [P≥1, flat_w] 二维）\n", nm);
+                        return false;
+                    }
+                } else if ((int)m.dims[0] != slots) {
                     std::fprintf(stderr, "[trt] 输入 %s dim0=%lld ≠ slots=%d\n",
                                  nm, (long long)m.dims[0], slots);
                     return false;
@@ -543,8 +555,11 @@ public:
         s->ins.resize(spec.ins.size());
         for (size_t i = 0; i < spec.ins.size(); i++) {
             s->ins[i].meta = spec.ins[i];
-            off = (off + spec.ins[i].row_bytes * (size_t)spec.slots + kAlign - 1)
-                      / kAlign * kAlign;
+            // population 面总量=行宽×dim0（P≠slots；同族坑：按 slots 会写爆堆）
+            off = (off + spec.ins[i].row_bytes
+                       * (size_t)(spec.ins[i].population
+                                      ? spec.ins[i].dims[0] : spec.slots)
+                   + kAlign - 1) / kAlign * kAlign;
         }
         s->in_h_bytes = s->in_d_bytes = off;
         if (g_cu.HostAlloc(&s->in_h_arena, s->in_h_bytes, 0)
@@ -555,7 +570,9 @@ public:
         }
         off = 0;
         for (size_t i = 0; i < s->ins.size(); i++) {
-            size_t bytes = s->ins[i].meta.row_bytes * (size_t)s->slots;
+            size_t bytes = s->ins[i].meta.row_bytes
+                * (size_t)(s->ins[i].meta.population
+                               ? s->ins[i].meta.dims[0] : s->slots);
             off = (off + kAlign - 1) / kAlign * kAlign;
             s->ins[i].host = (char*)s->in_h_arena + off;
             s->ins[i].dev = (char*)s->in_d_arena + off;
@@ -567,6 +584,16 @@ public:
                 return nullptr;
             }
         }
+        // 路由键识别（population 模式，镜像 ort_backend）：1-D i64 非
+        // population 输入=mid 类（批尾毒化目标；weight 面排除）
+        if (!cfg.population_input.empty())
+            for (size_t i = 0; i < s->ins.size(); i++) {
+                if (s->ins[i].meta.population) s->pop_mode = true;
+                else if (s->ins[i].meta.et == DTYPE_I64
+                         && s->ins[i].meta.dims.size() == 1
+                         && !s->ins[i].meta.weight)
+                    s->mid_like.push_back((int)i);
+            }
         // 输出单块 arena
         s->outs.resize(spec.outs.size());
         off = 0;
@@ -811,6 +838,22 @@ public:
         return nullptr;
     }
 
+    // population 面写入（演化路由，判决16）：宿主 arena 落盘 + 置脏旗
+    //（下次 SubmitBatch 全量 H2D；流序先于发射=与在飞批无竞态）
+    bool SetPopulation(void* session, const char* pop_input, const void* host) override {
+        TrtSession* s = (TrtSession*)session;
+        for (size_t i = 0; i < s->ins.size(); i++)
+            if (s->ins[i].meta.population
+                && s->ins[i].meta.name == pop_input) {
+                memcpy(s->ins[i].host, host,
+                       s->ins[i].meta.row_bytes
+                           * (size_t)s->ins[i].meta.dims[0]);
+                s->pop_dirty = true;
+                return true;
+            }
+        return false;
+    }
+
     // 前缀 h2d（n > 7/8·slots 走整块；尾行旧数据=行独立无害）+ 异步发射；
     // ③状态会话：状态输入行改设备池 D2D 填充（H2D 跳过，恒逐输入路径——
     // 聚合分支会整块 H2D 状态行）
@@ -830,6 +873,27 @@ public:
         const double tw0 = s->ev_a ? std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
         if (s->ev_a) g_cu.EventRecord(s->ev_a, s->stream);   // 流头（h2d 前=GPA 全串行链）
+        // population 脏旗（判决16）：代际换权重后的单次全量 H2D（pop 非每槽
+        // 输入，不参与前缀拷；同流序先于发射=正确性由流序保证）
+        if (s->pop_dirty) {
+            for (size_t i = 0; i < s->ins.size(); i++)
+                if (s->ins[i].meta.population
+                    && g_cu.MemcpyAsync(s->ins[i].dev, s->ins[i].host,
+                                        s->ins[i].meta.row_bytes
+                                            * (size_t)s->ins[i].meta.dims[0],
+                                        1, s->stream))
+                    return false;
+            s->pop_dirty = false;
+        }
+        // 批尾毒化（路由模式死行协议，判决16）：未领槽位 [n, slots) 的路由键
+        // 置 -1（0xFF）——陈旧 mid 参与图内散射会破坏 (p,j) 唯一性。图侧把
+        // -1 路由到专属死块，毒行输出不被收割。整块路径全量拷贝自带尾段。
+        if (s->pop_mode && n_rows < s->slots)
+            for (int mi : s->mid_like) {
+                const TrtIn& m = s->ins[(size_t)mi];
+                memset((char*)m.host + (size_t)n_rows * m.meta.row_bytes, 0xFF,
+                       (size_t)(s->slots - n_rows) * m.meta.row_bytes);
+            }
         if (!st && n_rows > (s->slots * 7) / 8) {
             if (g_cu.MemcpyAsync(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1, s->stream))
                 return false;
@@ -877,11 +941,25 @@ public:
                     }
                     continue;
                 }
+                if (s->ins[i].meta.population) continue;   // 整平面面不走前缀（脏旗 H2D 已覆盖）
                 if (g_cu.MemcpyAsync(s->ins[i].dev, s->ins[i].host,
                                      (size_t)n_rows * s->ins[i].meta.row_bytes,
                                      1, s->stream))
                     return false;
             }
+            // 前缀路径补充：毒化后的路由键尾段同步到设备（整块路径全量拷贝已含）
+            if (s->pop_mode && n_rows < s->slots)
+                for (int mi : s->mid_like) {
+                    const TrtIn& m = s->ins[(size_t)mi];
+                    if (g_cu.MemcpyAsync((char*)m.dev
+                                             + (size_t)n_rows * m.meta.row_bytes,
+                                         (char*)m.host
+                                             + (size_t)n_rows * m.meta.row_bytes,
+                                         (size_t)(s->slots - n_rows)
+                                             * m.meta.row_bytes,
+                                         1, s->stream))
+                        return false;
+                }
         }
         if (!StBatchFlush(s)) return false;   // 状态填充批：单次提交
         // 排水拆解：ev_a=流头（h2d 前）、ev_b=流尾（盖章后）——事件差=本批
