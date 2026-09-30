@@ -87,6 +87,11 @@ static thread_local FiTask* t_fi_task = nullptr;   // 本工人当前局（等�
 // 批模式投递（FiberPostBegin/End；kMaxWorkers=512 → 512 位=8×u64 位图）
 static thread_local bool t_post_batch = false;
 static thread_local uint64_t t_post_wake[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+// 批模式按工人分桶（2026-09-30 唤醒链刀）：Begin/End 之间 FiberPost 只入
+// 桶，End 按工人**一次锁批量入队**——原形态每 fiber 各过一次 w.mx（掼蛋
+// rot 唤段 0.155ms/轮转 ≈ 384 席×0.4µs 逐席锁的账），批量化后每工人一次
+// 锁+N 次 push_back。桶生命周期=投递线程（收割/调度台各持一份）。
+static thread_local std::vector<std::vector<FiTask*>> t_post_q;
 static thread_local int t_nosuspend = 0;           // 契约 1 断言计数（ScopedNoSuspend）
 static IFiberBackend* g_be = nullptr;              // 切换后端（RunLeg 期选定，池寿命）
 static inline void SpinPause() {                   // x86 PAUSE（SMT 对端不阻塞执行口）
@@ -161,6 +166,17 @@ void FiberPost(void* cookie) {
     const long long p0 = prof ? Census::NowNsI() : 0;
     FiWorker& w = g_fps.fiw[(size_t)t->worker];
     bool need_wake;
+    if (t_post_batch) {   // 批模式：入桶不锁（FiberPostEnd 按工人一次锁批量入队）
+        if (t_post_q.size() < g_fps.fiw.size()) t_post_q.resize(g_fps.fiw.size());
+        t_post_q[(size_t)t->worker].push_back(t);
+        t_post_wake[(size_t)t->worker >> 6] |= uint64_t(1) << (t->worker & 63);
+        if (prof) {
+            cen->post_hook_ns.fetch_add(Census::NowNsI() - p0,
+                                        std::memory_order_relaxed);
+            cen->post_samp_n.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(w.mx);
         const long long p1 = prof ? Census::NowNsI() : 0;
@@ -175,15 +191,6 @@ void FiberPost(void* cookie) {
         w.ready.push_back(t);
         const long long p2 = prof ? Census::NowNsI() : 0;
         if (prof) cen->post_lock_ns.fetch_add(p2 - p1, std::memory_order_relaxed);
-        if (t_post_batch) {   // 批模式：只记账不唤醒（FiberPostEnd 统一发）
-            t_post_wake[(size_t)t->worker >> 6] |= uint64_t(1) << (t->worker & 63);
-            if (prof) {
-                cen->post_hook_ns.fetch_add((p1 - p0) + (Census::NowNsI() - p2),
-                                            std::memory_order_relaxed);
-                cen->post_samp_n.fetch_add(1, std::memory_order_relaxed);
-            }
-            return;
-        }
         if (need_wake) w.cv.notify_one();
         if (prof) {
             const long long p3 = Census::NowNsI();
@@ -197,23 +204,32 @@ void FiberPost(void* cookie) {
 void FiberPostBegin() {
     t_post_batch = true;
     for (auto& m : t_post_wake) m = 0;
+    if (t_post_q.size() < g_fps.fiw.size()) t_post_q.resize(g_fps.fiw.size());
+    for (auto& q : t_post_q) q.clear();
 }
 
 void FiberPostEnd() {
     t_post_batch = false;
-    for (size_t i = 0; i < 8; i++) {
-        uint64_t m = t_post_wake[i];
-        t_post_wake[i] = 0;
-        while (m) {
-            const int w = (int)(i << 6) + Ctz64(m);
-            m &= m - 1;
-            // 只叫醒在睡的：sleeping 无锁读的竞争窗=工人正醒着干活（本批
-            // 早前行可能已把它叫醒）——跳过省 notify；真在睡则旗已置位可见。
-            // 误判方向唯一：对已醒工人多叫一次（无害，用户拍板）。
-            if (g_fps.fiw[(size_t)w].sleeping.load(std::memory_order_acquire))
-                g_fps.fiw[(size_t)w].cv.notify_one();
+    // 批量入队（唤醒链刀 2026-09-30）：按工人一次锁搬整桶——原形态每 fiber
+    // 一次 lock/push/unlock。锁内仍逐条 assert+queued 置位（语义与逐条同）；
+    // FIFO 序保持（桶内=投递序，桶间按工人独立队列无跨序）。
+    for (size_t w = 0; w < t_post_q.size(); w++) {
+        auto& q = t_post_q[w];
+        if (q.empty()) continue;
+        FiWorker& fw = g_fps.fiw[w];
+        {
+            std::lock_guard<std::mutex> lk(fw.mx);
+            for (FiTask* t : q) {
+                assert(!t->queued);   // debug：同一 fiber 不得在队列中挂两条
+                t->queued = true;
+                fw.ready.push_back(t);
+            }
         }
+        q.clear();
+        if (fw.sleeping.load(std::memory_order_acquire))
+            fw.cv.notify_one();
     }
+    for (size_t i = 0; i < 8; i++) t_post_wake[i] = 0;
 }
 
 // ---------------- 契约 1 机器校验（作用域内挂起=断言）----------------

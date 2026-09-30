@@ -393,10 +393,14 @@ struct TrtSession {
     // 之差=观测/提交延迟。事件在旗标到（完成跃迁）时结算。
     void* ev_a = nullptr;
     void* ev_b = nullptr;
+    void* ev_c = nullptr;   // 检出延迟仪器（DATA18 观测差拆解）：检测点回记
+                            // 事件——EventElapsedTime(ev_b,ev_c)=本批 GPU 完
+                            // 成→CPU 检出的墙钟差（设备钟），观测差减它=残差
+                            // 归 ev_a 起跑延迟（流队列）。事件缺席=分段静默。
     bool ev_pending = false;
     double ev_t_launch = 0;
     long long fl_n = 0;
-    double fl_gpu_ms = 0, fl_wall_ms = 0, h2d_ms = 0, lch_ms = 0;
+    double fl_gpu_ms = 0, fl_wall_ms = 0, fl_det_ms = 0, h2d_ms = 0, lch_ms = 0;
     // CUDA Graph 批捕获
     void* graph = nullptr;
     bool graph_ok = false;
@@ -600,8 +604,10 @@ public:
         if (g_cu.EventCreateWithFlags && g_cu.EventRecord) {
             int ra = g_cu.EventCreateWithFlags(&s->ev_a, 0);
             int rb = g_cu.EventCreateWithFlags(&s->ev_b, 0);
-            if (ra || rb)
-                std::fprintf(stderr, "[trt-flight] 事件创建失败 ra=%d rb=%d（拆账缺席）\n", ra, rb);
+            int rc2 = g_cu.EventCreateWithFlags(&s->ev_c, 0);
+            if (ra || rb || rc2)
+                std::fprintf(stderr, "[trt-flight] 事件创建失败 ra=%d rb=%d rc=%d"
+                             "（拆账缺席）\n", ra, rb, rc2);
         } else {
             std::fprintf(stderr, "[trt-flight] 事件符号缺席（拆账缺席）\n");
         }
@@ -894,6 +900,7 @@ public:
         if (s->mb_host) g_cu.FreeHost(s->mb_host);
         if (s->ev_a && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_a);
         if (s->ev_b && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_b);
+        if (s->ev_c && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_c);
         if (s->mb_seq_dev) g_cu.Free(s->mb_seq_dev);
         if (s->sg_tbl_d) g_cu.Free(s->sg_tbl_d);
         delete[] s->sg_tbl_h;
@@ -1096,12 +1103,32 @@ public:
                 s->fl_n++;
                 s->fl_gpu_ms += gpu_ms;
                 s->fl_wall_ms += now - s->ev_t_launch;
+                // 检出延迟分段（DATA18）：检测点在会话流回记 ev_c——
+                // elapsed(ev_b,ev_c)=本批 GPU 完成→检测的设备钟差（本流空闲
+                // 事件即执行≈墙钟）。观测差−检出=残差归 ev_a 起跑延迟（同流
+                // FIFO/设备队列）。旗标到⇒ev_b 必已完成（盖章在 ev_b 前入流）。
+                if (s->ev_c && g_cu.EventRecord) {
+                    g_cu.EventRecord(s->ev_c, s->stream);
+                    for (int spin = 0; spin < 10000; spin++) {
+                        if (!g_cu.EventQuery
+                            || g_cu.EventQuery(s->ev_c) == 0) break;
+                        _mm_pause();
+                    }
+                    float det = -1.f;
+                    if (g_cu.EventElapsedTime(&det, s->ev_b, s->ev_c) == 0
+                        && det >= 0)
+                        s->fl_det_ms += det;
+                }
                 if (s->fl_n % 128 == 0) {
                     std::printf("[trt-flight] n=%lld GPU侧串行=%.3fms 飞行墙=%.3fms "
-                                "观测差=%.3fms | 发射前段: h2d入队=%.3fms 发射调用=%.3fms\n",
+                                "观测差=%.3fms 检出=%.3fms 起跑残差=%.3fms"
+                                " | 发射前段: h2d入队=%.3fms 发射调用=%.3fms\n",
                                 s->fl_n, s->fl_gpu_ms / s->fl_n,
                                 s->fl_wall_ms / s->fl_n,
                                 (s->fl_wall_ms - s->fl_gpu_ms) / s->fl_n,
+                                s->fl_det_ms / s->fl_n,
+                                (s->fl_wall_ms - s->fl_gpu_ms
+                                 - s->fl_det_ms) / s->fl_n,
                                 s->h2d_ms / s->fl_n, s->lch_ms / s->fl_n);
                     std::fflush(stdout);
                 }
