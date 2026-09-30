@@ -520,7 +520,7 @@ bool StateScatter(OrtSess* s, int n_rows) {
         const size_t rb = (size_t)s->outs[j].meta.width * 4;
         const size_t prows = (size_t)st_pools_[(size_t)pi].rows;
         for (int r = 0; r < n_rows; r++) {
-            const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+            const int pid = s->st_pids[r].load(std::memory_order_acquire);
             if (pid < 0 || (size_t)pid >= prows) continue;
             bool ok;
             if (s->async)
@@ -1184,7 +1184,7 @@ bool StateScatter(OrtSess* s, int n_rows) {
                     const size_t prows = (size_t)pol.rows;
                     for (int r = 0; r < n_rows; r++) {
                         const int pid = s->st_pids[r].load(
-                            std::memory_order_relaxed);
+                                std::memory_order_acquire);
                         if (pid < 0 || (size_t)pid >= prows)
                             continue;   // 幻影行（cursor 虚增未领号）——行内容
                                         // 垃圾无害，填充跳过

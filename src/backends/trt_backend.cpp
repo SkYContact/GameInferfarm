@@ -417,6 +417,11 @@ struct TrtSession {
     // （③池表已上收 backend 级 st_pools_——ShareStatePool 接线后无需重建会话）
     const std::atomic<int>* st_pids = nullptr;   // 银行槽→池下标（Claim 写/
                                                   // 发车读；未绑=Init 期冒烟走旧路）
+                                                  // 读侧 acquire（09-30 加固，
+                                                  // 掼蛋竞态案同款）：与 Claim/
+                                                  // Abandon 的 release 写逐点配
+                                                  // 对=局部自洽，不再单押 drain
+                                                  // 握手的跨文件 happens-before
     // ③批量 D2D scratch（填充/散射逐行小拷合并为单次 cudaMemcpyBatchAsync
     //——发车段 API 税∝提交次数；判决25 同机器。调度台线程独占=无锁）
     struct StBatch {
@@ -1001,7 +1006,7 @@ public:
                     }
                     const bool batch = StBatchOn();
                     for (int r = 0; r < n_rows; r++) {
-                        const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+                        const int pid = s->st_pids[r].load(std::memory_order_acquire);
                         if (pid < 0 || (size_t)pid >= prows)
                             continue;   // 幻影行（轮转归 -1：cursor 虚增未领
                                         // 号）——行内容垃圾无害，填充跳过
@@ -1356,7 +1361,7 @@ private:
                            bool zero_ok, int* tbl) {
         const int prows = pol.rows;
         for (int r = 0; r < n_rows; r++) {
-            const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+            const int pid = s->st_pids[r].load(std::memory_order_acquire);
             if (pid < 0 || pid >= prows) { tbl[r] = -1; continue; }
             if (zero_ok && pol.zero_pending[pid].load(std::memory_order_acquire)) {
                 pol.zero_pending[pid].store(0, std::memory_order_relaxed);
@@ -1469,7 +1474,7 @@ private:
                     continue;
                 }
                 for (int r = 0; r < n_rows; r++) {
-                    const int pid = s->st_pids[r].load(std::memory_order_relaxed);
+                    const int pid = s->st_pids[r].load(std::memory_order_acquire);
                     if (pid < 0 || (size_t)pid >= prows)
                         continue;   // 幻影行：不散射（陈旧 pid 会把垃圾写进
                                     // 他链池行=状态投毒；与填充侧同卫）
@@ -1518,7 +1523,7 @@ private:
                         const size_t prows = (size_t)st_pools_[(size_t)pi].rows;
                         for (int r = 0; r < n_rows; r++) {
                             const int pid = s->st_pids[r].load(
-                                std::memory_order_relaxed);
+                                std::memory_order_acquire);
                             if (pid < 0 || (size_t)pid >= prows) continue;
                             g_cu.Memcpy(pool + (size_t)pid * rb,
                                         src + (size_t)r * rb, rb, 3);

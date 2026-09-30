@@ -120,9 +120,12 @@ struct alignas(64) BankCtl {            // 64B 对齐：相邻银行的 cursor/i
     //=nullptr（不走预解，回退后端直查）
     std::vector<char*> in_rows;                       // 下标=本组 gspec.ins 下标
     std::vector<std::pair<const char*, size_t>> in_idx;   // 名字指针→ins 下标
-    // ③槽→池下标（成对状态行）：Claim 写（槽独占期单写者，release）/
-    // 发车读（drain 握手给 happens-before）；后端 Init 期 BindStatePids 取
-    // 数组地址——每批零接口流量。生命周期=银行池（会话销毁前有效）。
+    // ③槽→池下标（成对状态行）：Claim/Abandon 写（release）/ 发车读（后端
+    // acquire——双重防线：①drain 握手（fence(release)+inflight 归零 acquire）
+    // 仍是最粗粒度 happens-before；②读侧逐点 acquire 与 release 写配对=局部
+    // 自洽，防未来绕开 drain 的直读者（掼蛋竞态排查案 cf6d 同款加固，
+    // 2026-09-30 吸收）；后端 Init 期 BindStatePids 取数组地址——每批零接口
+    // 流量。生命周期=银行池（会话销毁前有效）。
     std::atomic<int>* sp_ids = nullptr;   // [slots]（建池 new/Shutdown delete）
     // 槽所有权（09-30 死锁案硬化）：认领者 fiber cookie（线程腿=0，同线程
     // 提交天然自洽）。SubmitWait/Abandon 前校验 open+owner，违约=响亮指路
