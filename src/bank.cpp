@@ -143,6 +143,7 @@ struct alignas(64) BankCtl {            // 64B 对齐：相邻银行的 cursor/i
     int flight_n = 0;
     double flight_t0 = 0;
     bool flight_warned = false;          // 看门狗打印去重
+    bool flight_dead = false;            // 死信营救已触发（发车时复位）
 };
 
 struct BankScheduler::Impl {
@@ -812,6 +813,7 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     b.flight_seq = seq;
     b.flight_n = n;
     b.flight_t0 = tl1;
+    b.flight_dead = false;
     b.state.store(BK_FLIGHT, std::memory_order_release);
     {   // Init 窗时序探针（DATA20 附二）：首次发车一次性打点——僵死 attempt
         // 若停在 Init（未发过车），部分 stdout 的最后一行就停在这之前
@@ -1061,6 +1063,31 @@ if ((int)I.lat.size() >= 3000) {   // P0-4（2026-09-24 审计）：3×sort+
 }
 
 
+// FLIGHT 死信营救（2026-10-01 gen149/g187 僵死案收口刀）：流级 wedge（图捕
+// 失败回退在线路径后首批石沉大海，"在飞=4 等待者=3063 永不销账"形态）在
+// 收割侧无解——超阈值即全量诊断落盘 + 响亮阵亡换进程（rc=86；es 侧视同
+// 瞬时故障自动重拉新鲜 farm，wedge 的 GPU 上下文随进程释放）。看门狗只报
+// 警不营救的旧行为=整场僵死 300s 靠外层超时收尸。阈值 env
+// FARM_FLIGHT_DEAD_MS（缺省 30000；0=关）。
+static void BankFlightDeadExit(BankCtl& b, double stuck_ms) {
+    static const double dead_ms = [] {
+        const char* e = std::getenv("FARM_FLIGHT_DEAD_MS");
+        return e ? std::atof(e) : 30000.0;
+    }();
+    if (dead_ms <= 0 || stuck_ms <= dead_ms || b.flight_dead) return;
+    b.flight_dead = true;
+    char diag[192];
+    b.be->DiagnoseSubmit(b.sess, diag, (int)sizeof diag);
+    std::fprintf(stderr,
+                 "[bank] FLIGHT 死信: bank=%d 已 %.0fms 未回信 seq=%u n=%d"
+                 "（阈值 %.0fms）——响亮阵亡换进程 rc=86（外层自动重拉）%s%s\n",
+                 b.id, stuck_ms, b.flight_seq, b.flight_n, dead_ms,
+                 diag[0] ? " | " : "", diag);
+    std::fflush(stderr);
+    std::_Exit(86);
+}
+
+
 // 收割线程主体（harv_on 档，所有权切分版）：**全权收车**——自己轮询完成
 // 旗标→Fence→收割→还池（还池 Notify 叫醒调度台轮转；发车通知也到本线程
 // 的 I.cv wait——调度台发车后立即开始盯在飞），调度台零参与。统计向量与
@@ -1087,6 +1114,7 @@ static void BankHarvestLoop(BankScheduler::Impl* Ip) {
                                 diag[0] ? " | " : "", diag);
                     std::fflush(stdout);
                 }
+                BankFlightDeadExit(b, now - b.flight_t0);
                 continue;
             }
             b.be->CompletionFence();
@@ -1147,6 +1175,7 @@ static void BankLoop(BankScheduler::Impl& I) {
                                 diag[0] ? " | " : "", diag);
                     std::fflush(stdout);
                 }
+                BankFlightDeadExit(b, now - b.flight_t0);
                 continue;
             }
             b.be->CompletionFence();

@@ -1634,6 +1634,11 @@ private:
             }
             return true;
         }
+        // 旗标毒化（2026-10-01 冒烟空转案）：发射前把完成旗标打上不可能值
+        //——陈旧旗标/上一批残值永不可能冒充本批序号，WaitFlag/收割轮询必须
+        // 等 GPU 真回信（重捕冒烟 0.002ms 假绿案根除；in-flight≤1 契约下
+        // 无覆写竞争）。
+        *(volatile unsigned*)s->mb_host = 0xFFFFFFFFu;
         *(volatile unsigned*)((char*)s->mb_host + 64) = seq_out;
         if (st) {
             if (s->graph_c_ok && s->graph_c) {
