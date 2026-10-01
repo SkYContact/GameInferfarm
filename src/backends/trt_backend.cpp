@@ -389,6 +389,8 @@ struct TrtSession {
     void* mb_seq_dev = nullptr;
     unsigned mb_seq = 0;
     bool mb_ok = false;
+    // 僵死诊断（2026-10-01 DATA20）：最近一次发射失败/看门狗探针快照
+    char last_diag[192] = {0};
     // 排水拆解（09-29 飞行窗）：ev_a=发射前（h2d 入队后）、ev_b=发射后（盖章
     // 后=流尾）——EventElapsedTime=GPU 侧真实串行时长；与收割观测的飞行窗墙钟
     // 之差=观测/提交延迟。事件在旗标到（完成跃迁）时结算。
@@ -919,7 +921,37 @@ public:
     // ③状态会话：状态输入行改设备池 D2D 填充（H2D 跳过，恒逐输入路径——
     // 聚合分支会整块 H2D 状态行）
     bool SubmitBatch(void* session, int n_rows, unsigned& seq_out) override {
-        TrtSession* s = (TrtSession*)session;
+        TrtSession* s0 = (TrtSession*)session;
+        if (!SubmitBatchImpl(s0, n_rows, seq_out)) {
+            // DATA20：发射失败不再裸奔——当下探针（错误码/流状态/旗标）随
+            // 批异常一起打印（cudaGetLastError 会清错，此处消费=诊断专用）
+            char db[192];
+            ProbeDiag(s0, -1, db, (int)sizeof db);
+            std::fprintf(stderr, "[trt][发射诊断] %s\n", db);
+            std::fflush(stderr);
+            return false;
+        }
+        return true;
+    }
+    // 当下探针：expect<0=读会话已发 seq。写 s->last_diag 供 bank 看门狗转印。
+    void ProbeDiag(TrtSession* s, long long expect, char* buf, int cap) {
+        if (!buf || cap <= 0) return;
+        char errbuf[32] = "-";
+        if (g_cu.GetLastError)
+            std::snprintf(errbuf, sizeof errbuf, "%d", g_cu.GetLastError());
+        const int sq = g_cu.StreamQuery ? g_cu.StreamQuery(s->stream) : -999;
+        const unsigned flag = s->mb_host ? *(volatile unsigned*)s->mb_host : 0;
+        // ev_b=本批流尾事件（发射时回记）——NotReady=GPU 真未完成（图回放
+        // 段卡死）；Success=GPU 已完而旗标未达=盖章/D2H 段问题
+        const int evb = (s->ev_b && g_cu.EventQuery)
+                            ? g_cu.EventQuery(s->ev_b) : -999;
+        const unsigned exp = expect >= 0 ? (unsigned)expect : s->mb_seq;
+        std::snprintf(buf, (size_t)cap,
+                      "cuda_err=%s stream_qry=%d ev_b_qry=%d flag=%u seq=%u",
+                      errbuf, sq, evb, flag, exp);
+        std::snprintf(s->last_diag, sizeof s->last_diag, "%s", buf);
+    }
+    bool SubmitBatchImpl(TrtSession* s, int n_rows, unsigned& seq_out) {
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev);   // 多卡守卫
         if (n_rows > s->slots) n_rows = s->slots;
         s->last_n = n_rows;
@@ -1129,6 +1161,11 @@ public:
         return true;
     }
     void CompletionFence() override { _mm_lfence(); }
+
+    // bank 看门狗/批异常回调（2026-10-01 DATA20）：当下探针快照
+    void DiagnoseSubmit(void* session, char* buf, int cap) override {
+        ProbeDiag((TrtSession*)session, -1, buf, cap);
+    }
 
     const float* OutputRow(void* session, const char* name, int slot) override {
         TrtSession* s = (TrtSession*)session;

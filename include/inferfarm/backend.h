@@ -55,6 +55,14 @@ public:
     // 换心（RW1 blob；TRT=refitter，CPU=直接改权重）。失败=false。
     virtual bool RefitWeights(const char* rw1_path) = 0;
 
+    // 僵死/批异常诊断（2026-10-01 DATA20）：银行在发射失败（批异常）或
+    // FLIGHT 看门狗触发时调用，后端把**当下**的会话探针写入 buf——流状态、
+    // 完成旗标现值 vs 已发 seq、最近 CUDA 错误码。缺省=空串（无诊断面）。
+    virtual void DiagnoseSubmit(void* session, char* buf, int cap) {
+        (void)session;
+        if (buf && cap > 0) buf[0] = '\0';
+    }
+
     // 诊断钩子（R10 门用）：实例缓存引擎元素的地址（容器稳定性回归观测——
     // 仅比对值，不解引用；缺省 nullptr=后端无引擎缓存概念）。
     virtual const void* DebugEngineCookie() const { return nullptr; }

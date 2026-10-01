@@ -787,8 +787,13 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     double th0 = NowMsD();
     unsigned seq = 0;
     if (!b.be->SubmitBatch(b.sess, n, seq)) {
-        // 发射失败（不可达防御）：本批全弃答（判负纪律），银行回池
-        std::printf("[bank] 批异常（发射，本批 %d 行弃答）\n", n);
+        // 发射失败（不可达防御）：本批全弃答（判负纪律），银行回池。
+        // DATA20：附带后端当下探针（错误码/流状态/旗标现值）——僵死案
+        // 不再只有一行裸异常
+        char diag[192];
+        b.be->DiagnoseSubmit(b.sess, diag, (int)sizeof diag);
+        std::printf("[bank] 批异常（发射，本批 %d 行弃答）%s%s\n", n,
+                    diag[0] ? " | " : "", diag);
         std::fflush(stdout);
         for (int s = 0; s < n; s++) {
             BankReq* r = b.reqs[(size_t)s];
@@ -1044,9 +1049,12 @@ static void BankHarvestLoop(BankScheduler::Impl* Ip) {
             if (!b.be->CompletionReached(b.sess, b.flight_seq)) {
                 if (now - b.flight_t0 > 500.0 && !b.flight_warned) {
                     b.flight_warned = true;
+                    char diag[192];
+                    b.be->DiagnoseSubmit(b.sess, diag, (int)sizeof diag);
                     std::printf("[bank] FLIGHT 看门狗: bank=%d 已 %.0fms 未回信"
-                                " seq=%u（后端段卡死排查线索）\n",
-                                i, now - b.flight_t0, b.flight_seq);
+                                " seq=%u（后端段卡死排查线索）%s%s\n",
+                                i, now - b.flight_t0, b.flight_seq,
+                                diag[0] ? " | " : "", diag);
                     std::fflush(stdout);
                 }
                 continue;
@@ -1101,9 +1109,12 @@ static void BankLoop(BankScheduler::Impl& I) {
             if (!b.be->CompletionReached(b.sess, b.flight_seq)) {
                 if (now - b.flight_t0 > 500.0 && !b.flight_warned) {
                     b.flight_warned = true;
+                    char diag[192];
+                    b.be->DiagnoseSubmit(b.sess, diag, (int)sizeof diag);
                     std::printf("[bank] FLIGHT 看门狗: bank=%d 已 %.0fms 未回信 seq=%u"
-                                "（后端段卡死排查线索）\n",
-                                i, now - b.flight_t0, b.flight_seq);
+                                "（后端段卡死排查线索）%s%s\n",
+                                i, now - b.flight_t0, b.flight_seq,
+                                diag[0] ? " | " : "", diag);
                     std::fflush(stdout);
                 }
                 continue;

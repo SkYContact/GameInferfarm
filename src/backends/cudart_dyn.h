@@ -43,6 +43,9 @@ struct Cudart {
     int (*SetDeviceFlags)(unsigned int) = nullptr;
     int (*GetDeviceFlags)(unsigned int*) = nullptr;
     int (*StreamSynchronize)(void*) = nullptr;
+    // 僵死诊断探针（2026-10-01 DATA20；可选符号——缺席=诊断行缺该项）
+    int (*StreamQuery)(void*) = nullptr;
+    int (*GetLastError)() = nullptr;
     int (*HostGetDevicePointer)(void**, void*, unsigned int) = nullptr;
     int (*StreamBeginCapture)(void*, unsigned int) = nullptr;
     int (*StreamEndCapture)(void*, void**) = nullptr;
@@ -117,6 +120,8 @@ struct Cudart {
         SetDeviceFlags = (int (*)(unsigned int))g("cudaSetDeviceFlags");
         GetDeviceFlags = (int (*)(unsigned int*))g("cudaGetDeviceFlags");
         StreamSynchronize = (int (*)(void*))g("cudaStreamSynchronize");
+        StreamQuery = (int (*)(void*))g("cudaStreamQuery");
+        GetLastError = (int (*)())g("cudaGetLastError");
         HostGetDevicePointer = (int (*)(void**, void*, unsigned int))g("cudaHostGetDevicePointer");
         StreamBeginCapture = (int (*)(void*, unsigned int))g("cudaStreamBeginCapture");
         StreamEndCapture = (int (*)(void*, void**))g("cudaStreamEndCapture");
