@@ -1214,7 +1214,25 @@ public:
             return false;
         }
         if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);
-        return ApplyRefitWeights(eng_->eng, rw1_path);
+        if (!ApplyRefitWeights(eng_->eng, rw1_path)) return false;
+        // 图失效+全量重捕（2026-10-01 僵死案根治刀）：批图在捕获时刻烧死
+        // 内核参数（含权重设备地址），refit 原地改权重显存——TRT 内部
+        // staging 重排/tactic 状态变化（候选离基座越远越易触发）时图参数
+        // 指向旧地址/半更新状态，某次 GraphLaunch 永不成完（死锁形态=旗标
+        // 停写+全员 futex）。重捕把新地址重新烧死=整类交互消灭；尾部自带
+        // 发射冒烟（5s 界）——不过的会话毁图降级邮箱=响败不挂死。契约：
+        // 换心只在腿间调用（无在飞批）=重捕窗口安全。
+        for (TrtSession* rs : st_sessions_) {
+            if (!rs->mb_ok) continue;   // 已降级会话无图可捕（在线路径天然新地址）
+            if (rs->graph) { g_cu.GraphDestroy(rs->graph); rs->graph = nullptr; }
+            if (rs->graph_c) { g_cu.GraphDestroy(rs->graph_c); rs->graph_c = nullptr; }
+            rs->graph_ok = false;
+            rs->graph_c_ok = false;
+            if (g_cu.SetDevice) g_cu.SetDevice(rs->dev);
+            CaptureGraph(rs);
+        }
+        if (g_cu.SetDevice) g_cu.SetDevice(dev_id_);
+        return true;
     }
 
 private:
