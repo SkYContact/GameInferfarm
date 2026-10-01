@@ -391,6 +391,11 @@ struct TrtSession {
     bool mb_ok = false;
     // 僵死诊断（2026-10-01 DATA20）：最近一次发射失败/看门狗探针快照
     char last_diag[192] = {0};
+    // 非法访存首现场埋点（2026-10-01 err700 定谳案）：发射站点标签+
+    // sticky 错误首见快照（谁先见谁记一次定谳）
+    std::atomic<const char*> last_site{nullptr};
+    std::atomic<int> gpu_err{0};
+    std::atomic<bool> err_seen{false};
     // 排水拆解（09-29 飞行窗）：ev_a=发射前（h2d 入队后）、ev_b=发射后（盖章
     // 后=流尾）——EventElapsedTime=GPU 侧真实串行时长；与收割观测的飞行窗墙钟
     // 之差=观测/提交延迟。事件在旗标到（完成跃迁）时结算。
@@ -974,8 +979,10 @@ public:
                             ? g_cu.EventQuery(s->ev_b) : -999;
         const unsigned exp = expect >= 0 ? (unsigned)expect : s->mb_seq;
         std::snprintf(buf, (size_t)cap,
-                      "cuda_err=%s stream_qry=%d ev_b_qry=%d flag=%u seq=%u",
-                      errbuf, sq, evb, flag, exp);
+                      "cuda_err=%s stream_qry=%d ev_b_qry=%d flag=%u seq=%u site=%s gpu_err=%d",
+                      errbuf, sq, evb, flag, exp,
+                      s->last_site.load(std::memory_order_relaxed),
+                      s->gpu_err.load(std::memory_order_relaxed));
         std::snprintf(s->last_diag, sizeof s->last_diag, "%s", buf);
     }
     bool SubmitBatchImpl(TrtSession* s, int n_rows, unsigned& seq_out) {
@@ -1123,6 +1130,21 @@ public:
 
     bool CompletionReached(void* session, unsigned seq) override {
         TrtSession* s = (TrtSession*)session;
+        // GPU 错误首现场（2026-10-01 err700 定谳案）：sticky 错误第一次在
+        // 收割线程现身即记录+落盘——比死信早 30s，site=最近发射点=凶手指认
+        if (g_cu.GetLastError && !s->err_seen.load(std::memory_order_relaxed)) {
+            const int e = g_cu.GetLastError();
+            if (e != 0) {
+                s->err_seen.store(true, std::memory_order_relaxed);
+                s->gpu_err.store(e, std::memory_order_relaxed);
+                const char* site = s->last_site.load(std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[trt] GPU错误首现场: sess=%p site=%s err=%d "
+                             "seq=%u（sticky——上下文已死，死信即将收尸）\n",
+                             (void*)s, site ? site : "?", e, s->mb_seq);
+                std::fflush(stderr);
+            }
+        }
         if (!s->mb_ok) {   // 降级流同步路径：发射即等完（SubmitBatch 已同步）
             if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
             g_cu.DeviceSynchronize();
@@ -1533,6 +1555,7 @@ private:
     // 图外逐输出前缀 D2H + 盖章殿后（盖章在 D2H 之后=旗标到即输出驻留，
     // 流序契约与图内四段完全一致）
     static bool EnqueuePartialD2H(TrtSession* s, int n_rows) {
+        s->last_site.store("partial_d2h", std::memory_order_relaxed);
         for (const auto& o : s->outs)
             if (g_cu.MemcpyAsync(o.host, o.dev, (size_t)n_rows * (size_t)o.meta.width * sizeof(float),
                                  2, s->stream))
@@ -1546,6 +1569,7 @@ private:
     // D2D 散射回池（不过主机）+非状态输出前缀 D2H+盖章殿后（流序契约不变：
     // 旗标到=散射与 D2H 均已执行）
     bool EnqueueStateTail(TrtSession* s, int n_rows) {
+        s->last_site.store("state_tail", std::memory_order_relaxed);
         s->sb.clear();   // 防御：早退不留陈旧条目（填充批已在 Submit 清空）
         if (!SgWaitOthers(s)) return false;   // 本散射等他席最近散射（跨流
         // 行序：旧局末散射不得晚于新局散射覆写同行——NewGame 延迟零行案）
@@ -1642,8 +1666,10 @@ private:
         *(volatile unsigned*)((char*)s->mb_host + 64) = seq_out;
         if (st) {
             if (s->graph_c_ok && s->graph_c) {
+                s->last_site.store("st_graphc_launch", std::memory_order_relaxed);
                 if (g_cu.GraphLaunch(s->graph_c, s->stream)) return false;
             } else {
+                s->last_site.store("st_online_enqueue", std::memory_order_relaxed);
                 if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4,
                                      1, s->stream))
                     return false;
@@ -1653,8 +1679,10 @@ private:
         }
         if (PartialD2hOn(s, n_rows)) {
             if (s->graph_c_ok && s->graph_c) {
+                s->last_site.store("p_graphc_launch", std::memory_order_relaxed);
                 if (g_cu.GraphLaunch(s->graph_c, s->stream)) return false;
             } else {
+                s->last_site.store("p_online_enqueue", std::memory_order_relaxed);
                 if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4,
                                      1, s->stream))
                     return false;
@@ -1662,8 +1690,11 @@ private:
             }
             return EnqueuePartialD2H(s, n_rows);
         }
-        if (s->graph_ok && s->graph)
+        if (s->graph_ok && s->graph) {
+            s->last_site.store("full_graph_launch", std::memory_order_relaxed);
             return g_cu.GraphLaunch(s->graph, s->stream) == 0;
+        }
+        s->last_site.store("full_online_enqueue", std::memory_order_relaxed);
         if (g_cu.MemcpyAsync(s->mb_seq_dev, (char*)s->mb_host + 64, 4, 1, s->stream))
             return false;
         if (!s->ctx->enqueueV3((cudaStream_t)s->stream)) return false;
@@ -1786,6 +1817,7 @@ private:
         }
         unsigned seq = 0;
         double spin = 0;
+        s->last_site.store("cap_smoke", std::memory_order_relaxed);
         if (!this->MbSubmit(s, s->slots, seq) || !WaitFlag(s, seq, 5000.0, &spin)) {
             std::fprintf(stderr, "[trt] 图验证发射/旗标超时——降级仅邮箱\n");
             g_cu.GraphDestroy(s->graph); s->graph = nullptr;
