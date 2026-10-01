@@ -202,10 +202,30 @@ void FiberPost(void* cookie) {
 }
 
 void FiberPostBegin() {
+    // 投递完整性（2026-10-01 僵死案加固）：嵌套/漏配 End 的防御——Begin 时
+    // 批旗已立=上一窗未收口，先收口（桶内滞留 fiber 悉数入队）再开新窗。
+    // 原形态无条件清桶=滞留 cookie 被**静默丢掉**（fiber 悬在等待点、done
+    // 永差一、收卷谓词永假=全线程 futex 的丢唤醒死锁），任何未来路径在
+    // Begin/End 之间加一个早退即触发。
+    if (t_post_batch) FiberPostEnd();
     t_post_batch = true;
     for (auto& m : t_post_wake) m = 0;
     if (t_post_q.size() < g_fps.fiw.size()) t_post_q.resize(g_fps.fiw.size());
-    for (auto& q : t_post_q) q.clear();
+    for (auto& q : t_post_q) {
+        if (!q.empty()) {   // 残桶（无嵌套旗的漏收口）：入队兜底，绝不丢
+            FiWorker& fw = g_fps.fiw[&q - t_post_q.data()];
+            {
+                std::lock_guard<std::mutex> lk(fw.mx);
+                for (FiTask* t : q) {
+                    assert(!t->queued);
+                    t->queued = true;
+                    fw.ready.push_back(t);
+                }
+            }
+            q.clear();
+            fw.cv.notify_all();
+        }
+    }
 }
 
 void FiberPostEnd() {
@@ -217,6 +237,7 @@ void FiberPostEnd() {
         auto& q = t_post_q[w];
         if (q.empty()) continue;
         FiWorker& fw = g_fps.fiw[w];
+        bool need_wake;
         {
             std::lock_guard<std::mutex> lk(fw.mx);
             for (FiTask* t : q) {
@@ -224,10 +245,14 @@ void FiberPostEnd() {
                 t->queued = true;
                 fw.ready.push_back(t);
             }
+            // 唤醒旗读移入锁内（2026-10-01 加固）：原"push-CS 之后同线程无锁
+            // 读"与工人睡眠窗口 race——本收口形态与逐条 FiberPost 全同
+            //（旗读写都在 mx 内=与工人"查空+置旗"临界区互斥，漏唤醒不可达，
+            // TSAN race 面一并消灭）。
+            need_wake = fw.sleeping.load(std::memory_order_acquire);
         }
         q.clear();
-        if (fw.sleeping.load(std::memory_order_acquire))
-            fw.cv.notify_one();
+        if (need_wake) fw.cv.notify_one();
     }
     for (size_t i = 0; i < 8; i++) t_post_wake[i] = 0;
 }

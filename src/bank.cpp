@@ -895,7 +895,29 @@ static void BankTryRotate(BankScheduler::Impl& I, int g) {
 #endif
         }
     }
-    if (i < 0) return;
+    if (i < 0) {
+        // 轮转空转诊断（2026-10-01 僵死案）：组池空但本组还有 parked 写手
+        // ——park 恢复唯一靠轮转投递，此态若因全银行在飞而持续=正常排队；
+        // 若在飞也归零仍持续=投递链断（丢唤醒死锁现场）。低频打印留物证。
+        static double last_dump[64] = {};
+        const double now_ = NowMsD();
+        if (g < 64 && !I.waiters_g[(size_t)g].empty()
+            && now_ - last_dump[g] > 2000.0) {
+            last_dump[g] = now_;
+            int nfl = 0;
+            for (int k = 0; k < I.n_banks; k++)
+                if (I.banks[(size_t)k].grp == g
+                    && I.banks[(size_t)k].state.load(std::memory_order_acquire) == BK_FLIGHT)
+                    nfl++;
+            std::printf("[bank] 轮转空转: 组=%d 等待者=%zu 在飞=%d 池=%zu fill=%d"
+                        "（2s 一报；在飞=0 且持续=投递链断）\n",
+                        g, I.waiters_g[(size_t)g].size(), nfl,
+                        I.pool_g[(size_t)g].size(),
+                        I.fill_idx[g].load(std::memory_order_acquire));
+            std::fflush(stdout);
+        }
+        return;
+    }
     if (rprof)
         rc->seg_rot_lock_ns.fetch_add(NowNsI() - rlock0, std::memory_order_relaxed);
     BankCtl& b = I.banks[(size_t)i];
