@@ -777,6 +777,18 @@ public:
     bool Warmup(void* session) override {
         TrtSession* s = (TrtSession*)session;
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
+        // Init 窗时序探针（2026-10-01 DATA20 附二：僵死收窄 Init 窗，7 段
+        // 精确 302-305s=超时+重试成功）：分段一次性打点，进程级相对秒——
+        // 僵死 attempt 的部分 stderr（宿主转储）据此直接读出停在哪段。
+        static const auto t0 = std::chrono::steady_clock::now();
+        auto initlog = [](const char* stage) {
+            std::fprintf(stderr, "[trt][init] t=%.2fs %s\n",
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0).count(),
+                         stage);
+            std::fflush(stderr);
+        };
+        initlog("热身起（3 跑 enqueueV3+同步）");
         memset(s->in_h_arena, 0, s->in_h_bytes);
         for (int r = 0; r < 3; r++) {
             if (g_cu.Memcpy(s->in_d_arena, s->in_h_arena, s->in_h_bytes, 1))
@@ -785,15 +797,19 @@ public:
             if (g_cu.StreamSynchronize) g_cu.StreamSynchronize(s->stream);
             else g_cu.DeviceSynchronize();
         }
+        initlog("3 跑完成，进图捕获");
         // 3 跑后图捕获（惰性分配已落定，捕获窗口内不容分配）；验证发射+自旋
         if (s->mb_ok) {
             CaptureGraph(s);
+            initlog(s->graph_ok ? "批图捕获=开" : "批图捕获=败（回退在线邮箱）");
             if (!s->graph_ok) {   // 在线邮箱冒烟（链路坏=回退流同步，不让首批挂）
                 unsigned seq = 0;
                 if (!this->MbSubmit(s, s->slots, seq)) { s->mb_ok = false; return false; }
                 if (!WaitFlag(s, seq, 5000.0)) { s->mb_ok = false; return true; }
             }
         }
+        initlog(s->mb_ok ? (s->graph_ok ? "热身就绪（邮箱+批图）" : "热身就绪（邮箱）")
+                         : "热身就绪（降级流同步）");
         std::fprintf(stderr, "[trt] 热身就绪 slots=%d%s%s\n", s->slots,
                      s->mb_ok ? "，邮箱=开" : "", s->graph_ok ? "，批图捕获=开" : "");
         return true;
@@ -804,6 +820,16 @@ public:
     bool ProbeGraph(void* session) override {
         TrtSession* s = (TrtSession*)session;
         if (g_cu.SetDevice) g_cu.SetDevice(s->dev);
+        // Init 窗时序探针（同 Warmup，DATA20 附二）
+        static const auto t0 = std::chrono::steady_clock::now();
+        auto initlog = [](const char* stage) {
+            std::fprintf(stderr, "[trt][init] t=%.2fs %s\n",
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0).count(),
+                         stage);
+            std::fflush(stderr);
+        };
+        initlog("图探针起（两图案+回放逐位）");
         // 状态会话只捕计算图（无 4 段图）——计算图同为准入对象
         if (!s->graph_ok && !s->graph_c_ok) {
             std::fprintf(stderr, "[trt-probe] 无批图——银行制要求图+邮箱，拒绝\n");
@@ -858,6 +884,7 @@ public:
         std::printf("[trt-probe] 两图案可分辨=%d 图回放1逐位=%d 图回放2逐位=%d%s\n",
                     (int)diff, (int)g1ok, (int)g2ok, bok ? "" : " ←FAIL");
         std::fflush(stdout);
+        initlog(bok ? "图探针过" : "图探针 FAIL");
         return bok;
     }
 

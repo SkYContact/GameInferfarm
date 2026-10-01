@@ -813,6 +813,14 @@ static void BankDrainSubmit(BankScheduler::Impl& I, BankCtl& b, bool by_disp) {
     b.flight_n = n;
     b.flight_t0 = tl1;
     b.state.store(BK_FLIGHT, std::memory_order_release);
+    {   // Init 窗时序探针（DATA20 附二）：首次发车一次性打点——僵死 attempt
+        // 若停在 Init（未发过车），部分 stdout 的最后一行就停在这之前
+        static std::atomic<int> first{0};
+        if (first.fetch_add(1) == 0) {
+            std::printf("[bank] 首批发车 bank=%d seq=%u n=%d\n", b.id, seq, n);
+            std::fflush(stdout);
+        }
+    }
     I.batches.fetch_add(1);
     I.rows.fetch_add(n);
     if (I.cen) {
