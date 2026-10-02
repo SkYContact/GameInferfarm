@@ -169,3 +169,37 @@ FIFO。②"ResetStatePool 跨流 memset"已不存在——延迟零行案（DATA
 CreateSession 响亮快败。三门回归零漂移。
 
 — 框架侧 2026-10-02
+
+## 8. 框架侧接手批注：err700 真凶收窄（2026-10-02 下午）
+
+**Xid 31 内核日志实证**（dmesg，本机）：err700 发作=MMU fault，FAULT_PDE
+**VIRT_READ（读全未映射虚拟地址）**，全在计算管线客户端，**无一笔在拷贝
+引擎（CE）**——框架填充/散射逐行 D2D memcpy 若越界应表现为 CE fault：
+数据搬运面就此出局（与代码审计、GATHER=0 发作排除三面对齐）。已知
+97+ 笔（环形缓冲滚动，实数更多），全 gd_farm；另有 4 笔 k23_test（9-30，
+addr=0 空指针）=乘客自测自身 bug，不在本案。
+
+**客户端归因警示**：k23_test 的 fault 也落 T1 客户端而两核零张量管指令
+（无 mma/wmma/ldmatrix/cp.async 实证）——**T1 客户端不能独占指认 TRT
+引擎**，引擎/乘客的分界只能靠实验。
+
+**上游已知问题高度同貌**：NVIDIA/TensorRT#4061（open，triaged，无修复
+无回复）——图捕获的 ExecutionContext 并发 + 同卡其他计算进程 → 迭代
+数千次后 Xid 31/err700；**实测 compute-sanitizer/memcheck/CUDA_LAUNCH_
+BLOCKING 全部不可见**。与本案三点自洽：生产=4 银行会话各自捕图并发
+发射；多实例并行显著放大；**掼蛋侧 sanitized 狩猎循环至今空手**——若
+真凶属此类，狩猎永远空手，策略须换。
+
+**筛查（阴性）**：TRT 10.16.1.11 + 玩具引擎，单/双/三进程并发图轰击
+（probe_grpwait，18 分钟 ~40 万批并发图发射，最多 8 图上下文+侧旁进程）
+零复现——#4061 类在玩具战术面/此时间预算下不出。
+
+**框架交付：`FARM_TRT_NO_GRAPH=1`**（trt_backend，opt-in 缺省零行为
+差）：跳过图捕获+换心不重捕+图探针空过，全走在线邮箱。双重身份：
+①**判别腿**——掼蛋侧同考卷同跑法关图跑一段，wedge 消失=图类坐实
+（回填 #4061 或新 issue，附本机 Xid 画像+复现配置），wedge 照发=排除
+图类，回 engine-tactic 线（sanitizer 继续狩猎才有意义）；②**规避档**
+——图类坐实期间可关图续产，性能税=发射段图收益归零，先跑通再谈优化。
+验收：farm_test+trt 全量+trt r9 三门 ALL PASS，开关冒烟过。
+
+— 框架侧 2026-10-02（接手第一班）

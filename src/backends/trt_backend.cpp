@@ -826,9 +826,22 @@ public:
         initlog("3 跑完成，进图捕获");
         // 3 跑后图捕获（惰性分配已落定，捕获窗口内不容分配）；验证发射+自旋
         if (s->mb_ok) {
-            CaptureGraph(s);
-            initlog(s->graph_ok ? "批图捕获=开" : "批图捕获=败（回退在线邮箱）");
-            if (!s->graph_ok) {   // 在线邮箱冒烟（链路坏=回退流同步，不让首批挂）
+            // FARM_TRT_NO_GRAPH=1（err700 判别/规避开关，2026-10-02）：跳过
+            // 图捕获全走在线邮箱——NVIDIA #4061 类（并发图上下文 Xid 31，
+            // sanitizer 不可见）的排除腿：触发条件一（图捕获）整体拆除。
+            // 性能税=发射段图收益归零；判别跑法=同考卷同跑法关图数 wedge。
+            // RefitWeights 重捕循环同门（TrtNoGraph），关图态换心不重捕。
+            if (TrtNoGraph()) {
+                unsigned seq = 0;   // 在线邮箱冒烟（链路验证照做）
+                if (!this->MbSubmit(s, s->slots, seq)) { s->mb_ok = false; return false; }
+                if (!WaitFlag(s, seq, 5000.0)) { s->mb_ok = false; return true; }
+                initlog("FARM_TRT_NO_GRAPH=1——跳过捕获，在线邮箱档");
+            } else {
+                CaptureGraph(s);
+            }
+            if (!TrtNoGraph())
+                initlog(s->graph_ok ? "批图捕获=开" : "批图捕获=败（回退在线邮箱）");
+            if (!s->graph_ok && !TrtNoGraph()) {   // 在线邮箱冒烟（链路坏=回退流同步，不让首批挂）
                 unsigned seq = 0;
                 if (!this->MbSubmit(s, s->slots, seq)) { s->mb_ok = false; return false; }
                 if (!WaitFlag(s, seq, 5000.0)) { s->mb_ok = false; return true; }
@@ -839,6 +852,15 @@ public:
         std::fprintf(stderr, "[trt] 热身就绪 slots=%d%s%s\n", s->slots,
                      s->mb_ok ? "，邮箱=开" : "", s->graph_ok ? "，批图捕获=开" : "");
         return true;
+    }
+
+    // FARM_TRT_NO_GRAPH=1：关图态（Warmup 与 RefitWeights 重捕同门，见 Warmup 注）
+    static bool TrtNoGraph() {
+        static const bool v = [] {
+            const char* e = std::getenv("FARM_TRT_NO_GRAPH");
+            return e && *e && std::atoi(e) == 1;
+        }();
+        return v;
     }
 
     // 图地址烧死小实验（bank_contract 关键工程点 1）：两图案可分辨 + 图回放
@@ -856,6 +878,10 @@ public:
             std::fflush(stderr);
         };
         initlog("图探针起（两图案+回放逐位）");
+        if (TrtNoGraph()) {   // 关图态：图面整体缺席=探针空过（在线档由冒烟验证）
+            initlog("FARM_TRT_NO_GRAPH=1——图探针空过");
+            return true;
+        }
         // 状态会话只捕计算图（无 4 段图）——计算图同为准入对象
         if (!s->graph_ok && !s->graph_c_ok) {
             std::fprintf(stderr, "[trt-probe] 无批图——银行制要求图+邮箱，拒绝\n");
@@ -1267,7 +1293,7 @@ public:
         // 发射冒烟（5s 界）——不过的会话毁图降级邮箱=响败不挂死。契约：
         // 换心只在腿间调用（无在飞批）=重捕窗口安全。
         for (TrtSession* rs : st_sessions_) {
-            if (!rs->mb_ok) continue;   // 已降级会话无图可捕（在线路径天然新地址）
+            if (!rs->mb_ok || TrtNoGraph()) continue;   // 降级/关图态会话无图可捕（在线路径天然新地址）
             if (rs->graph) { g_cu.GraphDestroy(rs->graph); rs->graph = nullptr; }
             if (rs->graph_c) { g_cu.GraphDestroy(rs->graph_c); rs->graph_c = nullptr; }
             rs->graph_ok = false;
