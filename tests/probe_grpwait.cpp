@@ -47,6 +47,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[probe] LoadSpec 失败\n");
         return 1;
     }
+    // 多组：每实例各自 LoadSpec（CreateSession 不懒装引擎——eng_ 空会话创建
+    // 静默 null 案）。IO 枚举追加式=同 spec 二传会重复入表，实例装载用弃。
+    for (size_t g = 1; g < bes.size(); g++) {
+        ModelSpec scratch;
+        if (!bes[g]->LoadSpec(mc, slots, scratch)) {
+            std::fprintf(stderr, "[probe] 组 %zu LoadSpec 失败\n", g);
+            return 1;
+        }
+    }
     BankConfig bc;
     bc.banks = banks;
     bc.slots = slots;

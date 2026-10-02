@@ -147,4 +147,25 @@ instrumented）——非法访存会**当场**报出内核名+地址+host 栈，
 gd 仓参考提交：ccce58d、826061e、938d5e5、0789e82；掼蛋侧调用方语义
 （rc=86 重试链/GPU 释放等待）在 gd 仓 evo/es.py、evo/fixed_es.py。
 
-— 掼蛋侧 2026-10-02
+## 7. 框架侧回灌批注（2026-10-02 回执）
+
+§6 清单已回灌本仓（K1/K23 面按上游策略留 vendored，泛用件全收）：
+sg_tbl 锁页化+全会话预分配、LaunchProbe（每错误码各报一次）+
+sg_gather/sg_scatter 站点标签、ShareStatePool 跨组行宽/行数校验、
+图销毁置空。验收：farm_test + gomoku_backend_test trt 全量 + trt r9
+三门 ALL PASS，probe_grpwait 双组 fails=0。
+
+§5.2 时序复核**判安全**：①散射侧根本不读 zero_pending（zero_ok=false
+短路）——NewGame 语义由散射覆写兑现；填充侧消费 TOCTOU 双消费良性
+（两边都改读保留零行=幂等），安全性前提是同池行单链单消费者（链→银行
+→流亲和契约，跨组共享形态下行钉单组同样成立）；NewGame store(1,
+release)↔填充 load(acquire) 构成 synchronizes-with；GPU 侧同池行恒同流
+FIFO。②"ResetStatePool 跨流 memset"已不存在——延迟零行案（DATA8 修复）
+后 NewGame 零 CUDA 调用；残留的 st_streams_ 死重与陈旧注释/文档已清。
+
+附赠定谳：probe_grpwait 双组"启动 flake"实为确定性 bug——组>0 backend
+从未 LoadSpec（CreateSession 遇 eng_ 空静默 null→调度台无声 init_rc=-1）；
+修=每实例 LoadSpec（IO 枚举追加式，实例装载走 scratch spec）+
+CreateSession 响亮快败。三门回归零漂移。
+
+— 框架侧 2026-10-02

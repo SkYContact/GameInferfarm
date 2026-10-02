@@ -57,9 +57,11 @@ ModelConfig.state_pairs = {{"M_prev","M_new"}, {"Kr_prev","Kr_new"}, ...};
 
 ### 实现分层
 
-1. **trt 后端**（掼蛋现役路径先行）：池分配（HostAlloc 零基一次 memset）、
-   BindPoolPids、SubmitBatch 状态输入行 D2D 填充（H2D 跳过）、批尾散射+
-   状态输出 D2H 跳过、ResetStatePool(row)（全流 memset）、状态会话恒走
+1. **trt 后端**（掼蛋现役路径先行）：池分配（HostAlloc 零基一次 memset，
+   末行保留零行）、BindPoolPids、SubmitBatch 状态输入行 D2D 填充（H2D 跳过）、
+   批尾散射+状态输出 D2H 跳过、ResetStatePool(row)（纯宿主延迟零行旗——
+   NewGame 零 CUDA 调用：该行下次填充改读保留零行，散射覆写即语义兑现，
+   DATA8 全流 memset 跨流竞态由此根除）、状态会话恒走
    计算图/在线+图外尾段形态（4 段图内静态拷装不下动态行集）；
 2. **ort 后端**：同机制后续补（fence 尾段同位插散射）；
 3. **cpu 后端**：不适用（无设备池概念），声明即拒绝；

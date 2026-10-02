@@ -567,7 +567,13 @@ public:
 
     void* CreateSession(const ModelConfig& cfg, const ModelSpec& spec, bool for_bank) override {
         (void)for_bank;
-        if (!eng_ || !eng_->eng) return nullptr;
+        if (!eng_ || !eng_->eng) {
+            // 响亮快败（probe 2 组 InitGroups 静默null案，2026-10-02）：本实例
+            // 未 LoadSpec=eng_ 空。静默 null 让调度台线程无声 ok=false，排查税极高。
+            std::fprintf(stderr, "[trt] CreateSession 前须 LoadSpec（本实例 eng_ 空"
+                         "——多组形态每组 backend 各自 LoadSpec）\n");
+            return nullptr;
+        }
         nvinfer1::ICudaEngine* eng = eng_->eng;
         TrtSession* s = new TrtSession();
         s->slots = spec.slots;
@@ -722,6 +728,8 @@ public:
                     StatePool p;
                     p.row_bytes = rb_in;
                     p.rows = cfg.state_pool_rows;
+                    st_pair_widths_.push_back(rb_in);
+                    st_pool_rows_cfg_ = cfg.state_pool_rows;
                     p.zero_pending = new std::atomic<char>[(size_t)p.rows];
                     for (int t = 0; t < p.rows; t++) p.zero_pending[t].store(0);
                     if (g_cu.Malloc(&p.dev, p.row_bytes * (size_t)(p.rows + 1))
@@ -766,7 +774,6 @@ public:
                              cfg.state_pairs.size(), cfg.state_pool_rows);
         }
         if (for_bank) {
-            st_streams_.push_back(s->stream);   // ResetStatePool 全流面
             // 跨流序事件（DATA17 定谳；可选符号缺席=退化旧行为，单组无恙）
             if (g_cu.EventCreateWithFlags && g_cu.EventRecord)
                 g_cu.EventCreateWithFlags(&s->ev_state, 0x2 /*DisableTiming*/);
@@ -793,6 +800,20 @@ public:
                          stage);
             std::fflush(stderr);
         };
+        // sg_tbl 通用预分配（2026-10-02 图捕获案收尾刀·全会话版）：SgRun 懒
+        // 分配首落流捕获期=非法 API→捕获必败回退在线（池引擎会话无状态填充
+        // 分支曾漏罩）。创建期一次配齐，捕获窗口内不容分配。
+        if (!s->sg_cap) {
+            if (g_cu.HostAlloc(reinterpret_cast<void**>(&s->sg_tbl_h),
+                               (size_t)s->slots * sizeof(int), 0)
+                || g_cu.Malloc(reinterpret_cast<void**>(&s->sg_tbl_d),
+                               (size_t)s->slots * sizeof(int))) {
+                std::fprintf(stderr, "[trt] sg_tbl 预分配失败\n");
+                DestroySession(s);
+                return false;
+            }
+            s->sg_cap = s->slots;
+        }
         initlog("热身起（3 跑 enqueueV3+同步）");
         memset(s->in_h_arena, 0, s->in_h_bytes);
         for (int r = 0; r < 3; r++) {
@@ -897,16 +918,17 @@ public:
         TrtSession* s = (TrtSession*)session;
         if (!s) return;
         StTouchRemove(s);   // 触池登记摘除（wait 面防悬挂）
-        for (size_t i = 0; i < st_streams_.size(); i++)   // ③流表摘除（防悬挂——
-            if (st_streams_[i] == s->stream) {            // ResetStatePool 全流面）
-                st_streams_.erase(st_streams_.begin() + (long)i);
-                break;
-            }
         for (size_t i = 0; i < st_sessions_.size(); i++)
             if (st_sessions_[i] == s) { st_sessions_.erase(st_sessions_.begin() + (long)i); break; }
         if (s->ev_state && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_state);
-        if (s->graph && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph);
-        if (s->graph_c && g_cu.GraphDestroy) g_cu.GraphDestroy(s->graph_c);
+        if (s->graph && g_cu.GraphDestroy) {
+            g_cu.GraphDestroy(s->graph);
+            s->graph = nullptr;   // 双重销毁卫生案（Shutdown+析构两路皆走此）
+        }
+        if (s->graph_c && g_cu.GraphDestroy) {
+            g_cu.GraphDestroy(s->graph_c);
+            s->graph_c = nullptr;
+        }
         if (s->ctx) delete s->ctx;
         if (s->stream && g_cu.StreamDestroy) g_cu.StreamDestroy(s->stream);
         if (s->in_h_arena) g_cu.FreeHost(s->in_h_arena);
@@ -919,7 +941,7 @@ public:
         if (s->ev_c && g_cu.EventDestroy) g_cu.EventDestroy(s->ev_c);
         if (s->mb_seq_dev) g_cu.Free(s->mb_seq_dev);
         if (s->sg_tbl_d) g_cu.Free(s->sg_tbl_d);
-        delete[] s->sg_tbl_h;
+        if (s->sg_tbl_h && g_cu.FreeHost) g_cu.FreeHost(s->sg_tbl_h);
         delete s;
     }
 
@@ -1285,10 +1307,9 @@ private:
         bool external = false;    // ③跨组共享（ShareStatePool 绑定）——析构不释放
     };
     std::vector<StatePool> st_pools_;
+    std::vector<size_t> st_pair_widths_;   // 本组 state_pair 行宽序（跨组校验）
+    int st_pool_rows_cfg_ = 0;
     std::vector<TrtSession*> st_sessions_;   // 状态会话表（跨流 wait 面）
-    std::vector<void*> st_streams_;   // 全部银行会话流（ResetStatePool 全流
-                                      // memset=任意下一读所在流自有序；同零值
-                                      // 多流写良性）
 
 public:
     ~TrtBackend() {
@@ -1312,6 +1333,22 @@ public:
     bool ShareStatePool(const SharedStatePool* pools, int n) override {
         if (!st_pools_.empty()) return false;   // 已持有/已绑定=重复接线
         if (n <= 0) return false;
+        // 跨组校验（2026-10-02 静态分析案回灌）：借来的池按**下标**配对本组
+        // state_pair——行宽/行数不等=散射内核按本组 rb 写对方 stride 的池
+        // =系统性 OOB（两引擎独立烤制，面宽度各异，错位即炸）。不等=响亮拒绑。
+        for (int i = 0; i < n; i++) {
+            if ((size_t)i >= st_pair_widths_.size()) break;
+            if (st_pair_widths_[(size_t)i] != pools[i].row_bytes
+                || (int)pools[i].rows != st_pool_rows_cfg_) {
+                std::fprintf(stderr,
+                             "[trt] 跨组池校验失败 pair#%d: 本组行宽 %zu ↔ "
+                             "借池 %zu（rows %d↔%d）——两引擎 state_pairs "
+                             "错位/异版，拒绑（防散射 OOB）\n", i,
+                             st_pair_widths_[(size_t)i], pools[i].row_bytes,
+                             st_pool_rows_cfg_, pools[i].rows);
+                return false;
+            }
+        }
         for (int i = 0; i < n; i++) {
             StatePool p;
             p.dev = pools[i].dev;
@@ -1527,8 +1564,12 @@ private:
                       size_t rb, int mode) {
         if (n_rows > s->sg_cap) {
             if (s->sg_tbl_d && g_cu.Free(s->sg_tbl_d)) return false;
-            delete[] s->sg_tbl_h;
-            s->sg_tbl_h = new int[s->slots];
+            if (s->sg_tbl_h && g_cu.FreeHost) g_cu.FreeHost(s->sg_tbl_h);
+            // 锁页（2026-10-02 图捕获案定谳）：堆内存 H2D 在流捕获期非法
+            //（状态会话"批图捕获=败（回退在线邮箱）"的 longstanding 真因）
+            if (g_cu.HostAlloc(reinterpret_cast<void**>(&s->sg_tbl_h),
+                               (size_t)s->slots * sizeof(int), 0))
+                return false;
             s->sg_tbl_d = nullptr;
             if (g_cu.Malloc((void**)&s->sg_tbl_d, (size_t)s->slots * sizeof(int)))
                 return false;
@@ -1538,8 +1579,11 @@ private:
         if (g_cu.MemcpyAsync(s->sg_tbl_d, s->sg_tbl_h,
                              (size_t)n_rows * sizeof(int), 1, s->stream))
             return false;
-        return StateGatherLaunch(rows_base, pool_base, s->sg_tbl_d, n_rows, rb,
-                                 s->stream, mode);
+        const bool sg_ok =
+            StateGatherLaunch(rows_base, pool_base, s->sg_tbl_d, n_rows, rb,
+                              s->stream, mode);
+        LaunchProbe(s, mode == 0 ? "sg_gather" : "sg_scatter");
+        return sg_ok;
     }
     // flush 批 scratch（单 attr 复用全条目；失败=scratch 清空后 false）
     static bool StBatchFlush(TrtSession* s) {
@@ -1615,6 +1659,27 @@ private:
         if (g_cu.MemcpyAsync(s->mb_flag_dev, s->mb_seq_dev, 4, 2, s->stream))
             return false;
         return true;
+    }
+
+    // 发射后错误探针（2026-10-02 err700 精确归因回灌）：sticky 错误会在肇事
+    // kernel 执行后由本线程下一次 API 调用返回——每发射点后查一次，第一个
+    // 看到 700 的探针≈肇事发射点（异步最多滞后 1-2 发射，配合站点标签点名）。
+    static void LaunchProbe(TrtSession* s, const char* site) {
+        if (!g_cu.GetLastError) return;
+        const int e = g_cu.GetLastError();
+        if (e == 0) return;
+        // 每个不同错误码各报一次（掼蛋 seq=22 案教训：err=1 捕获残留先到把
+        // 一次性闸门用掉，真凶 err=700 反被噤声）——换码即报，换的那次的
+        // site=见错发射点。
+        const int prev = s->gpu_err.exchange(e, std::memory_order_relaxed);
+        if (prev == e) return;
+        s->last_site.store(site, std::memory_order_relaxed);
+        if (e >= 400) s->err_seen.store(true, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[trt] 发射后错误: site=%s err=%d seq=%u"
+                     "（见错发射点=肇事点±2）\n",
+                     site, e, s->mb_seq);
+        std::fflush(stderr);
     }
 
     // 邮箱提交：序号 +1 写 staging → [图=graphLaunch（H2D 节点执行时读 staging
