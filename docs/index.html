@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GameInferfarm 推理农场 — 游戏AI自博弈批量推理框架 | Python 串行 116× 加速</title>
+<meta name="description" content="GameInferfarm（推理农场）：通用 C++ 游戏决策推理框架。接入一个 GameAdapter，自博弈/强化学习评估/演化种群评估的对局吞吐全部托管——实测 python 串行 116× 加速（19.8 → 2303 局/s），NVIDIA+AMD 异构多卡混跑，逐位确定性，MIT 开源。">
+<meta name="keywords" content="self-play, 自博弈, 强化学习, RL, batched inference, 游戏AI, 推理框架, C++, TensorRT, ONNX Runtime, CUDA Graph, 零拷贝, fiber, 演化算法, 对局生成, EnvPool, GameInferfarm">
+<meta property="og:title" content="GameInferfarm 推理农场 — 把对局吞吐外包出去">
+<meta property="og:description" content="通用 C++ 游戏决策推理框架：python 串行 → 116×（2303 局/s），NVIDIA+AMD 异构混跑，逐位确定性门常驻 CI。写一个 GameAdapter，剩下的交给农场。">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://skycontact.github.io/GameInferfarm/">
+<meta property="og:image" content="https://skycontact.github.io/GameInferfarm/figures/bench_ladder.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌾</text></svg>">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "GameInferfarm",
+  "alternateName": "推理农场",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Windows, Linux",
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+  "license": "https://opensource.org/licenses/MIT",
+  "description": "通用 C++ 游戏决策推理框架：自博弈/RL 评估/演化种群评估的批量推理层，实测 python 串行 116× 加速。",
+  "programmingLanguage": "C++17"
+}
+</script>
+<style>
+:root{
+  --bg:#0d1117; --bg2:#161b22; --card:#1a212b; --line:#2d333b;
+  --fg:#e6edf3; --dim:#9aa7b3; --green:#3fb950; --amber:#d29922;
+  --blue:#58a6ff; --purple:#bc8cff; --red:#f85149;
+  --mono:'Cascadia Code',Consolas,'JetBrains Mono',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--fg);font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;line-height:1.7}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+code{font-family:var(--mono);background:#21262d;border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:.9em}
+pre{background:#0a0d12;border:1px solid var(--line);border-radius:10px;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:.88rem;line-height:1.55}
+pre code{background:none;border:none;padding:0}
+.badge{display:inline-block;padding:3px 12px;border-radius:999px;font-size:.8rem;border:1px solid var(--line);background:var(--bg2);color:var(--dim)}
+.badge.green{color:var(--green);border-color:#1f4a29}
+.badge.amber{color:var(--amber);border-color:#57491a}
+
+/* hero */
+header{padding:88px 0 64px;background:
+  radial-gradient(ellipse 60% 50% at 70% -10%,rgba(88,166,255,.13),transparent),
+  radial-gradient(ellipse 50% 40% at 20% 0%,rgba(63,185,80,.10),transparent),
+  var(--bg);border-bottom:1px solid var(--line)}
+.kicker{color:var(--green);font-family:var(--mono);font-size:.9rem;letter-spacing:.12em;margin-bottom:14px}
+h1{font-size:3rem;line-height:1.15;margin-bottom:8px}
+h1 .en{color:var(--dim);font-size:1.5rem;font-weight:400}
+.tagline{font-size:1.3rem;color:var(--fg);margin:18px 0 6px;max-width:760px}
+.sub{color:var(--dim);max-width:780px;margin-bottom:28px}
+.cta{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:36px}
+.btn{display:inline-block;padding:11px 26px;border-radius:8px;font-weight:600;font-size:1rem}
+.btn.primary{background:var(--green);color:#04150a}
+.btn.primary:hover{background:#46c95a;text-decoration:none}
+.btn.ghost{border:1px solid var(--line);color:var(--fg)}
+.btn.ghost:hover{border-color:var(--dim);text-decoration:none}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+.stat .num{font-size:1.9rem;font-weight:700;font-family:var(--mono);color:var(--green)}
+.stat .num.blue{color:var(--blue)} .stat .num.purple{color:var(--purple)} .stat .num.amber{color:var(--amber)}
+.stat .lbl{color:var(--dim);font-size:.85rem;margin-top:2px}
+
+/* sections */
+section{padding:64px 0;border-bottom:1px solid var(--line)}
+h2{font-size:1.7rem;margin-bottom:8px}
+h2 .anchor{color:var(--dim);font-size:.85rem;font-weight:400;font-family:var(--mono)}
+.secdesc{color:var(--dim);margin-bottom:32px;max-width:800px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:22px 24px}
+.card h3{font-size:1.05rem;margin-bottom:8px}
+.card h3 .ico{margin-right:8px}
+.card p{color:var(--dim);font-size:.92rem}
+.card p b,.card p strong{color:var(--fg)}
+figure{margin:32px 0;text-align:center}
+figure img{max-width:100%;border-radius:10px;border:1px solid var(--line)}
+figcaption{color:var(--dim);font-size:.85rem;margin-top:10px}
+table{width:100%;border-collapse:collapse;margin:20px 0;font-size:.92rem}
+th,td{border:1px solid var(--line);padding:9px 14px;text-align:left}
+th{background:var(--bg2);color:var(--dim);font-weight:600}
+td{color:var(--fg)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+@media(max-width:820px){.grid2{grid-template-columns:1fr}h1{font-size:2.2rem}}
+.note{background:#122028;border-left:3px solid var(--blue);border-radius:0 8px 8px 0;padding:14px 18px;color:var(--dim);font-size:.92rem;margin:20px 0}
+.note b{color:var(--fg)}
+ul.feat{list-style:none}
+ul.feat li{padding:6px 0 6px 26px;position:relative;color:var(--dim)}
+ul.feat li::before{content:"▸";position:absolute;left:6px;color:var(--green)}
+ul.feat li b{color:var(--fg)}
+footer{padding:44px 0;color:var(--dim);font-size:.88rem}
+footer .links{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:14px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="kicker">GAMEINF erfarm // 自博弈批量推理层</div>
+    <h1>推理农场 <span class="en">GameInferfarm</span></h1>
+    <p class="tagline">写一个 <code>GameAdapter</code> 接入你的游戏，剩下的并发、攒批、GPU 提交、取证——全部交给农场。</p>
+    <p class="sub">通用 C++17 游戏决策推理框架：把「大量同构对局并发推进 + 神经网络批量决策」做成游戏无关的库。面向自博弈训练、强化学习评估、演化种群评估、对局数据生成这类高吞吐负载。</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/SkYContact/GameInferfarm">GitHub 仓库 →</a>
+      <a class="btn ghost" href="#quickstart">5 分钟接入</a>
+      <a class="btn ghost" href="#benchmark">看基准数据</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="num">116×</div><div class="lbl">python 串行 → 框架（五子棋公开基准）</div></div>
+      <div class="stat"><div class="num blue">2303</div><div class="lbl">局/秒 · 单卡 6 设备组（8192 局同口径）</div></div>
+      <div class="stat"><div class="num purple">逐位</div><div class="lbl">确定性：从 190 → 2300 局/s，八千局一局没变</div></div>
+      <div class="stat"><div class="num amber">~29ms</div><div class="lbl">refit 换心：演化一代候选免烤引擎</div></div>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="wrap">
+    <h2>瓶颈不在网络，在三层税 <span class="anchor">#why</span></h2>
+    <p class="secdesc">自博弈 / RL 评估 / 对局生成的瓶颈几乎从不在神经网络本身，而在：每个决策一次线程唤醒的 OS 调度税、特征组装的同进程拷贝链、小批次付整批的 GPU 门票。农场把这三层做成游戏无关的机件（实测 7.5–8.7×）。</p>
+    <div class="cards">
+      <div class="card"><h3><span class="ico">🧵</span>fiber 调度器</h3><p>K 工人线程 + 每局一 fiber + per-worker 唤醒队列。推理等待 = 纤程让出（不睡条件变量、不进 OS 运行队列）——<b>唤醒税归零</b>。链-工人亲和保住 thread_local 语义；有跨让出状态的游戏装进 <b>TLS 帧</b>，切换点自动装卸。</p></div>
+      <div class="card"><h3><span class="ico">🏦</span>零拷贝槽位银行</h3><p>N 家银行 × slots 槽 pinned、地址终身固定、每家一张专属 <b>CUDA Graph</b>。原子游标领号 → 组装<b>直写槽</b>（零同进程拷贝）→ 满座自驱发车 → 只拷前 n 行 → 异步整批回放。池容量 = 在飞上限 = <b>天然背压</b>。</p></div>
+      <div class="card"><h3><span class="ico">🔥</span>refit 热换双后端</h3><p>RW1 权重 blob <b>毫秒级换心</b>（TRT ~29ms / ORT RefitWeights 真实现）——演化/评估场景一代候选免烤引擎；换心后 CUDA 图自动失效重捕，空转 fail-fast。</p></div>
+      <div class="card"><h3><span class="ico">🔬</span>census 取证</h3><p>全原子状态机（人口恒等式 X≡0）、复活路径直方图、乘客侧三段计时、队深取证、链钟拆账——<b>性能问题先有测量再有解释</b>。配套 segvcatch / dbg_stack / dbg_sample 采样剖析器全家桶。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="benchmark">
+  <div class="wrap">
+    <h2>公开基准：可复现的价值链 <span class="anchor">#benchmark</span></h2>
+    <p class="secdesc">仓库自带一条一键再生的基准（<code>tools/</code>，<a href="https://github.com/SkYContact/GameInferfarm/blob/master/docs/benchmark.md">docs/benchmark.md</a> 全口径）：模型真会下棋、框架真跑得快、行为逐位等价——三件事各自有数。</p>
+    <div class="grid2">
+      <div>
+        <ul class="feat">
+          <li><b>模型真会下棋</b>：自博弈 4000 局 → BC 训 6.85M 参数 CNN（随仓分发）→ 对规则对手 <b>0/16 → 85.6%</b>（8192 局）</li>
+          <li><b>框架真跑得快</b>：python 串行 19.8 局/s → C++ 逐链线程 190 → <b>农场 2303 局/s</b>（同卡 6 设备组×2 银行）；谱系首尾 <b>116×</b>，同 C++ 同模型 <b>12.1×</b></li>
+          <li><b>一张卡还能再拆</b>：设备组 = 并行填充管线，1 组 780 → 2 组 1376 → 6 组 2303 局/s（零额外硬件）</li>
+          <li><b>行为逐位等价</b>：5 腿指纹全同、决策数全同（104175）、推理故障 0——12 倍提速一局没变</li>
+        </ul>
+      </div>
+      <div>
+        <figure>
+          <img src="figures/bench_ladder.png" alt="实现谱系阶梯：python 串行 19.8 → 农场 2303 局/s" loading="lazy">
+          <figcaption>实现谱系阶梯（8192 局同口径，每档 ≥3 跑中位）</figcaption>
+        </figure>
+      </div>
+    </div>
+    <figure>
+      <img src="figures/bench_winrate.png" alt="未训练 0/16 → BC 训练后 85.6% 胜率" loading="lazy">
+      <figcaption>同一个 6.85M CNN：未训练被规则对手 0/16 清盘，BC 训练后 85.6%（先手 88.4% / 后手 82.9%）</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2>产线级特性 <span class="anchor">#features</span></h2>
+    <p class="secdesc">全部来自真实演化/RL 产线连续战役的回灌——不是演示件。</p>
+    <div class="cards">
+      <div class="card"><h3><span class="ico">🎮</span>异构多卡混跑</h3><p>NVIDIA（CUDA / TensorRT）+ AMD（DirectML）同进程混跑；链钉扎保证<b>跨厂商重跑逐位一致</b>；同一张卡拆多设备组，轻模型下独显+核显 = 单卡 1.8×。</p></div>
+      <div class="card"><h3><span class="ico">🔀</span>一进程多引擎 + 组路由</h3><p>按模型路径引擎缓存，双模型同进程共存；决策级组路由（每组独立引擎/IO/固批）；TRT <b>population 路由</b>——演化一代种群免散批、免 5.3MB/批 PCIe 税。</p></div>
+      <div class="card"><h3><span class="ico">💾</span>状态驻留池</h3><p>成对状态行设备常驻：输入 D2D 直填、输出批尾散射回池（不过主机）；发车段 <b>cudaMemcpyBatchAsync</b> 批量化；部分行 D2H 非满批大输出 <b>-42%</b>。</p></div>
+      <div class="card"><h3><span class="ico">🎯</span>确定性纪律</h3><p>种子协议 + 行独立 + 「时序旋钮不改算术」红线：<b>任何提速开关都有指纹门执法</b>，FARM_FIXED_BATCH 根治 TRT tactic 翻面，Optuna 调参器（tune_farm.py）指纹违约自动判剪。</p></div>
+      <div class="card"><h3><span class="ico">🛡️</span>产线硬化</h3><p>幻影行竞态根修、惊群防御、池竞态延迟零行根修、乘客契约硬化（违约=当场响亮报错而非远端死锁）、FLIGHT 死信看门狗（30s 阵亡优雅重拉）、发射站点标签埋点。</p></div>
+      <div class="card"><h3><span class="ico">🖥️</span>双平台</h3><p>Windows 全功能面 + Linux x64（fcontext SysV 切换体）：cpu 全门 + TRT 全绿（三平台逐位同）+ ncnn，CI 双平台 × {C++17, C++20} 矩阵常驻。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>5 分钟接入 <span class="anchor">#quickstart</span></h2>
+    <div class="grid2">
+      <div>
+        <p class="secdesc">构建（无 GPU 依赖，cpu 后端全链可跑）：</p>
+        <pre><code>git clone https://github.com/SkYContact/GameInferfarm.git
+cd GameInferfarm
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+cmake --build build --config Release
+
+build/Release/farm_test.exe   # 确定性门 G1-G8 全绿才算数
+build/Release/gomoku.exe      # 五子棋范例（未训练模型即可全流程）</code></pre>
+        <p class="secdesc" style="margin-top:18px">先跑范例、不写一行接入代码：</p>
+        <pre><code>build/Release/gomoku.exe --chains 8 --games 16 --show-board</code></pre>
+      </div>
+      <div>
+        <p class="secdesc">接入你的游戏 = 实现一个适配器（五子棋全量约 200 行 / 十个钩子）：</p>
+        <pre><code>struct MyGame : inferfarm::GameAdapter {
+  void NewGame(uint64_t seed, bool we_first) override;
+  bool AdvanceToDecision() override;      // 推进到决策点
+  void AssembleInto(SlotWriter&) override;// 特征直写槽（零拷贝）
+  int  CollectOutputs(OutputDest*, int) override;
+  void ApplyResult() override;            // 消费输出、推进局面
+  bool IsDone() override; int Outcome() override;
+};
+
+int main() {
+  inferfarm::FarmConfig cfg;
+  cfg.model.backend = "cpu";   // cpu | ort | trt
+  inferfarm::Farm farm;
+  farm.Init(cfg);
+  farm.RunLeg([](int chain, void*) {
+    return new MyGame();       // 每链一局工厂
+  }, nullptr);
+}</code></pre>
+      </div>
+    </div>
+    <div class="note"><b>三条契约</b>：① advance 与 assemble 无挂起点；② 行独立（无 batchnorm 类跨行算子）；③ 逐位确定性由适配器的种子协议保证。跨让出存活的 thread_local 状态装进 <code>ITlsFrame</code>，调度器切换点自动装卸。</div>
+  </div>
+</section>
+
+<section id="backends">
+  <div class="wrap">
+    <h2>三后端一个接口 <span class="anchor">#backends</span></h2>
+    <p class="secdesc">同一 <code>InferBackend</code> 接口、同一银行协议——吞吐差在提交层，行为逐位可比（ORT 与 TRT 对同一 fp32 模型指纹逐位同）。</p>
+    <table>
+      <tr><th>后端</th><th>批图</th><th>refit 换心</th><th>定位</th></tr>
+      <tr><td><code>cpu</code></td><td>—</td><td>✓</td><td>无 GPU 全链验证、确定性门、CI</td></tr>
+      <tr><td><code>ort</code></td><td>CUDA Graph（会话绑调度台）</td><td>✓ RefitWeights</td><td>不烤 TRT：调度/攒批层收益全额</td></tr>
+      <tr><td><code>trt</code></td><td>一银行一图捕获</td><td>✓ ~29ms</td><td>生产路线：提交合并 + 毫秒换心</td></tr>
+    </table>
+    <p class="secdesc">另有 <code>ncnn</code>（Linux，radv 异构首证）与 DirectML 通道（AMD 显卡/核显直用）。推理缓存（KataGo NNCache 思想）、多设备组、population 路由均为可选模块，默认零行为差。</p>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <h2>FAQ <span class="anchor">#faq</span></h2>
+    <div class="cards">
+      <div class="card"><h3>与 EnvPool / SampleFactory / OpenSpiel / KataGo 的区别？</h3><p>EnvPool 只做环境并行（推理侧仍要自己攒批）；SampleFactory 绑定算法栈；OpenSpiel 求算法广度非吞吐；KataGo 是围棋专用引擎。GameInferfarm 补的是「<b>带你的游戏 + 你的模型，把对局吞吐外包</b>」的推理中间层。</p></div>
+      <div class="card"><h3>必须用 GPU 吗？</h3><p>不。cpu 后端全链可跑（CI 常驻）；玩具尺度模型下 CPU 反而最快（GPU 每批门票是纯开销）。GPU 后端的价值在真模型尺度——设备组与异构混跑都只为那一步准备。</p></div>
+      <div class="card"><h3>接入一个游戏要写多少代码？</h3><p>五子棋全量适配器约 <b>200 行、十个钩子</b>；未训练模型即可跑通种子协议/直写槽/银行攒批/确定性门全流程——换成你训练好的模型只改一处模型声明。</p></div>
+      <div class="card"><h3>结果可复现吗？</h3><p>是设计目标而非口号：种子协议逐局确定、同配置复跑逐位同、跨后端指纹逐位同、跨厂商（CUDA/DML）钉扎逐位同——全部有 CI 门执法。</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/SkYContact/GameInferfarm">GitHub</a>
+      <a href="https://github.com/SkYContact/GameInferfarm/blob/master/README.md">README（完整文档）</a>
+      <a href="https://github.com/SkYContact/GameInferfarm/blob/master/docs/benchmark.md">基准报告</a>
+      <a href="https://github.com/SkYContact/GameInferfarm/blob/master/docs/design-judgments.md">实测判决台账</a>
+      <a href="https://github.com/SkYContact/GameInferfarm/blob/master/docs/pitfalls.md">血律/坑档</a>
+      <a href="https://github.com/SkYContact/GameInferfarm/blob/master/CONTRIBUTING.md">贡献指南</a>
+    </div>
+    <div>GameInferfarm · MIT License · C++17 · Windows / Linux x64 · 🌾 把对局吞吐外包出去</div>
+  </div>
+</footer>
+
+</body>
+</html>

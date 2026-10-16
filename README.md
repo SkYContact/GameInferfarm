@@ -17,6 +17,39 @@
 [English version](README.en.md)
 ```
 
+## 最近更新（2026-09-28 → 10-16，自公开基准后的四十余笔）
+
+- **一进程多引擎（W1）**：按模型路径引擎缓存，主/池双模型同进程共存、各实例独立
+  换心互不串（演化"评估模型+种群模型"场景的框架面）。
+- **决策级组路由（W2）**：每组独立引擎/IO 形状/固批参数，决策级路由到组——掼蛋
+  双模型、座位异构路由这类"一个进程喂多张图"的负载解禁（G19 双引擎门常驻）。
+- **TRT population 路由**：种群面（`SetPopulation`）整平面 H2D+脏旗增量提交，
+  满批跳 carve——演化一代种群免散批、免 5.3MB/批级 PCIe 税。
+- **refit 换心双后端**：ORT `RefitWeights` 真实现落地（推翻"ORT 无热换 API"旧判），
+  TRT 侧名字归一+空转 fail-fast；换心 ~29ms（TRT 探针实测）；CUDA Graph×换心
+  交互根治（换后图失效自动全量重捕）。
+- **状态驻留池**：成对状态行（`state_pairs`）设备常驻——状态输入 D2D 直填、输出
+  批尾散射回池（不过主机）；发车段批量 `cudaMemcpyBatchAsync`（cu12/cu13 ABI
+  双形态自适应）；部分行 D2H（非满批大输出实测 -42%）；跨组共享状态池 +
+  headlive 头部活跃面（[docs/state-residency-design.md](docs/state-residency-design.md)）。
+- **Linux 实测推进**：判决 26 提交面 A/B 实测（WDDM 税蒸发，S0 档 5.1×）；判决 27
+  TRT 后端 Linux 移植（dlopen 装载面+烤引擎链，三平台逐位同）；ncnn 收官（radv，
+  cuda+ncnn 异构首证）。
+- **确定性旋钮**：`FARM_FIXED_BATCH`（根治 TRT 按批形状选 tactic 的近平局翻面）、
+  `FARM_D2H_PARTIAL` `FARM_STATE_GATHER` `FARM_TRT_NO_GRAPH`（上游 Xid 31 判别/
+  规避开关）`FARM_FLIGHT_DEAD_MS` 等——旋钮纪律不变：只改时序不改算术，指纹违约
+  可判。
+- **调参器** `tools/tune_farm.py`：Optuna+MedianPruner 自动扫农场旋钮（dlshogi
+  吸收），trial 内同 seed 指纹/决策数违约自动判剪——"时序旋钮不改算术"红线变执法面
+  （[docs/framework-survey-absorption.md](docs/framework-survey-absorption.md)）。
+- **产线实战硬化**（掼蛋演化产线连续战役回灌）：幻影行竞态根修、惊群防御、池竞态
+  延迟零行根修、银行槽所有权契约硬化（乘客协议违约=当场响亮报错而非远端死锁）、
+  FLIGHT 死信看门狗（30s 阵亡换 rc=86 优雅重拉）、非法访存首现场埋点（发射站点
+  标签+sticky 快照）。
+- **取证仪器全家桶入仓**：census 二期（乘客侧 adv/coll/asm 三段计时+队深取证+链钟
+  拆账）、`tools/segvcatch`（Linux 信号抓栈）、`tools/dbg_stack.py`（Win 迷你取栈器）、
+  `tools/dbg_sample.py`（穷人的采样剖析器，--pid 只读附着）。
+
 ## 为什么需要它
 
 自博弈/强化学习评估/对局生成这类负载的瓶颈几乎从不在神经网络本身，而在：
@@ -147,7 +180,7 @@ TRT 后端：`cmake -B build-trt -DINFERFARM_WITH_TRT=ON`
 | 后端 | 批图 | 完成检测 | refit 换心 | 定位 |
 |---|---|---|---|---|
 | `cpu` | — | 即时 | ✓（demo 协议） | 无 GPU 全链验证、确定性门、CI |
-| `ort` | enable_cuda_graph（银行会话绑调度台线程） | 整设备同步 | ✗（ORT 无此 API） | 不烤 TRT：调度/拷贝/攒批层收益全额 |
+| `ort` | enable_cuda_graph（银行会话绑调度台线程） | 整设备同步 | ✓（RefitWeights 真实现） | 不烤 TRT：调度/拷贝/攒批层收益全额 |
 | `trt` | CUDA Graph 批捕获（一银行一图） | GPU 邮箱 4B 盖章 + volatile 自旋 | ✓ | 生产路线：提交合并 + 围栏税消灭 + 毫秒换心 |
 
 三后端同一 `InferBackend` 接口，同一银行协议——吞吐差在提交层，行为逐位可比。
@@ -190,7 +223,7 @@ capi 目录——与 CUDA 构建同名冲突由框架自动改名共存）。TRT
 | 面 | Windows x64 | Linux x64（Ubuntu 档） |
 |---|---|---|
 | fiber 后端 | `winfiber`（现役，Windows Fibers 1:1）与 `fcontext`（自写 MASM64 切换体）双后端，`FARM_FIBER_BACKEND` 双向选 | `fcontext`（自写 SysV AMD64 切换体，GNU as）；winfiber 不可用自动回退并提示 |
-| 推理后端 | cpu / ORT（CUDA+Graph / DML）/ TRT / ncnn | cpu（全门可跑）；ORT/TRT/ncnn 的动态库装载面已收 dlopen（GPU EP 面**待接待测**，接入=社区通道） |
+| 推理后端 | cpu / ORT（CUDA+Graph / DML）/ TRT / ncnn | cpu（全门可跑）；TRT 已移植全绿（判决 27，三平台逐位同）；ncnn 收官（radv 异构首证）；ORT CUDA EP 动态装载面已收 dlopen（**待接待测**，接入=社区通道） |
 | 绑核 | 全功能（判决 18） | env 解析收口，pinned 动作降级跳过（stderr 注记） |
 | census | 全功能（含线程级 CPU 普查） | 打印行/忙闲/进程 pcpu 在；线程普查降级 |
 
@@ -215,6 +248,10 @@ capi 目录——与 CUDA 构建同名冲突由框架自动改名共存）。TRT
 `FARM_STAGGER_MS` `FARM_CENSUS` `FARM_CACHE_LOG2` `FARM_ORT_DIR`
 `FARM_CUDA_DIR` `FARM_TRT_DIR` `FARM_BANK_SPIN` `FARM_ORT_ASYNC`
 `FARM_WORKER_AFFINITY` `FARM_SCHED_AFFINITY`
+`FARM_FIXED_BATCH` `FARM_CLAIM_SPINS` `FARM_STAGGER_BATCH` `FARM_WORKER_SPIN`
+`FARM_D2H_PARTIAL` `FARM_STATE_GATHER` `FARM_H2D_BATCH` `FARM_TRT_NO_GRAPH`
+`FARM_FLIGHT_DEAD_MS` `FARM_FIBER_BACKEND` `FARM_FC_STACK_KB`
+`FARM_CHECK_BACKEND`（影子哨兵，挂账项）
 
 绑核（opt-in，判决 18）：`FARM_WORKER_AFFINITY` / `FARM_SCHED_AFFINITY`，
 值格式 `"0,2-7,phys"`（`phys`=物理核代表号，SMT 机器推荐；默认不绑=零行为
@@ -272,25 +309,24 @@ NVIDIA（CUDA/TensorRT）同进程混跑，链钉扎保证跨厂商重跑逐位�
 卡拆多设备组也是官方用法（1 组 → 6 组实测 780 → 2303 局/s）。
 
 **支持 Linux 吗？** 支持（Linux x64 / Ubuntu 档）：fcontext（SysV AMD64 自写
-有栈切换）+ cpu 后端可编译可跑通全部确定性门（CI 常驻双平台矩阵验证）；GPU
-EP 面待接待测。见上文[平台支持](#平台支持)。
+有栈切换）+ cpu 后端可编译可跑通全部确定性门（CI 常驻双平台矩阵验证）；TRT
+后端已移植全绿（判决 27，三平台逐位同），ncnn 收官；ORT CUDA EP 待接待测。
+真 Linux 盒提交面 A/B 实测：WDDM 税蒸发，S0 档 5.1×（判决 26）。见上文
+[平台支持](#平台支持)。
 
 **接入一个游戏要写多少代码？** 五子棋全量适配器约 200 行、十个钩子；
 未训练模型即可跑通全流程（种子协议/直写槽/银行攒批/确定性门照常工作）。
 
 ## 约束与路线
 
-- 平台现状（2026-09-27 起）：Windows=全功能面（winfiber/fcontext 双后端 +
-  ORT CUDA/DML/TRT/ncnn）；Linux x64=fcontext(SysV) + cpu 后端可编译可跑
-  （确定性门 CI 常驻），GPU EP 面待接待测。fcontext 切换体参考 Boost.Context
-  （BSD 风格许可，attribution 见源文件头）。详见[平台支持](#平台支持)。
+- 平台现状（2026-10-16 起）：Windows=全功能面（winfiber/fcontext 双后端 +
+  ORT CUDA/DML/TRT/ncnn）；Linux x64=fcontext(SysV) + cpu 全门 + TRT 全绿 +
+  ncnn（ORT CUDA EP 待接待测；确定性门 CI 常驻）。fcontext 切换体参考
+  Boost.Context（BSD 风格许可，attribution 见源文件头）。详见[平台支持](#平台支持)。
   C++17，CMake ≥3.16。
-- 路线：ORT/TRT 真模型实测基准（范式=KataGo benchmarkPureForward：barrier
-  同起跑+每线程中位数+全体墙钟）、fp16 烤制档（int8 与 fp32 之间）、低负载
-  混合发车（单局场景银行税的解药）、Linux GPU EP 面接入（ORT CUDA/TRT/ncnn
-  动态装载面已收 dlopen）、更多游戏范例。
-  （多 GPU 已落地：cuda+dml 异构实测跑通、跨厂商复跑逐位同；TRT device_id
-  守卫就位待双同构卡实测。）
+- 路线：fp16 烤制档（int8 与 fp32 之间）、低负载混合发车（单局场景银行税的
+  解药）、Linux ORT CUDA EP 接入（动态装载面已收 dlopen）、更多游戏范例、
+  在体影子哨兵 FARM_CHECK_BACKEND、位压缩输入。
 
 ## 命名说明
 
