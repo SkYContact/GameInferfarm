@@ -1,6 +1,7 @@
 # GameInferfarm · 推理农场
 
 [![CI](https://github.com/SkYContact/GameInferfarm/actions/workflows/ci.yml/badge.svg)](https://github.com/SkYContact/GameInferfarm/actions/workflows/ci.yml)
+[![Homepage](https://img.shields.io/badge/homepage-skycontact.github.io%2FGameInferfarm-3fb950)](https://skycontact.github.io/GameInferfarm/)
 
 **通用 C++ 游戏决策推理框架**——把"大量同构游戏并发推进 + 神经网络批量决策"做成游戏无关的库。
 写一个 `GameAdapter` 接入你的游戏，剩下的并发、攒批、GPU 提交、取证全部交给农场。

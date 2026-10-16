@@ -1,6 +1,7 @@
 # GameInferfarm · Inference Farm
 
 [![CI](https://github.com/SkYContact/GameInferfarm/actions/workflows/ci.yml/badge.svg)](https://github.com/SkYContact/GameInferfarm/actions/workflows/ci.yml)
+[![Homepage](https://img.shields.io/badge/homepage-skycontact.github.io%2FGameInferfarm-3fb950)](https://skycontact.github.io/GameInferfarm/)
 
 **A general-purpose C++ game-decision inference framework** — "many homogeneous games advancing concurrently + neural-network batched decisions" packaged as a game-agnostic library.
 Write one `GameAdapter` to plug in your game; concurrency, batching, GPU submission and forensics are the farm's job.
